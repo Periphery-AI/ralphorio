@@ -2,7 +2,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value};
-use sim_core::{movement_step, projectile_step, InputState as CoreInputState};
+use sim_core::{
+    movement_step_with_obstacles, projectile_step, InputState as CoreInputState, StructureObstacle,
+    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use worker::durable::{DurableObject, State, WebSocketIncomingMessage};
@@ -26,8 +29,12 @@ const PROJECTILE_MAP_LIMIT: f32 = 5500.0;
 const PROJECTILE_TTL_MS: i64 = 1800;
 const PROJECTILE_MAX_SPEED: f64 = 900.0;
 
+const BUILD_GRID_SIZE: f64 = 32.0;
+const BUILD_PREVIEW_STALE_MS: i64 = 15000;
+
 const MAX_STRUCTURES: usize = 1024;
 const MAX_PROJECTILES: usize = 4096;
+const MAX_PREVIEWS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SocketAttachment {
@@ -100,6 +107,15 @@ struct BuildRemovePayload {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BuildPreviewPayload {
+    active: bool,
+    x: Option<f64>,
+    y: Option<f64>,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectileFirePayload {
     x: f64,
     y: f64,
@@ -155,6 +171,32 @@ struct BuildRow {
     structure_id: String,
     owner_id: String,
     kind: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildGridOccupiedRow {
+    count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildPreviewRow {
+    player_id: String,
+    kind: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructureObstacleRow {
+    kind: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerPositionRow {
     x: f64,
     y: f64,
 }
@@ -344,6 +386,23 @@ fn map_input_to_core(input: &InputState) -> CoreInputState {
     }
 }
 
+fn is_valid_structure_kind(kind: &str) -> bool {
+    matches!(kind, "beacon" | "miner" | "assembler")
+}
+
+fn structure_half_extent(_kind: &str) -> f32 {
+    STRUCTURE_COLLIDER_HALF_EXTENT
+}
+
+fn snap_axis_to_grid(value: f64) -> i64 {
+    let clamped = value.clamp(-(MOVEMENT_MAP_LIMIT as f64), MOVEMENT_MAP_LIMIT as f64);
+    (clamped / BUILD_GRID_SIZE).round() as i64
+}
+
+fn grid_cell_center(grid_axis: i64) -> f64 {
+    grid_axis as f64 * BUILD_GRID_SIZE
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
@@ -451,9 +510,76 @@ impl RoomDurableObject {
               kind TEXT NOT NULL,
               x REAL NOT NULL,
               y REAL NOT NULL,
+              grid_x INTEGER,
+              grid_y INTEGER,
               created_at INTEGER NOT NULL
             )
             ",
+            None,
+        )?;
+
+        if let Err(error) = sql.exec(
+            "ALTER TABLE build_structures ADD COLUMN grid_x INTEGER",
+            None,
+        ) {
+            let message = format!("{error}");
+            if !message.contains("duplicate column") {
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = sql.exec(
+            "ALTER TABLE build_structures ADD COLUMN grid_y INTEGER",
+            None,
+        ) {
+            let message = format!("{error}");
+            if !message.contains("duplicate column") {
+                return Err(error);
+            }
+        }
+
+        sql.exec(
+            "UPDATE build_structures SET grid_x = CAST(ROUND(x / ?) AS INTEGER), grid_y = CAST(ROUND(y / ?) AS INTEGER) WHERE grid_x IS NULL OR grid_y IS NULL",
+            Some(vec![BUILD_GRID_SIZE.into(), BUILD_GRID_SIZE.into()]),
+        )?;
+
+        sql.exec(
+            "
+            DELETE FROM build_structures
+            WHERE structure_id IN (
+              SELECT older.structure_id
+              FROM build_structures older
+              JOIN build_structures newer
+                ON older.grid_x = newer.grid_x
+               AND older.grid_y = newer.grid_y
+               AND older.created_at < newer.created_at
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_build_structures_grid ON build_structures(grid_x, grid_y) WHERE grid_x IS NOT NULL AND grid_y IS NOT NULL",
+            None,
+        )?;
+
+        sql.exec(
+            "
+            CREATE TABLE IF NOT EXISTS build_previews (
+              player_id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              x REAL NOT NULL,
+              y REAL NOT NULL,
+              grid_x INTEGER NOT NULL,
+              grid_y INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_build_previews_updated_at ON build_previews(updated_at)",
             None,
         )?;
 
@@ -482,6 +608,11 @@ impl RoomDurableObject {
                 return Err(error);
             }
         }
+
+        sql.exec(
+            "DELETE FROM build_previews WHERE updated_at < ?",
+            Some(vec![(now_ms() - BUILD_PREVIEW_STALE_MS).into()]),
+        )?;
 
         Ok(())
     }
@@ -644,10 +775,18 @@ impl RoomDurableObject {
 
     fn on_disconnect_player(&self, player_id: &str) -> Result<()> {
         let now = now_ms();
-        self.sql().exec(
+        let sql = self.sql();
+
+        sql.exec(
             "UPDATE presence_players SET connected = 0, last_seen = ? WHERE player_id = ?",
             Some(vec![now.into(), player_id.into()]),
         )?;
+
+        sql.exec(
+            "DELETE FROM build_previews WHERE player_id = ?",
+            Some(vec![player_id.into()]),
+        )?;
+
         self.snapshot_dirty.set(true);
         Ok(())
     }
@@ -735,6 +874,122 @@ impl RoomDurableObject {
         Ok(false)
     }
 
+    fn prune_stale_build_previews(&self) -> Result<()> {
+        self.sql().exec(
+            "DELETE FROM build_previews WHERE updated_at < ?",
+            Some(vec![(now_ms() - BUILD_PREVIEW_STALE_MS).into()]),
+        )?;
+        Ok(())
+    }
+
+    fn can_place_structure_at_cell(
+        &self,
+        grid_x: i64,
+        grid_y: i64,
+        center_x: f64,
+        center_y: f64,
+    ) -> Result<bool> {
+        let sql = self.sql();
+
+        let occupied_rows: Vec<BuildGridOccupiedRow> = sql
+            .exec(
+                "SELECT COUNT(*) AS count FROM build_structures WHERE grid_x = ? AND grid_y = ?",
+                Some(vec![grid_x.into(), grid_y.into()]),
+            )?
+            .to_array()?;
+
+        if occupied_rows.first().is_some_and(|row| row.count > 0) {
+            return Ok(false);
+        }
+
+        let players: Vec<PlayerPositionRow> = sql
+            .exec(
+                "
+                SELECT s.x, s.y
+                FROM movement_state s
+                INNER JOIN presence_players p ON p.player_id = s.player_id
+                WHERE p.connected = 1
+                ",
+                None,
+            )?
+            .to_array()?;
+
+        let blocked = STRUCTURE_COLLIDER_HALF_EXTENT + PLAYER_COLLIDER_RADIUS;
+        for player in players {
+            if (player.x - center_x).abs() < blocked as f64
+                && (player.y - center_y).abs() < blocked as f64
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn handle_build_preview(&self, player_id: &str, payload: Option<Value>) -> Result<bool> {
+        let payload =
+            payload.ok_or_else(|| Error::RustError("missing build preview payload".into()))?;
+        let preview: BuildPreviewPayload = serde_json::from_value(payload)
+            .map_err(|_| Error::RustError("invalid build preview payload".into()))?;
+
+        if !preview.active {
+            self.sql().exec(
+                "DELETE FROM build_previews WHERE player_id = ?",
+                Some(vec![player_id.into()]),
+            )?;
+            self.prune_stale_build_previews()?;
+            self.snapshot_dirty.set(true);
+            return Ok(false);
+        }
+
+        let x = preview
+            .x
+            .ok_or_else(|| Error::RustError("build preview missing x".into()))?;
+        let y = preview
+            .y
+            .ok_or_else(|| Error::RustError("build preview missing y".into()))?;
+        let kind = preview
+            .kind
+            .as_deref()
+            .ok_or_else(|| Error::RustError("build preview missing kind".into()))?;
+
+        if !is_valid_structure_kind(kind) {
+            return Err(Error::RustError("invalid structure kind".into()));
+        }
+
+        let grid_x = snap_axis_to_grid(x);
+        let grid_y = snap_axis_to_grid(y);
+        let center_x = grid_cell_center(grid_x);
+        let center_y = grid_cell_center(grid_y);
+
+        self.sql().exec(
+            "
+            INSERT INTO build_previews (player_id, kind, x, y, grid_x, grid_y, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET
+              kind = excluded.kind,
+              x = excluded.x,
+              y = excluded.y,
+              grid_x = excluded.grid_x,
+              grid_y = excluded.grid_y,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                player_id.into(),
+                kind.into(),
+                center_x.into(),
+                center_y.into(),
+                grid_x.into(),
+                grid_y.into(),
+                now_ms().into(),
+            ]),
+        )?;
+
+        self.prune_stale_build_previews()?;
+        self.snapshot_dirty.set(true);
+        Ok(false)
+    }
+
     fn handle_build_command(
         &self,
         player_id: &str,
@@ -748,8 +1003,17 @@ impl RoomDurableObject {
                 let place: BuildPlacePayload = serde_json::from_value(payload)
                     .map_err(|_| Error::RustError("invalid build payload".into()))?;
 
-                if !matches!(place.kind.as_str(), "beacon" | "miner" | "assembler") {
+                if !is_valid_structure_kind(place.kind.as_str()) {
                     return Err(Error::RustError("invalid structure kind".into()));
+                }
+
+                let grid_x = snap_axis_to_grid(place.x);
+                let grid_y = snap_axis_to_grid(place.y);
+                let snapped_x = grid_cell_center(grid_x);
+                let snapped_y = grid_cell_center(grid_y);
+
+                if !self.can_place_structure_at_cell(grid_x, grid_y, snapped_x, snapped_y)? {
+                    return Err(Error::RustError("build cell is blocked".into()));
                 }
 
                 let structure_id = place
@@ -759,16 +1023,18 @@ impl RoomDurableObject {
 
                 self.sql().exec(
                     "
-                    INSERT INTO build_structures (structure_id, owner_id, kind, x, y, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO build_structures (structure_id, owner_id, kind, x, y, grid_x, grid_y, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(structure_id) DO NOTHING
                     ",
                     Some(vec![
                         structure_id.into(),
                         player_id.into(),
                         place.kind.into(),
-                        place.x.into(),
-                        place.y.into(),
+                        snapped_x.into(),
+                        snapped_y.into(),
+                        grid_x.into(),
+                        grid_y.into(),
                         now_ms().into(),
                     ]),
                 )?;
@@ -776,6 +1042,7 @@ impl RoomDurableObject {
                 self.snapshot_dirty.set(true);
                 Ok(true)
             }
+            "preview" => self.handle_build_preview(player_id, payload),
             "remove" => {
                 let payload =
                     payload.ok_or_else(|| Error::RustError("missing build payload".into()))?;
@@ -888,6 +1155,19 @@ impl RoomDurableObject {
 
         let sql = self.sql();
         let now = now_ms();
+        let obstacle_rows: Vec<StructureObstacleRow> = sql
+            .exec("SELECT kind, x, y FROM build_structures", None)?
+            .to_array()?;
+        let structure_obstacles: Vec<StructureObstacle> = obstacle_rows
+            .iter()
+            .map(|row| StructureObstacle {
+                x: row.x as f32,
+                y: row.y as f32,
+                half_extent: structure_half_extent(row.kind.as_str()),
+            })
+            .collect();
+
+        let mut changed = false;
 
         for player_id in connected_players {
             let input_rows: Vec<MovementInputRow> = sql
@@ -924,14 +1204,26 @@ impl RoomDurableObject {
                 .map(|row| (row.x, row.y))
                 .unwrap_or((0.0, 0.0));
 
-            let step = movement_step(
+            let step = movement_step_with_obstacles(
                 current_x as f32,
                 current_y as f32,
                 map_input_to_core(&input),
                 SIM_DT_SECONDS,
                 MOVE_SPEED,
                 MOVEMENT_MAP_LIMIT,
+                &structure_obstacles,
+                PLAYER_COLLIDER_RADIUS,
             );
+
+            if (step.x as f64 - current_x).abs() > f64::EPSILON
+                || (step.y as f64 - current_y).abs() > f64::EPSILON
+                || state_rows.first().is_some_and(|row| {
+                    (step.vx as f64 - row.vx).abs() > f64::EPSILON
+                        || (step.vy as f64 - row.vy).abs() > f64::EPSILON
+                })
+            {
+                changed = true;
+            }
 
             sql.exec(
                 "
@@ -955,7 +1247,7 @@ impl RoomDurableObject {
             )?;
         }
 
-        Ok(true)
+        Ok(changed)
     }
 
     fn tick_projectiles(&self) -> Result<bool> {
@@ -1085,6 +1377,35 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let preview_rows: Vec<BuildPreviewRow> = sql
+            .exec(
+                "
+                SELECT player_id, kind, x, y
+                FROM build_previews
+                WHERE updated_at > ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                ",
+                Some(vec![
+                    (now_ms() - BUILD_PREVIEW_STALE_MS).into(),
+                    (MAX_PREVIEWS as i64).into(),
+                ]),
+            )?
+            .to_array()?;
+
+        let previews: Vec<Value> = preview_rows
+            .iter()
+            .filter(|row| connected_set.contains(row.player_id.as_str()))
+            .map(|row| {
+                json!({
+                    "playerId": row.player_id,
+                    "kind": row.kind,
+                    "x": row.x,
+                    "y": row.y,
+                })
+            })
+            .collect();
+
         let projectile_rows: Vec<ProjectileRow> = sql
             .exec(
                 "
@@ -1132,6 +1453,8 @@ impl RoomDurableObject {
                 "build": {
                     "structures": structures,
                     "structureCount": structure_rows.len(),
+                    "previews": previews,
+                    "previewCount": previews.len(),
                 },
                 "projectile": {
                     "projectiles": projectiles,

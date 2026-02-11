@@ -1,4 +1,5 @@
 import type {
+  BuildPreview,
   BuildStructure,
   PlayerState,
   ProjectileState,
@@ -109,6 +110,10 @@ function copyStructures(structures: BuildStructure[]) {
   return structures.slice();
 }
 
+function copyPreviews(previews: BuildPreview[]) {
+  return previews.slice();
+}
+
 function snapshotTime(snapshot: RoomSnapshot) {
   return snapshot.serverTime;
 }
@@ -203,6 +208,7 @@ export class ReplicationPipeline {
 
     const projectiles = interpolateProjectiles(olderProjectiles, newerProjectiles, alpha);
     const structures = copyStructures(latest.features.build?.structures ?? []);
+    const previews = copyPreviews(latest.features.build?.previews ?? []);
 
     return {
       serverTick: latest.serverTick,
@@ -211,6 +217,7 @@ export class ReplicationPipeline {
       renderDelayMs: this.interpolationDelayMs,
       players,
       structures,
+      previews,
       projectiles,
     };
   }

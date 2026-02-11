@@ -66,7 +66,6 @@ export function RoomRoute() {
   const [latencyMs, setLatencyMs] = useState(0);
   const [structureCount, setStructureCount] = useState(0);
   const [projectileCount, setProjectileCount] = useState(0);
-  const [optimisticPlacements, setOptimisticPlacements] = useState(0);
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [devInput, setDevInput] = useState('');
   const [devLog, setDevLog] = useState<string[]>([]);
@@ -136,7 +135,6 @@ export function RoomRoute() {
 
           if (build) {
             setStructureCount(build.structureCount);
-            setOptimisticPlacements(0);
           }
 
           if (projectile) {
@@ -319,23 +317,8 @@ export function RoomRoute() {
         </div>
 
         <div className="flex items-center gap-2 text-xs sm:gap-3">
-          <button
-            type="button"
-            className="hud-pill transition hover:border-[#67f0c1]"
-            onClick={() => {
-              const socket = socketRef.current;
-              if (!socket) {
-                return;
-              }
-
-              const targetX = localPosRef.current.x + 48;
-              const targetY = localPosRef.current.y;
-              setOptimisticPlacements((count) => count + 1);
-              socket.sendBuildPlace(targetX, targetY, 'beacon');
-            }}
-          >
-            Place Beacon
-          </button>
+          <span className="hud-pill">Q = Build</span>
+          <span className="hud-pill">Click = Place</span>
           <span className="hud-pill">Space = Shoot</span>
           <MetricPill label="Tick" value={serverTick} />
           <MetricPill label="Sim" value={`${simRateHz}Hz`} />
@@ -344,7 +327,7 @@ export function RoomRoute() {
           <MetricPill label="Interp" value={`${Math.round(interpDelayMs)}ms`} />
           <MetricPill label="Ack" value={lastAckSeq} />
           <MetricPill label="Online" value={activePlayers} />
-          <MetricPill label="Structures" value={structureCount + optimisticPlacements} />
+          <MetricPill label="Structures" value={structureCount} />
           <MetricPill label="Projectiles" value={projectileCount} />
           <span className="hidden rounded-md border border-white/15 bg-[#101b31] px-3 py-1.5 text-[#cfddf9] md:inline-flex">
             {playerLabel}

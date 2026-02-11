@@ -20,6 +20,16 @@ pub struct MovementStep {
     pub vy: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StructureObstacle {
+    pub x: f32,
+    pub y: f32,
+    pub half_extent: f32,
+}
+
+pub const PLAYER_COLLIDER_RADIUS: f32 = 10.0;
+pub const STRUCTURE_COLLIDER_HALF_EXTENT: f32 = 11.0;
+
 pub fn clamp_axis(value: f32, map_limit: f32) -> f32 {
     value.max(-map_limit).min(map_limit)
 }
@@ -60,16 +70,80 @@ pub fn movement_step(
     speed: f32,
     map_limit: f32,
 ) -> MovementStep {
+    movement_step_with_obstacles(
+        x,
+        y,
+        input,
+        dt_seconds,
+        speed,
+        map_limit,
+        &[],
+        PLAYER_COLLIDER_RADIUS,
+    )
+}
+
+fn collides_with_obstacle(
+    x: f32,
+    y: f32,
+    obstacle: &StructureObstacle,
+    player_radius: f32,
+) -> bool {
+    let blocked = obstacle.half_extent + player_radius;
+    (x - obstacle.x).abs() < blocked && (y - obstacle.y).abs() < blocked
+}
+
+pub fn movement_step_with_obstacles(
+    x: f32,
+    y: f32,
+    input: InputState,
+    dt_seconds: f32,
+    speed: f32,
+    map_limit: f32,
+    obstacles: &[StructureObstacle],
+    player_radius: f32,
+) -> MovementStep {
     let velocity = movement_velocity(input, speed);
+
+    let desired_x = clamp_axis(x + velocity.x * dt_seconds, map_limit);
+    let desired_y = clamp_axis(y + velocity.y * dt_seconds, map_limit);
+
+    let mut resolved_x = desired_x;
+    let mut resolved_y = desired_y;
+    let mut resolved_vx = velocity.x;
+    let mut resolved_vy = velocity.y;
+
+    if obstacles
+        .iter()
+        .any(|obstacle| collides_with_obstacle(resolved_x, y, obstacle, player_radius))
+    {
+        resolved_x = x;
+        resolved_vx = 0.0;
+    }
+
+    if obstacles
+        .iter()
+        .any(|obstacle| collides_with_obstacle(resolved_x, resolved_y, obstacle, player_radius))
+    {
+        resolved_y = y;
+        resolved_vy = 0.0;
+    }
+
     MovementStep {
-        x: clamp_axis(x + velocity.x * dt_seconds, map_limit),
-        y: clamp_axis(y + velocity.y * dt_seconds, map_limit),
-        vx: velocity.x,
-        vy: velocity.y,
+        x: resolved_x,
+        y: resolved_y,
+        vx: resolved_vx,
+        vy: resolved_vy,
     }
 }
 
-pub fn projectile_step(x: f32, y: f32, vx: f32, vy: f32, dt_seconds: f32, map_limit: f32) -> (f32, f32) {
+pub fn projectile_step(
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    dt_seconds: f32,
+    map_limit: f32,
+) -> (f32, f32) {
     (
         clamp_axis(x + vx * dt_seconds, map_limit),
         clamp_axis(y + vy * dt_seconds, map_limit),
@@ -117,7 +191,12 @@ pub extern "C" fn sim_compute_velocity_y(
 }
 
 #[no_mangle]
-pub extern "C" fn sim_integrate_position(position: f32, velocity: f32, dt_seconds: f32, map_limit: f32) -> f32 {
+pub extern "C" fn sim_integrate_position(
+    position: f32,
+    velocity: f32,
+    dt_seconds: f32,
+    map_limit: f32,
+) -> f32 {
     clamp_axis(position + velocity * dt_seconds, map_limit)
 }
 
@@ -165,5 +244,33 @@ mod tests {
         let (x, y) = projectile_step(0.0, 0.0, 10000.0, -10000.0, 1.0, 5500.0);
         assert_eq!(x, 5500.0);
         assert_eq!(y, -5500.0);
+    }
+
+    #[test]
+    fn movement_step_respects_obstacles() {
+        let obstacle = StructureObstacle {
+            x: 0.0,
+            y: 0.0,
+            half_extent: STRUCTURE_COLLIDER_HALF_EXTENT,
+        };
+
+        let result = movement_step_with_obstacles(
+            -40.0,
+            0.0,
+            InputState {
+                up: false,
+                down: false,
+                left: false,
+                right: true,
+            },
+            0.25,
+            220.0,
+            5000.0,
+            &[obstacle],
+            PLAYER_COLLIDER_RADIUS,
+        );
+
+        assert_eq!(result.x, -40.0);
+        assert_eq!(result.vx, 0.0);
     }
 }

@@ -17,6 +17,13 @@ export type BuildStructure = {
   ownerId: string;
 };
 
+export type BuildPreview = {
+  playerId: string;
+  x: number;
+  y: number;
+  kind: string;
+};
+
 export type PresenceSnapshot = {
   online: string[];
   onlineCount: number;
@@ -33,6 +40,8 @@ export type MovementSnapshot = {
 export type BuildSnapshot = {
   structures: BuildStructure[];
   structureCount: number;
+  previews: BuildPreview[];
+  previewCount: number;
 };
 
 export type ProjectileState = {
@@ -116,5 +125,6 @@ export type RenderSnapshotPayload = {
   renderDelayMs: number;
   players: PlayerState[];
   structures: BuildStructure[];
+  previews: BuildPreview[];
   projectiles: ProjectileState[];
 };

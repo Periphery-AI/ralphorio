@@ -1,10 +1,13 @@
 use bevy::prelude::*;
 use bevy::render::texture::ImagePlugin;
-use bevy::window::WindowResolution;
+use bevy::window::{PrimaryWindow, WindowResolution};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sim_core::{movement_step, InputState as CoreInputState};
+use sim_core::{
+    movement_step_with_obstacles, InputState as CoreInputState, StructureObstacle,
+    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -18,6 +21,8 @@ const CHARACTER_SCALE: f32 = 1.75;
 const STRUCTURE_SIZE: f32 = 18.0;
 const PROJECTILE_SIZE: f32 = 8.0;
 const MAP_LIMIT: f32 = 5000.0;
+const BUILD_GRID_SIZE: f32 = 32.0;
+const BUILD_PREVIEW_SEND_INTERVAL_SECONDS: f32 = 0.08;
 const MOVE_SPEED: f32 = 220.0;
 const PROJECTILE_SPEED: f32 = 760.0;
 const PROJECTILE_TTL_SECONDS: f32 = 1.8;
@@ -35,6 +40,7 @@ const SNAPSHOT_Z: f32 = 4.0;
 const STRUCTURE_Z: f32 = 3.0;
 const PROJECTILE_Z: f32 = 5.0;
 const FLOOR_Z: f32 = 0.0;
+const BUILD_PREVIEW_Z: f32 = 3.6;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -64,6 +70,15 @@ struct StructureState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildPreviewState {
+    #[serde(rename = "playerId")]
+    player_id: String,
+    x: f32,
+    y: f32,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectileState {
     id: String,
     x: f32,
@@ -89,6 +104,8 @@ struct SnapshotPayload {
     players: Vec<PlayerState>,
     #[serde(default)]
     structures: Vec<StructureState>,
+    #[serde(default)]
+    previews: Vec<BuildPreviewState>,
     #[serde(default)]
     projectiles: Vec<ProjectileState>,
 }
@@ -144,6 +161,14 @@ struct RemoteTarget(Vec2);
 struct StructureActor {
     id: String,
 }
+
+#[derive(Component)]
+struct BuildPreviewActor {
+    player_id: String,
+}
+
+#[derive(Component)]
+struct LocalBuildGhost;
 
 #[derive(Component)]
 struct ProjectileActor {
@@ -228,6 +253,25 @@ impl Default for NextInputSeq {
 #[derive(Resource, Default)]
 struct InputHistory(VecDeque<InputHistoryEntry>);
 
+#[derive(Resource)]
+struct BuildPlacementState {
+    active: bool,
+    kind: &'static str,
+    last_sent_cell: Option<IVec2>,
+    send_cooldown: f32,
+}
+
+impl Default for BuildPlacementState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            kind: "beacon",
+            last_sent_cell: None,
+            send_cooldown: 0.0,
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -255,6 +299,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .insert_resource(SimAccumulator::default())
         .insert_resource(NextInputSeq::default())
         .insert_resource(InputHistory::default())
+        .insert_resource(BuildPlacementState::default())
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -273,6 +318,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             (
                 sync_player_id,
                 simulate_local_player,
+                handle_build_placement_controls,
                 emit_projectile_fire_command,
                 simulate_predicted_projectiles,
                 apply_latest_snapshot,
@@ -397,6 +443,20 @@ fn setup_world(
         CharacterAnimator::default(),
         LocalActor,
     ));
+
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: structure_preview_color("beacon", true),
+                custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
+                ..default()
+            },
+            transform: Transform::from_xyz(0.0, 0.0, BUILD_PREVIEW_Z),
+            visibility: Visibility::Hidden,
+            ..default()
+        },
+        LocalBuildGhost,
+    ));
 }
 
 fn sync_player_id(
@@ -475,13 +535,141 @@ fn queue_feature_command(feature: &str, action: &str, payload: Value) {
     }
 }
 
+fn snap_world_to_build_grid(world: Vec2) -> (IVec2, Vec2) {
+    let grid_x = (world.x / BUILD_GRID_SIZE).round() as i32;
+    let grid_y = (world.y / BUILD_GRID_SIZE).round() as i32;
+    let snapped = Vec2::new(
+        (grid_x as f32 * BUILD_GRID_SIZE).clamp(-MAP_LIMIT, MAP_LIMIT),
+        (grid_y as f32 * BUILD_GRID_SIZE).clamp(-MAP_LIMIT, MAP_LIMIT),
+    );
+    (IVec2::new(grid_x, grid_y), snapped)
+}
+
+fn set_local_build_ghost_visible(
+    ghost_query: &mut Query<(&mut Transform, &mut Visibility, &mut Sprite), With<LocalBuildGhost>>,
+    visible: bool,
+    position: Vec2,
+    kind: &str,
+) {
+    if let Ok((mut transform, mut visibility, mut sprite)) = ghost_query.get_single_mut() {
+        transform.translation.x = position.x;
+        transform.translation.y = position.y;
+        *visibility = if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        sprite.color = structure_preview_color(kind, true);
+    }
+}
+
+fn disable_build_mode(placement: &mut BuildPlacementState) {
+    placement.active = false;
+    placement.last_sent_cell = None;
+    placement.send_cooldown = 0.0;
+    queue_feature_command(
+        "build",
+        "preview",
+        json!({
+            "active": false,
+        }),
+    );
+}
+
+fn handle_build_placement_controls(
+    time: Res<Time>,
+    input: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut placement: ResMut<BuildPlacementState>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    mut ghost_query: Query<(&mut Transform, &mut Visibility, &mut Sprite), With<LocalBuildGhost>>,
+) {
+    if input.just_pressed(KeyCode::KeyQ) {
+        if placement.active {
+            disable_build_mode(&mut placement);
+            set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+            return;
+        }
+
+        placement.active = true;
+        placement.last_sent_cell = None;
+        placement.send_cooldown = BUILD_PREVIEW_SEND_INTERVAL_SECONDS;
+    }
+
+    if input.just_pressed(KeyCode::Escape) && placement.active {
+        disable_build_mode(&mut placement);
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    }
+
+    if !placement.active {
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    }
+
+    let Ok(window) = window_query.get_single() else {
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    };
+    let Some(cursor_pos) = window.cursor_position() else {
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    };
+    let Ok((camera, camera_transform)) = camera_query.get_single() else {
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    };
+    let Some(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor_pos) else {
+        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        return;
+    };
+
+    let (cell, snapped) = snap_world_to_build_grid(world_pos);
+    set_local_build_ghost_visible(&mut ghost_query, true, snapped, placement.kind);
+
+    placement.send_cooldown += time.delta_seconds();
+    let cell_changed = placement.last_sent_cell != Some(cell);
+    if cell_changed || placement.send_cooldown >= BUILD_PREVIEW_SEND_INTERVAL_SECONDS {
+        placement.last_sent_cell = Some(cell);
+        placement.send_cooldown = 0.0;
+        queue_feature_command(
+            "build",
+            "preview",
+            json!({
+                "active": true,
+                "x": snapped.x,
+                "y": snapped.y,
+                "kind": placement.kind,
+            }),
+        );
+    }
+
+    if mouse_buttons.just_pressed(MouseButton::Left) {
+        queue_feature_command(
+            "build",
+            "place",
+            json!({
+                "x": snapped.x,
+                "y": snapped.y,
+                "kind": placement.kind,
+                "clientBuildId": format!("build_{}", Uuid::new_v4()),
+            }),
+        );
+    }
+}
+
 fn simulate_local_player(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut accumulator: ResMut<SimAccumulator>,
     mut next_input_seq: ResMut<NextInputSeq>,
     mut input_history: ResMut<InputHistory>,
-    mut local_transform_query: Query<(&mut Transform, &mut ActorVelocity), With<LocalActor>>,
+    structure_query: Query<&Transform, (With<StructureActor>, Without<LocalActor>)>,
+    mut local_transform_query: Query<
+        (&mut Transform, &mut ActorVelocity),
+        (With<LocalActor>, Without<StructureActor>),
+    >,
 ) {
     let Ok((mut transform, mut velocity)) = local_transform_query.get_single_mut() else {
         return;
@@ -489,19 +677,29 @@ fn simulate_local_player(
 
     accumulator.0 += time.delta_seconds();
     let mut steps = 0;
+    let structure_obstacles: Vec<StructureObstacle> = structure_query
+        .iter()
+        .map(|structure| StructureObstacle {
+            x: structure.translation.x,
+            y: structure.translation.y,
+            half_extent: STRUCTURE_COLLIDER_HALF_EXTENT,
+        })
+        .collect();
 
     while accumulator.0 >= CLIENT_SIM_DT && steps < MAX_SIM_STEPS_PER_FRAME {
         accumulator.0 -= CLIENT_SIM_DT;
         steps += 1;
 
         let state = sample_input_state(&input);
-        let step = movement_step(
+        let step = movement_step_with_obstacles(
             transform.translation.x,
             transform.translation.y,
             to_core_input(&state),
             CLIENT_SIM_DT,
             MOVE_SPEED,
             MAP_LIMIT,
+            &structure_obstacles,
+            PLAYER_COLLIDER_RADIUS,
         );
         transform.translation.x = step.x;
         transform.translation.y = step.y;
@@ -648,6 +846,7 @@ fn apply_latest_snapshot(
     mut local_query: Query<(&mut Transform, &mut Actor), (With<LocalActor>, Without<RemoteActor>)>,
     remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
     structure_query: Query<(Entity, &StructureActor)>,
+    preview_query: Query<(Entity, &BuildPreviewActor)>,
     projectile_query: Query<(Entity, &ProjectileActor)>,
     predicted_projectile_query: Query<(Entity, &PredictedProjectileActor)>,
     mut predicted_target_query: Query<&mut PredictedProjectileTarget>,
@@ -668,13 +867,31 @@ fn apply_latest_snapshot(
     let Some(snapshot) = latest_snapshot else {
         return;
     };
+    let SnapshotPayload {
+        local_ack_seq,
+        render_delay_ms,
+        players,
+        structures,
+        previews,
+        projectiles,
+        ..
+    } = snapshot;
+    let structure_obstacles: Vec<StructureObstacle> = structures
+        .iter()
+        .map(|structure| StructureObstacle {
+            x: structure.x,
+            y: structure.y,
+            half_extent: STRUCTURE_COLLIDER_HALF_EXTENT,
+        })
+        .collect();
+    let local_player_id = current_player_id.0.clone();
 
     let mut remote_entities: HashMap<String, Entity> = remote_query
         .iter()
         .map(|(entity, actor)| (actor.id.clone(), entity))
         .collect();
 
-    for player in snapshot.players.into_iter().filter(|state| state.connected) {
+    for player in players.into_iter().filter(|state| state.connected) {
         let is_local = current_player_id
             .0
             .as_deref()
@@ -686,8 +903,9 @@ fn apply_latest_snapshot(
                 reconcile_local_transform(
                     &mut local_transform,
                     Vec2::new(player.x, player.y),
-                    snapshot.local_ack_seq,
+                    local_ack_seq,
                     &mut input_history,
+                    &structure_obstacles,
                 );
             }
 
@@ -717,7 +935,7 @@ fn apply_latest_snapshot(
         .map(|(entity, structure)| (structure.id.clone(), entity))
         .collect();
 
-    for structure in snapshot.structures {
+    for structure in structures {
         if let Some(entity) = structure_entities.remove(&structure.id) {
             commands.entity(entity).insert(Transform::from_xyz(
                 structure.x,
@@ -733,6 +951,37 @@ fn apply_latest_snapshot(
         commands.entity(*entity).despawn_recursive();
     }
 
+    let mut preview_entities: HashMap<String, Entity> = preview_query
+        .iter()
+        .map(|(entity, preview)| (preview.player_id.clone(), entity))
+        .collect();
+
+    for preview in previews {
+        if local_player_id
+            .as_deref()
+            .is_some_and(|player_id| player_id == preview.player_id)
+        {
+            if let Some(entity) = preview_entities.remove(&preview.player_id) {
+                commands.entity(entity).despawn_recursive();
+            }
+            continue;
+        }
+
+        if let Some(entity) = preview_entities.remove(&preview.player_id) {
+            commands.entity(entity).insert(Transform::from_xyz(
+                preview.x,
+                preview.y,
+                BUILD_PREVIEW_Z,
+            ));
+        } else {
+            spawn_build_preview_actor(&mut commands, &preview);
+        }
+    }
+
+    for entity in preview_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
     let mut projectile_entities: HashMap<String, Entity> = projectile_query
         .iter()
         .map(|(entity, projectile)| (projectile.id.clone(), entity))
@@ -741,9 +990,7 @@ fn apply_latest_snapshot(
         .iter()
         .map(|(entity, predicted)| (predicted.client_projectile_id.clone(), entity))
         .collect();
-    let local_player_id = current_player_id.0.clone();
-
-    for projectile in snapshot.projectiles {
+    for projectile in projectiles {
         if local_player_id
             .as_deref()
             .is_some_and(|player_id| player_id == projectile.owner_id)
@@ -753,10 +1000,8 @@ fn apply_latest_snapshot(
                     predicted_projectile_entities.remove(client_projectile_id)
                 {
                     if let Ok(mut target) = predicted_target_query.get_mut(predicted_entity) {
-                        let projected_x =
-                            projectile.x + projectile.vx * (snapshot.render_delay_ms / 1000.0);
-                        let projected_y =
-                            projectile.y + projectile.vy * (snapshot.render_delay_ms / 1000.0);
+                        let projected_x = projectile.x + projectile.vx * (render_delay_ms / 1000.0);
+                        let projected_y = projectile.y + projectile.vy * (render_delay_ms / 1000.0);
                         target.has_target = true;
                         target.position = Vec2::new(projected_x, projected_y);
                     }
@@ -790,6 +1035,7 @@ fn reconcile_local_transform(
     authoritative_position: Vec2,
     local_ack_seq: u32,
     input_history: &mut InputHistory,
+    structure_obstacles: &[StructureObstacle],
 ) {
     while input_history
         .0
@@ -801,13 +1047,15 @@ fn reconcile_local_transform(
 
     let mut replay_position = authoritative_position;
     for entry in input_history.0.iter() {
-        let step = movement_step(
+        let step = movement_step_with_obstacles(
             replay_position.x,
             replay_position.y,
             to_core_input(&entry.state),
             CLIENT_SIM_DT,
             MOVE_SPEED,
             MAP_LIMIT,
+            structure_obstacles,
+            PLAYER_COLLIDER_RADIUS,
         );
         replay_position.x = step.x;
         replay_position.y = step.y;
@@ -913,18 +1161,26 @@ fn spawn_remote_actor(
     ));
 }
 
-fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
-    let color = match structure.kind.as_str() {
+fn structure_color(kind: &str) -> Color {
+    match kind {
         "beacon" => Color::srgb_u8(99, 210, 255),
         "miner" => Color::srgb_u8(167, 139, 250),
         "assembler" => Color::srgb_u8(74, 222, 128),
         _ => Color::srgb_u8(255, 255, 255),
-    };
+    }
+}
 
+fn structure_preview_color(kind: &str, is_local: bool) -> Color {
+    let base = structure_color(kind).to_srgba();
+    let alpha = if is_local { 0.55 } else { 0.35 };
+    Color::srgba(base.red, base.green, base.blue, alpha)
+}
+
+fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
     commands.spawn((
         SpriteBundle {
             sprite: Sprite {
-                color,
+                color: structure_color(structure.kind.as_str()),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
                 ..default()
             },
@@ -933,6 +1189,23 @@ fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
         },
         StructureActor {
             id: structure.id.clone(),
+        },
+    ));
+}
+
+fn spawn_build_preview_actor(commands: &mut Commands, preview: &BuildPreviewState) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: structure_preview_color(preview.kind.as_str(), false),
+                custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
+                ..default()
+            },
+            transform: Transform::from_xyz(preview.x, preview.y, BUILD_PREVIEW_Z),
+            ..default()
+        },
+        BuildPreviewActor {
+            player_id: preview.player_id.clone(),
         },
     ));
 }
