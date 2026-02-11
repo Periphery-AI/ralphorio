@@ -19,7 +19,8 @@
     "worker:dev:raw": "wrangler dev --config worker/wrangler.toml",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke:prod": "node scripts/production-smoke.mjs"
   },
   "dependencies": {
     "@clerk/clerk-react": "^5.60.0",

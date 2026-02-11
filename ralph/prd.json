@@ -135,7 +135,7 @@
         "Two-player smoke test passes on production domain",
         "Known limitations documented"
       ],
-      "passes": false
+      "passes": true
     }
   ]
 }

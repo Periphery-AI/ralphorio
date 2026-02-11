@@ -143,4 +143,12 @@ Entry format:
 - decisions: Kept all existing runtime/protocol systems in place and added tests around current boundaries instead of rewriting simulation or network code; integrated smoke coverage into `check:premerge` so regressions fail the existing pre-merge gate.
 - files: worker/src/lib.rs, scripts/replication-smoke.test.ts, scripts/premerge-checks.sh, package.json, ralph/prd.json, ralph/progress.txt
 - validation: npm run test:smoke (pass, 3 tests); cargo test --manifest-path worker/Cargo.toml (pass, 30 tests); npm run check:premerge (pass: sim-core tests, worker tests, worker/game-client checks, smoke tests, build:web)
+- commit: 67fd250
+
+- timestamp: 2026-02-11
+- item: RLP2-110
+- summary: Shipped the production release slice by deploying `ralph-island-game` to `will.ralph-island.com`, adding a repeatable authenticated two-player production smoke runner, and documenting a release smoke checklist with known limitations.
+- decisions: Built on the existing Cloudflare deploy path and Clerk auth model; no gameplay subsystem rewrites. Implemented production smoke as a standalone Node script that mints real Clerk session JWTs through the ticket flow, validates dual-player authoritative websocket handshake/snapshot/ack behavior, and cleans up temporary users to keep production data hygiene intact.
+- files: scripts/production-smoke.mjs, docs/release-smoke-checklist.md, package.json, ralph/prd.json, ralph/progress.txt
+- validation: npm run lint (pass); npm run deploy (pass, deployed `ralph-island-game` to `will.ralph-island.com`, version `880a9f3e-fa94-4cf2-a5bd-e99fc78db3c4`); set -a; source .env.production; set +a; npm run smoke:prod (pass, room `SMOKEMLIMZOXY`, 2 authenticated players connected with welcome + shared snapshot + ack/pong)
 - commit: pending
