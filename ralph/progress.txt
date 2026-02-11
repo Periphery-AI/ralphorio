@@ -97,3 +97,11 @@ Format per entry:
 - files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: feat(worker): implement authoritative crafting queue execution
+
+- timestamp: 2026-02-11
+- item: RL-010
+- summary: Completed build placement inventory-cost enforcement so structure placement now atomically consumes authoritative inventory resources before persistence/replication.
+- decisions: Keep existing occupancy/collision checks and SQLite-backed structure persistence flow; add per-structure cost tables (`beacon`/`miner`/`assembler`) using craftable resources (`iron_plate`, `copper_plate`, `gear`); enforce all-or-nothing inventory deduction and mark inventory dirty on successful placement so connected clients receive updated authoritative inventory state.
+- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml
+- commit: feat(worker): enforce inventory costs for build placement

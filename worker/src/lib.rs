@@ -79,6 +79,10 @@ const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
 const MAX_CHARACTER_PROFILE_SLOTS: usize = 8;
 
+const BUILD_COST_BEACON: [(&str, u32); 2] = [("iron_plate", 2), ("copper_plate", 1)];
+const BUILD_COST_MINER: [(&str, u32); 2] = [("iron_plate", 3), ("gear", 2)];
+const BUILD_COST_ASSEMBLER: [(&str, u32); 2] = [("iron_plate", 9), ("gear", 5)];
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ClientEnvelopeKind {
@@ -1148,6 +1152,38 @@ fn map_input_to_core(input: &InputState) -> CoreInputState {
 
 fn is_valid_structure_kind(kind: &str) -> bool {
     matches!(kind, "beacon" | "miner" | "assembler")
+}
+
+fn structure_build_cost(kind: &str) -> Option<&'static [(&'static str, u32)]> {
+    match kind {
+        "beacon" => Some(&BUILD_COST_BEACON),
+        "miner" => Some(&BUILD_COST_MINER),
+        "assembler" => Some(&BUILD_COST_ASSEMBLER),
+        _ => None,
+    }
+}
+
+fn consume_structure_build_cost(inventory: &mut RuntimeInventoryState, kind: &str) -> Result<()> {
+    let cost = structure_build_cost(kind)
+        .ok_or_else(|| Error::RustError("invalid structure kind".into()))?;
+    if cost.is_empty() {
+        return Ok(());
+    }
+
+    let mut consumed_inventory = inventory.clone();
+    for (resource, amount) in cost.iter() {
+        if consumed_inventory
+            .remove_resource(resource, *amount)
+            .is_err()
+        {
+            return Err(Error::RustError(
+                "insufficient inventory resources for build placement".into(),
+            ));
+        }
+    }
+
+    *inventory = consumed_inventory;
+    Ok(())
 }
 
 fn structure_half_extent(_kind: &str) -> f32 {
@@ -2893,6 +2929,17 @@ impl RoomDurableObject {
                     return Err(Error::RustError("build cell is blocked".into()));
                 }
 
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let inventory = runtime
+                        .inventories
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                    inventory.normalize();
+                    consume_structure_build_cost(inventory, place.kind.as_str())?;
+                }
+                self.persist_inventory_for_player(player_id)?;
+
                 let structure_id = place
                     .client_build_id
                     .filter(|value| !value.is_empty())
@@ -2940,6 +2987,7 @@ impl RoomDurableObject {
 
                 self.snapshot_dirty.set(true);
                 self.dirty_build.set(true);
+                self.dirty_inventory.set(true);
                 Ok(true)
             }
             "preview" => self.handle_build_preview(player_id, payload),
@@ -4642,6 +4690,38 @@ mod tests {
             .move_stack(0, 1, Some(4))
             .expect_err("partial swap should fail");
         assert!(format!("{error}").contains("different resource"));
+    }
+
+    #[test]
+    fn structure_build_cost_consumes_inventory_requirements() {
+        let mut inventory = RuntimeInventoryState::new(8);
+        inventory.add_resource("iron_plate", 16).expect("seed iron");
+        inventory
+            .add_resource("copper_plate", 2)
+            .expect("seed copper");
+        inventory.add_resource("gear", 7).expect("seed gear");
+
+        consume_structure_build_cost(&mut inventory, "beacon").expect("consume beacon cost");
+        assert_eq!(resource_total(&inventory, "iron_plate"), 14);
+        assert_eq!(resource_total(&inventory, "copper_plate"), 1);
+        assert_eq!(resource_total(&inventory, "gear"), 7);
+
+        consume_structure_build_cost(&mut inventory, "assembler").expect("consume assembler cost");
+        assert_eq!(resource_total(&inventory, "iron_plate"), 5);
+        assert_eq!(resource_total(&inventory, "gear"), 2);
+    }
+
+    #[test]
+    fn structure_build_cost_rejects_without_partial_inventory_mutation() {
+        let mut inventory = RuntimeInventoryState::new(8);
+        inventory.add_resource("iron_plate", 9).expect("seed iron");
+        inventory.add_resource("gear", 4).expect("seed gear");
+
+        let error = consume_structure_build_cost(&mut inventory, "assembler")
+            .expect_err("assembler build should fail without enough gear");
+        assert!(format!("{error}").contains("insufficient inventory resources"));
+        assert_eq!(resource_total(&inventory, "iron_plate"), 9);
+        assert_eq!(resource_total(&inventory, "gear"), 4);
     }
 
     #[test]

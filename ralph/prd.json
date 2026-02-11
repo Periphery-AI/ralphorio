@@ -139,7 +139,7 @@
         "Placed entities persist in SQLite",
         "Placed entities replicate to all connected players"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-011",
