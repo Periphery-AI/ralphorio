@@ -232,6 +232,7 @@ export class ReplicationPipeline {
     const terrain = latest.features.terrain ?? null;
     const mining = latest.features.mining ?? null;
     const drops = latest.features.drops ?? null;
+    const combat = latest.features.combat ?? null;
     const character = latest.features.character ?? null;
 
     return {
@@ -246,6 +247,7 @@ export class ReplicationPipeline {
       terrain,
       mining,
       drops,
+      combat,
       character,
     };
   }

@@ -292,5 +292,6 @@ export type RenderSnapshotPayload = {
   terrain: TerrainSnapshot | null;
   mining: MiningSnapshot | null;
   drops: DropSnapshot | null;
+  combat: CombatSnapshot | null;
   character: CharacterSnapshot | null;
 };

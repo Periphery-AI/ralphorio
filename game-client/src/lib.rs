@@ -1,3 +1,4 @@
+use bevy::asset::AssetMetaCheck;
 use bevy::prelude::*;
 use bevy::render::texture::ImagePlugin;
 use bevy::window::{PrimaryWindow, WindowResolution};
@@ -56,6 +57,7 @@ const CHARACTER_DIRECTION_EPSILON: f32 = 0.001;
 const SNAPSHOT_Z: f32 = 4.0;
 const STRUCTURE_Z: f32 = 3.0;
 const PROJECTILE_Z: f32 = 5.0;
+const ENEMY_Z: f32 = 3.25;
 const FLOOR_Z: f32 = 0.0;
 const TERRAIN_RESOURCE_OVERLAY_Z: f32 = 0.15;
 const BUILD_PREVIEW_Z: f32 = 3.6;
@@ -67,6 +69,7 @@ const MINING_PROGRESS_BAR_HEIGHT: f32 = 4.0;
 const MINING_INTERACT_RADIUS: f32 = 20.0;
 const DROP_Z: f32 = 2.58;
 const DROP_BASE_SIZE: f32 = 10.0;
+const ENEMY_BASE_SIZE: f32 = 22.0;
 const DROP_PICKUP_INTERACT_RADIUS: f32 = 84.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 
@@ -196,6 +199,25 @@ struct CharacterSnapshotState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnemySnapshotState {
+    id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    health: u32,
+    #[serde(rename = "maxHealth")]
+    max_health: u32,
+    #[serde(rename = "targetPlayerId")]
+    target_player_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CombatSnapshotState {
+    enemies: Vec<EnemySnapshotState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotPayload {
     #[serde(rename = "serverTick")]
     server_tick: u32,
@@ -218,6 +240,8 @@ struct SnapshotPayload {
     mining: Option<MiningSnapshotState>,
     #[serde(default)]
     drops: Option<DropsSnapshotState>,
+    #[serde(default)]
+    combat: Option<CombatSnapshotState>,
     #[serde(default)]
     character: Option<CharacterSnapshotState>,
 }
@@ -325,6 +349,11 @@ struct LocalBuildGhost;
 
 #[derive(Component)]
 struct ProjectileActor {
+    id: String,
+}
+
+#[derive(Component)]
+struct EnemyActor {
     id: String,
 }
 
@@ -559,6 +588,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             DefaultPlugins
                 .set(AssetPlugin {
                     file_path: "/".to_string(),
+                    meta_check: AssetMetaCheck::Never,
                     ..default()
                 })
                 .set(WindowPlugin {
@@ -798,6 +828,7 @@ fn apply_pending_session_reset(
             With<DropActor>,
             With<BuildPreviewActor>,
             With<ProjectileActor>,
+            With<EnemyActor>,
             With<PredictedProjectileActor>,
             With<TerrainTileActor>,
             With<TerrainResourceOverlayActor>,
@@ -1484,7 +1515,10 @@ fn apply_latest_snapshot(
         With<RemoteActor>,
     >,
     mut name_label_query: Query<&mut Text, With<ActorNameLabel>>,
-    structure_query: Query<(Entity, &StructureActor)>,
+    world_object_query: Query<
+        (Entity, Option<&StructureActor>, Option<&EnemyActor>),
+        Or<(With<StructureActor>, With<EnemyActor>)>,
+    >,
     mining_node_query: Query<(Entity, &MiningNodeActor)>,
     mining_progress_query: Query<(Entity, &MiningProgressActor)>,
     drop_query: Query<(Entity, &DropActor)>,
@@ -1521,6 +1555,7 @@ fn apply_latest_snapshot(
         terrain,
         mining,
         drops,
+        combat,
         character,
         ..
     } = snapshot;
@@ -1665,9 +1700,11 @@ fn apply_latest_snapshot(
         commands.entity(*entity).despawn_recursive();
     }
 
-    let mut structure_entities: HashMap<String, Entity> = structure_query
+    let mut structure_entities: HashMap<String, Entity> = world_object_query
         .iter()
-        .map(|(entity, structure)| (structure.id.clone(), entity))
+        .filter_map(|(entity, structure, _)| {
+            structure.map(|structure| (structure.id.clone(), entity))
+        })
         .collect();
 
     for structure in structures {
@@ -1683,6 +1720,47 @@ fn apply_latest_snapshot(
     }
 
     for entity in structure_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
+    let latest_enemies = combat.map_or_else(Vec::new, |snapshot| snapshot.enemies);
+    let mut enemy_entities: HashMap<String, Entity> = world_object_query
+        .iter()
+        .filter_map(|(entity, _, enemy)| enemy.map(|enemy| (enemy.id.clone(), entity)))
+        .collect();
+    for enemy in latest_enemies {
+        if enemy.health == 0 {
+            if let Some(entity) = enemy_entities.remove(enemy.id.as_str()) {
+                commands.entity(entity).despawn_recursive();
+            }
+            continue;
+        }
+
+        let targets_local_player = local_player_id
+            .as_deref()
+            .zip(enemy.target_player_id.as_deref())
+            .is_some_and(|(local_id, target_id)| local_id == target_id);
+
+        if let Some(entity) = enemy_entities.remove(enemy.id.as_str()) {
+            commands.entity(entity).insert((
+                Transform::from_xyz(enemy.x, enemy.y, ENEMY_Z),
+                Sprite {
+                    color: enemy_color(
+                        enemy.kind.as_str(),
+                        enemy.health,
+                        enemy.max_health,
+                        targets_local_player,
+                    ),
+                    custom_size: Some(Vec2::splat(enemy_size(enemy.kind.as_str()))),
+                    ..default()
+                },
+            ));
+        } else {
+            spawn_enemy_actor(&mut commands, &enemy, targets_local_player);
+        }
+    }
+
+    for entity in enemy_entities.values() {
         commands.entity(*entity).despawn_recursive();
     }
 
@@ -1974,8 +2052,11 @@ fn animate_character_sprites(
 fn animate_mining_effects(
     time: Res<Time>,
     current_player_id: Res<CurrentPlayerId>,
-    mut node_query: Query<(&MiningNodeActor, &mut Sprite)>,
-    mut progress_query: Query<(&MiningProgressActor, &mut Sprite, &mut Transform)>,
+    mut node_query: Query<(&MiningNodeActor, &mut Sprite), Without<MiningProgressActor>>,
+    mut progress_query: Query<
+        (&MiningProgressActor, &mut Sprite, &mut Transform),
+        Without<MiningNodeActor>,
+    >,
 ) {
     let t = time.elapsed_seconds();
     let pulse = ((t * 8.5).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
@@ -2335,6 +2416,40 @@ fn structure_preview_color(kind: &str, is_local: bool) -> Color {
     Color::srgba(base.red, base.green, base.blue, alpha)
 }
 
+fn enemy_size(kind: &str) -> f32 {
+    match kind {
+        "biter_small" => ENEMY_BASE_SIZE,
+        "biter_medium" => ENEMY_BASE_SIZE * 1.24,
+        "spitter_small" => ENEMY_BASE_SIZE * 1.1,
+        _ => ENEMY_BASE_SIZE,
+    }
+}
+
+fn enemy_color(kind: &str, health: u32, max_health: u32, targets_local_player: bool) -> Color {
+    let base = match kind {
+        "biter_small" => Color::srgb_u8(206, 95, 84),
+        "biter_medium" => Color::srgb_u8(190, 74, 67),
+        "spitter_small" => Color::srgb_u8(133, 119, 214),
+        _ => Color::srgb_u8(204, 89, 81),
+    }
+    .to_srgba();
+
+    let health_ratio = if max_health == 0 {
+        0.0
+    } else {
+        (health as f32 / max_health as f32).clamp(0.0, 1.0)
+    };
+    let vitality = 0.56 + health_ratio * 0.44;
+    let aggro_boost = if targets_local_player { 0.12 } else { 0.0 };
+
+    Color::srgba(
+        (base.red * vitality + aggro_boost).clamp(0.0, 1.0),
+        (base.green * vitality).clamp(0.0, 1.0),
+        (base.blue * vitality).clamp(0.0, 1.0),
+        0.9,
+    )
+}
+
 fn mining_node_base_color(kind: &str) -> Color {
     match kind {
         "iron_ore" => Color::srgb_u8(133, 163, 188),
@@ -2380,6 +2495,32 @@ fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
         },
         StructureActor {
             id: structure.id.clone(),
+        },
+    ));
+}
+
+fn spawn_enemy_actor(
+    commands: &mut Commands,
+    enemy: &EnemySnapshotState,
+    targets_local_player: bool,
+) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: enemy_color(
+                    enemy.kind.as_str(),
+                    enemy.health,
+                    enemy.max_health,
+                    targets_local_player,
+                ),
+                custom_size: Some(Vec2::splat(enemy_size(enemy.kind.as_str()))),
+                ..default()
+            },
+            transform: Transform::from_xyz(enemy.x, enemy.y, ENEMY_Z),
+            ..default()
+        },
+        EnemyActor {
+            id: enemy.id.clone(),
         },
     ));
 }

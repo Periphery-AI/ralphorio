@@ -1,6 +1,12 @@
-# Ralph Loop Progress
+# Ralph Loop Progress (v2 Continuation)
 
-Format per entry:
+This file is session memory for iterative Ralph runs.
+
+Continuation note:
+- Previous v1 progress has been archived at `ralph/progress.archive.v1-2026-02-11.txt`.
+- This v2 track builds on already-implemented multiplayer/gameplay systems and prioritizes stabilization + fun.
+
+Entry format:
 - timestamp:
 - item:
 - summary:
@@ -12,152 +18,25 @@ Format per entry:
 ---
 
 - timestamp: 2026-02-11
-- item: RL-000
-- summary: Bootstrapped Codex Ralph loop harness (HITL + AFK scripts, PRD, prompt, progress tracking).
-- decisions: Use Codex `gpt-5.3-codex` model with YOLO-equivalent bypass mode for autonomous iterations.
-- files: ralph/prd.json, ralph/prompt.md, ralph/progress.txt, scripts/ralph-once.sh, scripts/afk-ralph.sh
-- validation: bash -n scripts/ralph-once.sh scripts/afk-ralph.sh; scripts/ralph-once.sh --dry-run; scripts/afk-ralph.sh 1 --dry-run
-- commit: pending
-- timestamp: 2026-02-11
-- item: RL-016
-- summary: Completed deterministic terrain generation pipeline from server seed metadata to client tile rendering with terrain/resource layers.
-- decisions: Persist per-room `terrain_seed` in DO `room_meta`; expose terrain config via `features.terrain` every snapshot; centralize deterministic terrain sampling (`sample_terrain`) in `sim-core` for server/client parity and future resource loops.
-- files: sim-core/src/lib.rs, worker/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo test --manifest-path sim-core/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
-- commit: b8765e1
-
-- timestamp: 2026-02-11
-- item: RL-001
-- summary: Added a dedicated shared gameplay domain module in `sim-core` with versioned schema contracts for resources, recipes, inventory, combat stats, placeables, and deterministic simulation tick IO.
-- decisions: Keep shared model in `sim-core::domain` to avoid UI coupling; use explicit `schema_version` on state/input/output (`GAMEPLAY_SCHEMA_VERSION = 1`); drive deterministic tick behavior with ordered structures (`BTreeMap`) and pure `simulate_step` command/event flow.
-- files: sim-core/src/domain.rs, sim-core/src/lib.rs, sim-core/Cargo.toml, sim-core/Cargo.lock, worker/Cargo.lock, game-client/Cargo.lock, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path sim-core/Cargo.toml; cargo test --manifest-path sim-core/Cargo.toml (13 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
-- commit: 1f52970
-
-- timestamp: 2026-02-11
-- item: RL-002
-- summary: Completed protocol v2 envelope expansion for inventory/mining/crafting/combat/character channels with strict client/server validation and compact delta-safe snapshot behavior.
-- decisions: Promote protocol feature names to explicit enums/unions on both worker and web client; treat malformed/unsupported payloads as safe rejects; emit new gameplay snapshot channels as compact schemas (full snapshot baseline + delta-preserved merge path) while keeping existing build/movement/projectile behavior server-authoritative.
-- files: src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: a1357eb
-
-- timestamp: 2026-02-11
-- item: RL-003
-- summary: Added durable character profile persistence keyed by user/character id with active profile selection and server snapshot integration.
-- decisions: Store profiles in `character_profiles(user_id, character_id)` and active selection in `active_character_profiles(user_id)`; implement `character.set_profile` upsert + `character.set_active`; backfill legacy `presence_players` into default profiles on schema init and document migration behavior in architecture docs.
-- files: worker/src/lib.rs, docs/networking-architecture.md, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: da62676
-
-- timestamp: 2026-02-11
-- item: RL-004
-- summary: Implemented a pre-room character selector with three editable slots, room-scoped server rehydration, and active slot persistence before room connect.
-- decisions: Add room DO HTTP endpoint `/api/rooms/:roomCode/character-profiles` (`GET` + `PUT`) so selector state can load/save before websocket connect; keep slot ids stable (`default`, `slot-02`, `slot-03`) and treat worker-side validation failures as safe 400 responses.
-- files: worker/src/lib.rs, src/game/character-profiles.ts, src/routes/connect-route.tsx, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: 66812ec
-
-- timestamp: 2026-02-11
-- item: RL-005
-- summary: Added a 3-variant Retro Diffusion character sprite set, wired selector metadata/UI, enforced server-side sprite id allow-listing, and applied per-player sprite selection in WASM runtime rendering.
-- decisions: Standardize on sprite ids (`engineer-default`, `surveyor-cyan`, `machinist-rose`) across web/worker/WASM; preserve fallback safety by normalizing unknown ids to default on client and rejecting unsupported ids on worker writes; ship a preset generator (`generate-character-set.mjs`) that regenerates assets plus `character-sprites.json` manifest.
-- files: public/sprites/character-engineer-default.png, public/sprites/character-engineer-default.png.json, public/sprites/character-surveyor-cyan.png, public/sprites/character-surveyor-cyan.png.json, public/sprites/character-machinist-rose.png, public/sprites/character-machinist-rose.png.json, public/sprites/character-sprites.json, src/game/character-sprites.ts, src/routes/connect-route.tsx, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, worker/src/lib.rs, retro-diffusion/generate-character-set.mjs, retro-diffusion/README.md, README.md, package.json, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- item: RLP2-000
+- summary: Reset Ralph artifacts for v2 scope; replaced PRD, prompt, and progress baseline; added dedicated gameplay design document.
+- decisions: Keep old work archived instead of deleting history; move to a stricter vertical-slice definition-of-done focused on combat + crafting + placement + polished UI.
+- files: ralph/prd.json, ralph/prompt.md, ralph/progress.txt, ralph/progress.archive.v1-2026-02-11.txt, docs/ralph-loop-gdd.md, README.md
+- validation: jq . ralph/prd.json; test -s docs/ralph-loop-gdd.md
 - commit: pending
 
 - timestamp: 2026-02-11
-- item: RL-007
-- summary: Implemented server-authoritative, slot-based inventory state with stack merge/split/discard command handling, SQLite persistence, and synchronized inventory snapshot rendering in the room HUD.
-- decisions: Persist inventory stacks in a dedicated `player_inventory_stacks(player_id, slot)` table and hydrate them into runtime state on DO startup; keep inventory authoritative on the worker (commands mutate server state then rebroadcast deltas); include explicit slot indices in the inventory snapshot contract so client UI can map state deterministically.
-- files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (3 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- item: RLP2-001
+- summary: pending
+- decisions: pending
+- files: pending
+- validation: pending
 - commit: pending
 
 - timestamp: 2026-02-11
-- item: RL-008
-- summary: Implemented server-authoritative mining with deterministic resource-node materialization, timed mining progress, persistent node depletion, inventory rewards, and client-side mining visuals/interaction.
-- decisions: Materialize mining nodes deterministically from terrain seed around connected players and persist node state (`remaining`/`max_yield`) in SQLite to prevent depleted-node respawns; drive mining as a server tick loop with start/cancel commands and fixed action windows (`900ms`, `yield=6`) while cancelling out-of-range/full-inventory miners safely; render mining nodes + animated progress bars in WASM and bind left-click hold mining outside build mode.
-- files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (5 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- item: RLP2-101
+- summary: Completed enemy visibility path by wiring combat snapshots through replication into Bevy and rendering snapshot-driven enemy actors in-world with live despawn/update behavior.
+- decisions: Keep server-authoritative combat state unchanged; client now treats enemies as render-only entities sourced from validated combat snapshots so existing projectile combat can target the visible positions.
+- files: src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/progress.txt
+- validation: npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending
-
-- timestamp: 2026-02-11
-- item: RL-006
-- summary: Implemented authoritative in-world player name labels for local and remote avatars with text nameplates that follow actor transforms and update from character snapshot data.
-- decisions: Use actor-child `Text2dBundle` labels so nameplates inherit movement interpolation without separate screen-space tracking; source names from `features.character.players[*].name` with deterministic fallback to sanitized player id when missing/blank; enable Bevy text/default font features in the WASM client to keep labels self-contained in the existing render path.
-- files: game-client/Cargo.toml, game-client/Cargo.lock, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path game-client/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
-- commit: pending
-
-- timestamp: 2026-02-11
-- item: RL-009
-- summary: Implemented server-authoritative crafting recipes/queue flow with repeat counts, tick-based progression, inventory consumption/output application, and synchronized crafting snapshot payloads.
-- decisions: Reused `sim-core::domain` recipe definitions (`RecipeKind` + `recipe_definition`) so worker crafting inputs/outputs stay aligned with shared deterministic gameplay schema; kept crafting queue runtime state in-memory per room/player while continuing to persist authoritative inventory mutations in SQLite.
-- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: feat(worker): implement authoritative crafting queue execution
-
-- timestamp: 2026-02-11
-- item: RL-010
-- summary: Completed build placement inventory-cost enforcement so structure placement now atomically consumes authoritative inventory resources before persistence/replication.
-- decisions: Keep existing occupancy/collision checks and SQLite-backed structure persistence flow; add per-structure cost tables (`beacon`/`miner`/`assembler`) using craftable resources (`iron_plate`, `copper_plate`, `gear`); enforce all-or-nothing inventory deduction and mark inventory dirty on successful placement so connected clients receive updated authoritative inventory state.
-- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml
-- commit: feat(worker): enforce inventory costs for build placement
-
-- timestamp: 2026-02-11
-- item: RL-011
-- summary: Advanced collectible drop pipeline with server-authoritative TTL/ownership, world persistence, and client pickup interaction across inventory discard + mining overflow outcomes.
-- decisions: Add durable `world_drops` SQLite persistence so drop state survives DO hibernation/reconnect; enforce pickup server-side (`drops.pickup`) with ownership grace window, range checks, and authoritative inventory mutation; keep RL-011 `passes` false this iteration because combat outcome integration is still pending under RL-012/RL-013.
-- files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
-- commit: feat(drops): add authoritative world drop persistence and pickup flow
-
-- timestamp: 2026-02-11
-- item: RL-011
-- summary: Hardened drop replication against desync by switching to per-recipient drop visibility snapshots and always emitting the `drops` feature in delta snapshots so out-of-range drops are actively cleared client-side.
-- decisions: Keep drop visibility server-authoritative per socket attachment instead of global connected-player unions; always include `features.drops` to avoid stale merged client state after movement/reconnect; keep RL-011 `passes` false because combat-driven drop emission still depends on RL-012/RL-013.
-- files: worker/src/lib.rs, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (13 passed); npm run build:web
-- commit: pending
-
-- timestamp: 2026-02-11
-- item: RL-012
-- summary: Completed server-authoritative enemy combat foundation with deterministic enemy materialization/AI, authoritative health and damage resolution, projectile hit handling, and enemy-death drop/event fanout.
-- decisions: Keep enemy state authoritative in the worker runtime (non-persistent for now) and deterministically materialize from terrain seed + grid hash near connected players; use tick-based enemy attack cooldowns for deterministic simulation cadence; emit `combat` feature deltas plus `combat` events (`enemy_damaged`, `enemy_defeated`, `player_damaged`, `player_defeated`) and spawn authoritative world drops on enemy death.
-- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (15 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: pending
-
-- timestamp: 2026-02-11
-- item: RL-011
-- summary: Completed collectible drop acceptance by locking recipient-scoped visibility semantics in tests and promoting RL-011 to pass after validating combat/mining drop lifecycle behavior.
-- decisions: Extract drop visibility gating into `drop_visible_to_recipient` so per-recipient and broadcast semantics are explicit/testable; treat RL-011 acceptance as met because drops already enforce TTL/owner grace, pickup mutates inventory + despawns durably, and reconnect desync is covered by persisted drops plus always-emitted `drops` snapshots.
-- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (16 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: feat(rl-011): finalize authoritative drop visibility guarantees
-
-- timestamp: 2026-02-11
-- item: RL-013
-- summary: Completed player attack command handling for authoritative combat by implementing `combat.attack` projectile spawning against server-known enemy targets, plus in-room combat event feed visibility for connected clients.
-- decisions: Keep server-authoritative targeting by resolving enemy positions/range checks in the worker (`COMBAT_ATTACK_RANGE`) and ignoring invalid/out-of-range targets safely; reuse projectile replication path for reconciliation by emitting authoritative projectiles from `combat.attack` with optional client projectile ids; expose combat feedback through room UI by consuming `combat` event envelopes (`player_attacked`, damage/defeat events) instead of leaving the event channel inert.
-- files: worker/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (19 passed); npm run build:web
-- commit: ae1155d
-
-- timestamp: 2026-02-11
-- item: RL-014
-- summary: Implemented initial in-room HUD panels for inventory, crafting, and selected build state using authoritative snapshot data and responsive mobile/desktop layout.
-- decisions: Derive panel state strictly from server snapshots (`features.inventory`, `features.crafting`, `features.build.previews`) keyed by authoritative player id; mount the panel tray inside the canvas viewport and hide it while the dev console is open to avoid HUD overlap regressions.
-- files: src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
-- validation: npm run build:web (pass); npx eslint src/routes/room-route.tsx (fails on pre-existing `react-hooks/set-state-in-effect` for synchronous `setCombatFeed` in effect)
-- commit: pending
-
-- timestamp: 2026-02-11
-- item: RL-015
-- summary: Completed protocol malformed-payload validation coverage with dedicated envelope/payload parser tests in worker, and added a repeatable pre-merge smoke-check pipeline command.
-- decisions: Extract protocol parsing/validation into pure helpers (`parse_client_command_envelope_message`, movement/inventory payload validators) so malformed cases are testable without DO runtime setup; codify required merge checks in `scripts/premerge-checks.sh` and expose via `npm run check:premerge`.
-- files: worker/src/lib.rs, scripts/premerge-checks.sh, package.json, README.md, ralph/prd.json, ralph/progress.txt
-- validation: cargo fmt --manifest-path worker/Cargo.toml; npm run check:premerge (pass: sim-core tests 13/13, worker tests 23/23, worker check pass, game-client wasm check pass, build:web pass)
-- commit: feat(rl-015): add protocol malformed-payload tests and premerge checks
