@@ -40,4 +40,4 @@ Format per entry:
 - decisions: Promote protocol feature names to explicit enums/unions on both worker and web client; treat malformed/unsupported payloads as safe rejects; emit new gameplay snapshot channels as compact schemas (full snapshot baseline + delta-preserved merge path) while keeping existing build/movement/projectile behavior server-authoritative.
 - files: src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: pending
+- commit: a1357eb
