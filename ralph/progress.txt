@@ -105,3 +105,11 @@ Format per entry:
 - files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml
 - commit: feat(worker): enforce inventory costs for build placement
+
+- timestamp: 2026-02-11
+- item: RL-011
+- summary: Advanced collectible drop pipeline with server-authoritative TTL/ownership, world persistence, and client pickup interaction across inventory discard + mining overflow outcomes.
+- decisions: Add durable `world_drops` SQLite persistence so drop state survives DO hibernation/reconnect; enforce pickup server-side (`drops.pickup`) with ownership grace window, range checks, and authoritative inventory mutation; keep RL-011 `passes` false this iteration because combat outcome integration is still pending under RL-012/RL-013.
+- files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- commit: feat(drops): add authoritative world drop persistence and pickup flow

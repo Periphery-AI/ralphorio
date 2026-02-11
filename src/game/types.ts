@@ -7,6 +7,7 @@ export const PROTOCOL_FEATURES = [
   'projectile',
   'inventory',
   'mining',
+  'drops',
   'crafting',
   'combat',
   'character',
@@ -133,6 +134,24 @@ export type MiningSnapshot = {
   activeCount: number;
 };
 
+export type DropState = {
+  id: string;
+  resource: string;
+  amount: number;
+  x: number;
+  y: number;
+  spawnedAt: number;
+  expiresAt: number;
+  ownerPlayerId: string | null;
+  ownerExpiresAt: number;
+};
+
+export type DropSnapshot = {
+  schemaVersion: number;
+  drops: DropState[];
+  dropCount: number;
+};
+
 export type CraftQueueEntry = {
   recipe: string;
   count: number;
@@ -208,6 +227,7 @@ export type RoomSnapshot = {
     terrain?: TerrainSnapshot;
     inventory?: InventorySnapshot;
     mining?: MiningSnapshot;
+    drops?: DropSnapshot;
     crafting?: CraftingSnapshot;
     combat?: CombatSnapshot;
     character?: CharacterSnapshot;
@@ -271,5 +291,6 @@ export type RenderSnapshotPayload = {
   projectiles: ProjectileState[];
   terrain: TerrainSnapshot | null;
   mining: MiningSnapshot | null;
+  drops: DropSnapshot | null;
   character: CharacterSnapshot | null;
 };

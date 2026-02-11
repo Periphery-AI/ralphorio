@@ -25,6 +25,7 @@ type ProjectileSnapshot = NonNullable<SnapshotFeatures['projectile']>;
 type TerrainSnapshot = NonNullable<SnapshotFeatures['terrain']>;
 type InventorySnapshot = NonNullable<SnapshotFeatures['inventory']>;
 type MiningSnapshot = NonNullable<SnapshotFeatures['mining']>;
+type DropSnapshot = NonNullable<SnapshotFeatures['drops']>;
 type CraftingSnapshot = NonNullable<SnapshotFeatures['crafting']>;
 type CombatSnapshot = NonNullable<SnapshotFeatures['combat']>;
 type CharacterSnapshot = NonNullable<SnapshotFeatures['character']>;
@@ -469,6 +470,64 @@ function parseMiningSnapshot(payload: unknown): MiningSnapshot | null {
   };
 }
 
+function parseDropState(payload: unknown) {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  if (
+    typeof payload.id !== 'string' ||
+    typeof payload.resource !== 'string' ||
+    !isNonNegativeInteger(payload.amount) ||
+    !isFiniteNumber(payload.x) ||
+    !isFiniteNumber(payload.y) ||
+    !isFiniteNumber(payload.spawnedAt) ||
+    !isFiniteNumber(payload.expiresAt) ||
+    !isFiniteNumber(payload.ownerExpiresAt)
+  ) {
+    return null;
+  }
+
+  if (
+    payload.ownerPlayerId !== null &&
+    payload.ownerPlayerId !== undefined &&
+    typeof payload.ownerPlayerId !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: payload.id,
+    resource: payload.resource,
+    amount: payload.amount,
+    x: payload.x,
+    y: payload.y,
+    spawnedAt: payload.spawnedAt,
+    expiresAt: payload.expiresAt,
+    ownerPlayerId:
+      payload.ownerPlayerId === undefined ? null : (payload.ownerPlayerId as string | null),
+    ownerExpiresAt: payload.ownerExpiresAt,
+  };
+}
+
+function parseDropSnapshot(payload: unknown): DropSnapshot | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const drops = parseArray(payload.drops, parseDropState);
+  const dropCount = drops ? parseCount(payload.dropCount, drops.length) : null;
+  if (!isPositiveInteger(payload.schemaVersion) || !drops || dropCount === null) {
+    return null;
+  }
+
+  return {
+    schemaVersion: payload.schemaVersion,
+    drops,
+    dropCount,
+  };
+}
+
 function parseCraftQueueEntry(payload: unknown) {
   if (!isRecord(payload)) {
     return null;
@@ -809,6 +868,14 @@ function parseRoomSnapshot(payload: unknown): RoomSnapshot | null {
       return null;
     }
     features.mining = mining;
+  }
+
+  if ('drops' in rawFeatures) {
+    const drops = parseDropSnapshot(rawFeatures.drops);
+    if (!drops) {
+      return null;
+    }
+    features.drops = drops;
   }
 
   if ('crafting' in rawFeatures) {

@@ -65,6 +65,9 @@ const MINING_NODE_BASE_SIZE: f32 = 13.0;
 const MINING_PROGRESS_BAR_WIDTH: f32 = 24.0;
 const MINING_PROGRESS_BAR_HEIGHT: f32 = 4.0;
 const MINING_INTERACT_RADIUS: f32 = 20.0;
+const DROP_Z: f32 = 2.58;
+const DROP_BASE_SIZE: f32 = 10.0;
+const DROP_PICKUP_INTERACT_RADIUS: f32 = 84.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -155,6 +158,29 @@ struct MiningSnapshotState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DropSnapshotState {
+    id: String,
+    resource: String,
+    amount: u32,
+    x: f32,
+    y: f32,
+    #[serde(rename = "spawnedAt")]
+    _spawned_at: i64,
+    #[serde(rename = "expiresAt")]
+    _expires_at: i64,
+    #[serde(rename = "ownerPlayerId")]
+    _owner_player_id: Option<String>,
+    #[serde(rename = "ownerExpiresAt")]
+    _owner_expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DropsSnapshotState {
+    drops: Vec<DropSnapshotState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CharacterProfileSnapshotState {
     #[serde(rename = "playerId")]
     player_id: String,
@@ -190,6 +216,8 @@ struct SnapshotPayload {
     terrain: Option<TerrainSnapshotState>,
     #[serde(default)]
     mining: Option<MiningSnapshotState>,
+    #[serde(default)]
+    drops: Option<DropsSnapshotState>,
     #[serde(default)]
     character: Option<CharacterSnapshotState>,
 }
@@ -280,6 +308,11 @@ struct MiningProgressActor {
     player_id: String,
     node_id: String,
     progress: f32,
+}
+
+#[derive(Component)]
+struct DropActor {
+    id: String,
 }
 
 #[derive(Component)]
@@ -549,7 +582,11 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         )
         .add_systems(
             Update,
-            emit_projectile_fire_command.after(handle_mining_controls),
+            handle_drop_pickup_controls.after(handle_mining_controls),
+        )
+        .add_systems(
+            Update,
+            emit_projectile_fire_command.after(handle_drop_pickup_controls),
         )
         .add_systems(
             Update,
@@ -758,6 +795,7 @@ fn apply_pending_session_reset(
             With<StructureActor>,
             With<MiningNodeActor>,
             With<MiningProgressActor>,
+            With<DropActor>,
             With<BuildPreviewActor>,
             With<ProjectileActor>,
             With<PredictedProjectileActor>,
@@ -1133,6 +1171,53 @@ fn handle_mining_controls(
     }
 }
 
+fn handle_drop_pickup_controls(
+    input: Res<ButtonInput<KeyCode>>,
+    placement: Res<BuildPlacementState>,
+    current_player_id: Res<CurrentPlayerId>,
+    local_transform_query: Query<&Transform, With<LocalActor>>,
+    drop_query: Query<(&DropActor, &Transform)>,
+) {
+    if placement.active || !input.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+
+    if current_player_id.0.is_none() {
+        return;
+    }
+    let Ok(local_transform) = local_transform_query.get_single() else {
+        return;
+    };
+
+    let local_position = local_transform.translation.truncate();
+    let mut nearest_drop: Option<(&DropActor, f32)> = None;
+    for (drop, transform) in &drop_query {
+        let distance_sq = local_position.distance_squared(transform.translation.truncate());
+        if distance_sq > DROP_PICKUP_INTERACT_RADIUS * DROP_PICKUP_INTERACT_RADIUS {
+            continue;
+        }
+
+        match nearest_drop {
+            Some((_, best_distance_sq)) if distance_sq >= best_distance_sq => {}
+            _ => {
+                nearest_drop = Some((drop, distance_sq));
+            }
+        }
+    }
+
+    let Some((drop, _)) = nearest_drop else {
+        return;
+    };
+
+    queue_feature_command(
+        "drops",
+        "pickup",
+        json!({
+            "dropId": drop.id,
+        }),
+    );
+}
+
 fn simulate_local_player(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -1402,10 +1487,13 @@ fn apply_latest_snapshot(
     structure_query: Query<(Entity, &StructureActor)>,
     mining_node_query: Query<(Entity, &MiningNodeActor)>,
     mining_progress_query: Query<(Entity, &MiningProgressActor)>,
+    drop_query: Query<(Entity, &DropActor)>,
     preview_query: Query<(Entity, &BuildPreviewActor)>,
     projectile_query: Query<(Entity, &ProjectileActor)>,
-    predicted_projectile_query: Query<(Entity, &PredictedProjectileActor)>,
-    mut predicted_target_query: Query<&mut PredictedProjectileTarget>,
+    mut predicted_queries: ParamSet<(
+        Query<(Entity, &PredictedProjectileActor)>,
+        Query<&mut PredictedProjectileTarget>,
+    )>,
 ) {
     let latest_snapshot = {
         let mut queue = match INBOUND_SNAPSHOTS.lock() {
@@ -1432,6 +1520,7 @@ fn apply_latest_snapshot(
         projectiles,
         terrain,
         mining,
+        drops,
         character,
         ..
     } = snapshot;
@@ -1690,6 +1779,28 @@ fn apply_latest_snapshot(
         commands.entity(*entity).despawn_recursive();
     }
 
+    let latest_drops = drops.map_or_else(Vec::new, |snapshot| snapshot.drops);
+    let mut drop_entities: HashMap<String, Entity> = drop_query
+        .iter()
+        .map(|(entity, drop)| (drop.id.clone(), entity))
+        .collect();
+    for drop in latest_drops {
+        if let Some(entity) = drop_entities.remove(drop.id.as_str()) {
+            commands.entity(entity).insert((
+                Transform::from_xyz(drop.x, drop.y, DROP_Z),
+                DropActor {
+                    id: drop.id.clone(),
+                },
+            ));
+        } else {
+            spawn_drop_actor(&mut commands, &drop);
+        }
+    }
+
+    for entity in drop_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
     let mut preview_entities: HashMap<String, Entity> = preview_query
         .iter()
         .map(|(entity, preview)| (preview.player_id.clone(), entity))
@@ -1725,7 +1836,8 @@ fn apply_latest_snapshot(
         .iter()
         .map(|(entity, projectile)| (projectile.id.clone(), entity))
         .collect();
-    let mut predicted_projectile_entities: HashMap<String, Entity> = predicted_projectile_query
+    let mut predicted_projectile_entities: HashMap<String, Entity> = predicted_queries
+        .p0()
         .iter()
         .map(|(entity, predicted)| (predicted.client_projectile_id.clone(), entity))
         .collect();
@@ -1738,7 +1850,7 @@ fn apply_latest_snapshot(
                 if let Some(predicted_entity) =
                     predicted_projectile_entities.remove(client_projectile_id)
                 {
-                    if let Ok(mut target) = predicted_target_query.get_mut(predicted_entity) {
+                    if let Ok(mut target) = predicted_queries.p1().get_mut(predicted_entity) {
                         let projected_x = projectile.x + projectile.vx * (render_delay_ms / 1000.0);
                         let projected_y = projectile.y + projectile.vy * (render_delay_ms / 1000.0);
                         target.has_target = true;
@@ -2237,6 +2349,24 @@ fn mining_node_size(remaining: u32) -> f32 {
     MINING_NODE_BASE_SIZE + richness * 7.5
 }
 
+fn drop_color(resource: &str) -> Color {
+    match resource {
+        "iron_ore" => Color::srgb_u8(168, 201, 224),
+        "copper_ore" => Color::srgb_u8(218, 143, 88),
+        "coal" => Color::srgb_u8(102, 108, 118),
+        "stone" => Color::srgb_u8(170, 174, 182),
+        "iron_plate" => Color::srgb_u8(226, 236, 246),
+        "copper_plate" => Color::srgb_u8(231, 172, 122),
+        "gear" => Color::srgb_u8(150, 170, 191),
+        _ => Color::srgb_u8(214, 220, 236),
+    }
+}
+
+fn drop_size(amount: u32) -> f32 {
+    let normalized = (amount as f32 / 24.0).clamp(0.2, 1.0);
+    DROP_BASE_SIZE + normalized * 7.0
+}
+
 fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
     commands.spawn((
         SpriteBundle {
@@ -2299,6 +2429,23 @@ fn spawn_mining_progress_actor(
             player_id,
             node_id,
             progress: progress.clamp(0.0, 1.0),
+        },
+    ));
+}
+
+fn spawn_drop_actor(commands: &mut Commands, drop: &DropSnapshotState) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: drop_color(drop.resource.as_str()),
+                custom_size: Some(Vec2::splat(drop_size(drop.amount))),
+                ..default()
+            },
+            transform: Transform::from_xyz(drop.x, drop.y, DROP_Z),
+            ..default()
+        },
+        DropActor {
+            id: drop.id.clone(),
         },
     ));
 }

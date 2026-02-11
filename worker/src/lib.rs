@@ -51,6 +51,11 @@ const MINING_NODE_SCAN_RADIUS_TILES: i32 = 14;
 const MAX_MINING_NODES: usize = 4096;
 const MAX_MINING_NODES_PER_SNAPSHOT: usize = 384;
 const MAX_MINING_ACTIVE_PER_SNAPSHOT: usize = 256;
+const DROP_TTL_MS: i64 = 30_000;
+const DROP_OWNER_GRACE_MS: i64 = 4_000;
+const DROP_PICKUP_RANGE: f32 = 84.0;
+const MAX_DROPS: usize = 4096;
+const MAX_DROPS_PER_SNAPSHOT: usize = 384;
 const MAX_CRAFT_QUEUE_ENTRIES_PER_PLAYER: usize = 32;
 const MAX_CRAFT_QUEUE_TOTAL_PER_PLAYER: u32 = 512;
 const MAX_CRAFT_QUEUES_PER_SNAPSHOT: usize = 128;
@@ -98,6 +103,7 @@ enum ProtocolFeature {
     Projectile,
     Inventory,
     Mining,
+    Drops,
     Crafting,
     Combat,
     Character,
@@ -233,6 +239,12 @@ struct MiningCancelPayload {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DropPickupPayload {
+    drop_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CraftQueuePayload {
     recipe: String,
     count: u16,
@@ -354,6 +366,20 @@ struct MiningNodeRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct DropRow {
+    drop_id: String,
+    resource: String,
+    amount: i64,
+    x: f64,
+    y: f64,
+    owner_player_id: Option<String>,
+    owner_expires_at: i64,
+    expires_at: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct RuntimeHydratedPlayerRow {
     player_id: String,
     x: f64,
@@ -451,6 +477,20 @@ struct RuntimeMiningProgressState {
     node_id: String,
     started_at: i64,
     completes_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeDropState {
+    drop_id: String,
+    resource: String,
+    amount: u32,
+    x: f32,
+    y: f32,
+    owner_player_id: Option<String>,
+    owner_expires_at: i64,
+    expires_at: i64,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +718,11 @@ impl RuntimeInventoryState {
         Ok(())
     }
 
-    fn discard_from_slot(&mut self, slot: u16, amount: Option<u32>) -> Result<()> {
+    fn discard_from_slot(
+        &mut self,
+        slot: u16,
+        amount: Option<u32>,
+    ) -> Result<RuntimeInventoryStackState> {
         let slot_index = self.slot_index(slot)?;
         let source = self.slots[slot_index]
             .clone()
@@ -693,12 +737,15 @@ impl RuntimeInventoryState {
             self.slots[slot_index] = None;
         } else {
             self.slots[slot_index] = Some(RuntimeInventoryStackState {
-                resource: source.resource,
+                resource: source.resource.clone(),
                 amount: source.amount - drop_amount,
             });
         }
 
-        Ok(())
+        Ok(RuntimeInventoryStackState {
+            resource: source.resource,
+            amount: drop_amount,
+        })
     }
 
     #[allow(dead_code)]
@@ -873,6 +920,7 @@ struct RoomRuntimeState {
     inventories: HashMap<String, RuntimeInventoryState>,
     mining_nodes: HashMap<String, RuntimeMiningNodeState>,
     mining_active: HashMap<String, RuntimeMiningProgressState>,
+    drops: HashMap<String, RuntimeDropState>,
     craft_queues: HashMap<String, RuntimeCraftQueueState>,
 }
 
@@ -991,6 +1039,28 @@ fn player_within_mining_range(player_x: f32, player_y: f32, node: &RuntimeMining
 fn mining_progress_ratio(progress: &RuntimeMiningProgressState, now: i64) -> f32 {
     let duration_ms = (progress.completes_at - progress.started_at).max(1) as f32;
     ((now - progress.started_at) as f32 / duration_ms).clamp(0.0, 1.0)
+}
+
+fn next_drop_id(now: i64) -> String {
+    format!(
+        "drop:{:x}:{:x}",
+        now as u64,
+        (js_sys::Math::random() * 1e12) as u64
+    )
+}
+
+fn player_within_drop_pickup_range(player_x: f32, player_y: f32, drop: &RuntimeDropState) -> bool {
+    let dx = player_x - drop.x;
+    let dy = player_y - drop.y;
+    dx * dx + dy * dy <= DROP_PICKUP_RANGE * DROP_PICKUP_RANGE
+}
+
+fn drop_pickup_allowed_for_player(drop: &RuntimeDropState, player_id: &str, now: i64) -> bool {
+    match drop.owner_player_id.as_deref() {
+        None => true,
+        Some(owner_id) if owner_id == player_id => true,
+        Some(_) => now >= drop.owner_expires_at,
+    }
 }
 
 fn default_character_name_for_player(player_id: &str) -> String {
@@ -1284,6 +1354,7 @@ pub struct RoomDurableObject {
     dirty_projectiles: Cell<bool>,
     dirty_inventory: Cell<bool>,
     dirty_mining: Cell<bool>,
+    dirty_drops: Cell<bool>,
     dirty_crafting: Cell<bool>,
     terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
@@ -1374,6 +1445,18 @@ impl RoomDurableObject {
             )?
             .to_array()?;
 
+        let drop_rows: Vec<DropRow> = sql
+            .exec(
+                "
+                SELECT drop_id, resource, amount, x, y, owner_player_id, owner_expires_at, expires_at, created_at, updated_at
+                FROM world_drops
+                ORDER BY updated_at DESC
+                LIMIT ?
+                ",
+                Some(vec![(MAX_DROPS as i64).into()]),
+            )?
+            .to_array()?;
+
         let mut runtime = self.runtime.borrow_mut();
         runtime.players.clear();
         runtime.structures.clear();
@@ -1382,6 +1465,7 @@ impl RoomDurableObject {
         runtime.inventories.clear();
         runtime.mining_nodes.clear();
         runtime.mining_active.clear();
+        runtime.drops.clear();
 
         for row in player_rows {
             runtime.players.insert(
@@ -1488,6 +1572,41 @@ impl RoomDurableObject {
                     grid_y,
                     remaining,
                     max_yield,
+                    updated_at: row.updated_at,
+                },
+            );
+        }
+
+        for row in drop_rows {
+            if !is_valid_protocol_identifier(row.drop_id.as_str())
+                || !is_supported_resource_id(row.resource.as_str())
+                || row.amount <= 0
+                || row.expires_at <= now
+            {
+                continue;
+            }
+
+            let Ok(amount) = u32::try_from(row.amount) else {
+                continue;
+            };
+            if amount == 0 {
+                continue;
+            }
+
+            let owner_player_id = row.owner_player_id.as_deref().and_then(sanitize_player_id);
+
+            runtime.drops.insert(
+                row.drop_id.clone(),
+                RuntimeDropState {
+                    drop_id: row.drop_id,
+                    resource: row.resource,
+                    amount,
+                    x: row.x as f32,
+                    y: row.y as f32,
+                    owner_player_id,
+                    owner_expires_at: row.owner_expires_at,
+                    expires_at: row.expires_at,
+                    created_at: row.created_at,
                     updated_at: row.updated_at,
                 },
             );
@@ -1655,6 +1774,141 @@ impl RoomDurableObject {
             ]),
         )?;
         Ok(())
+    }
+
+    fn persist_drop(&self, drop: &RuntimeDropState) -> Result<()> {
+        self.sql().exec(
+            "
+            INSERT INTO world_drops (
+              drop_id, resource, amount, x, y,
+              owner_player_id, owner_expires_at, expires_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(drop_id) DO UPDATE SET
+              resource = excluded.resource,
+              amount = excluded.amount,
+              x = excluded.x,
+              y = excluded.y,
+              owner_player_id = excluded.owner_player_id,
+              owner_expires_at = excluded.owner_expires_at,
+              expires_at = excluded.expires_at,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                drop.drop_id.as_str().into(),
+                drop.resource.as_str().into(),
+                (drop.amount as i64).into(),
+                (drop.x as f64).into(),
+                (drop.y as f64).into(),
+                drop.owner_player_id.clone().into(),
+                drop.owner_expires_at.into(),
+                drop.expires_at.into(),
+                drop.created_at.into(),
+                drop.updated_at.into(),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn delete_drop(&self, drop_id: &str) -> Result<()> {
+        self.sql().exec(
+            "DELETE FROM world_drops WHERE drop_id = ?",
+            Some(vec![drop_id.into()]),
+        )?;
+        Ok(())
+    }
+
+    fn spawn_world_drop(
+        &self,
+        resource: &str,
+        amount: u32,
+        x: f32,
+        y: f32,
+        owner_player_id: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        if amount == 0 || !is_supported_resource_id(resource) {
+            return Err(Error::RustError("invalid drop payload".into()));
+        }
+
+        let mut overflow_drop_id: Option<String> = None;
+        let owner_player_id = owner_player_id.and_then(sanitize_player_id);
+
+        let drop = {
+            let mut runtime = self.runtime.borrow_mut();
+            let mut drop_id = next_drop_id(now);
+            let mut attempts = 0u8;
+            while runtime.drops.contains_key(drop_id.as_str()) {
+                attempts = attempts.saturating_add(1);
+                if attempts > 8 {
+                    return Err(Error::RustError("failed to allocate drop id".into()));
+                }
+                drop_id = next_drop_id(now + attempts as i64);
+            }
+
+            if runtime.drops.len() >= MAX_DROPS {
+                overflow_drop_id = runtime
+                    .drops
+                    .values()
+                    .min_by_key(|drop| (drop.expires_at, drop.created_at))
+                    .map(|drop| drop.drop_id.clone());
+
+                if let Some(overflow_id) = overflow_drop_id.as_deref() {
+                    runtime.drops.remove(overflow_id);
+                }
+            }
+
+            let drop = RuntimeDropState {
+                drop_id: drop_id.clone(),
+                resource: resource.to_string(),
+                amount,
+                x,
+                y,
+                owner_player_id,
+                owner_expires_at: now + DROP_OWNER_GRACE_MS,
+                expires_at: now + DROP_TTL_MS,
+                created_at: now,
+                updated_at: now,
+            };
+            runtime.drops.insert(drop_id, drop.clone());
+            drop
+        };
+
+        if let Some(overflow_id) = overflow_drop_id.as_deref() {
+            self.delete_drop(overflow_id)?;
+        }
+        self.persist_drop(&drop)?;
+        Ok(true)
+    }
+
+    fn prune_expired_drops(&self, now: i64) -> Result<bool> {
+        let expired_drop_ids: Vec<String> = {
+            let runtime = self.runtime.borrow();
+            runtime
+                .drops
+                .values()
+                .filter(|drop| drop.expires_at <= now)
+                .map(|drop| drop.drop_id.clone())
+                .collect()
+        };
+
+        if expired_drop_ids.is_empty() {
+            return Ok(false);
+        }
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            for drop_id in expired_drop_ids.iter() {
+                runtime.drops.remove(drop_id.as_str());
+            }
+        }
+
+        for drop_id in expired_drop_ids.iter() {
+            self.delete_drop(drop_id.as_str())?;
+        }
+
+        Ok(true)
     }
 
     fn materialize_mining_nodes_for_connected_players(&self) -> Result<bool> {
@@ -2296,6 +2550,29 @@ impl RoomDurableObject {
 
         sql.exec(
             "
+            CREATE TABLE IF NOT EXISTS world_drops (
+              drop_id TEXT PRIMARY KEY,
+              resource TEXT NOT NULL,
+              amount INTEGER NOT NULL,
+              x REAL NOT NULL,
+              y REAL NOT NULL,
+              owner_player_id TEXT,
+              owner_expires_at INTEGER NOT NULL,
+              expires_at INTEGER NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_world_drops_expires_at ON world_drops(expires_at)",
+            None,
+        )?;
+
+        sql.exec(
+            "
             CREATE TABLE IF NOT EXISTS build_structures (
               structure_id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
@@ -2425,6 +2702,16 @@ impl RoomDurableObject {
                OR kind NOT IN ('iron_ore', 'copper_ore', 'coal')
             ",
             None,
+        )?;
+
+        sql.exec(
+            "
+            DELETE FROM world_drops
+            WHERE amount <= 0
+               OR expires_at <= ?
+               OR resource NOT IN ('iron_ore', 'copper_ore', 'coal', 'stone', 'iron_plate', 'copper_plate', 'gear')
+            ",
+            Some(vec![now_ms().into()]),
         )?;
 
         self.backfill_character_profiles_from_presence()?;
@@ -3167,18 +3454,38 @@ impl RoomDurableObject {
                     return Err(Error::RustError("invalid inventory discard payload".into()));
                 }
 
-                {
+                let (discarded_stack, player_x, player_y) = {
                     let mut runtime = self.runtime.borrow_mut();
+                    let (player_x, player_y) = {
+                        let player = runtime
+                            .players
+                            .entry(player_id.to_string())
+                            .or_insert_with(|| Self::default_runtime_player(now));
+                        player.last_seen = now;
+                        (player.x, player.y)
+                    };
+
                     let inventory = runtime
                         .inventories
                         .entry(player_id.to_string())
                         .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
                     inventory.normalize();
-                    inventory.discard_from_slot(discard_payload.slot, discard_payload.amount)?;
-                }
+                    let discarded = inventory
+                        .discard_from_slot(discard_payload.slot, discard_payload.amount)?;
+                    (discarded, player_x, player_y)
+                };
 
                 self.persist_inventory_for_player(player_id)?;
+                self.spawn_world_drop(
+                    discarded_stack.resource.as_str(),
+                    discarded_stack.amount,
+                    player_x,
+                    player_y,
+                    Some(player_id),
+                    now,
+                )?;
                 self.dirty_inventory.set(true);
+                self.dirty_drops.set(true);
                 Ok(true)
             }
             _ => Err(Error::RustError("invalid inventory action".into())),
@@ -3294,6 +3601,80 @@ impl RoomDurableObject {
                 Ok(removed)
             }
             _ => Err(Error::RustError("invalid mining action".into())),
+        }
+    }
+
+    fn handle_drops_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        if self.prune_expired_drops(now)? {
+            self.dirty_drops.set(true);
+        }
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "pickup" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing drop payload".into()))?;
+                let pickup_payload: DropPickupPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid drop payload".into()))?;
+                if !is_valid_protocol_identifier(pickup_payload.drop_id.as_str()) {
+                    return Err(Error::RustError("invalid drop id".into()));
+                }
+
+                let picked_up = {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let (player_x, player_y) = runtime
+                        .players
+                        .get(player_id)
+                        .map(|player| (player.x, player.y))
+                        .ok_or_else(|| Error::RustError("player state missing".into()))?;
+
+                    let drop = runtime
+                        .drops
+                        .get(pickup_payload.drop_id.as_str())
+                        .cloned()
+                        .ok_or_else(|| Error::RustError("drop not found".into()))?;
+
+                    if drop.expires_at <= now {
+                        return Err(Error::RustError("drop expired".into()));
+                    }
+                    if !drop_pickup_allowed_for_player(&drop, player_id, now) {
+                        return Err(Error::RustError("drop is reserved".into()));
+                    }
+                    if !player_within_drop_pickup_range(player_x, player_y, &drop) {
+                        return Err(Error::RustError("drop out of range".into()));
+                    }
+
+                    let inventory = runtime
+                        .inventories
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                    inventory.normalize();
+                    inventory.add_resource(drop.resource.as_str(), drop.amount)?;
+                    runtime.drops.remove(pickup_payload.drop_id.as_str());
+                    drop
+                };
+
+                self.persist_inventory_for_player(player_id)?;
+                self.delete_drop(picked_up.drop_id.as_str())?;
+                self.dirty_inventory.set(true);
+                self.dirty_drops.set(true);
+                Ok(true)
+            }
+            _ => Err(Error::RustError("invalid drop action".into())),
         }
     }
 
@@ -3571,8 +3952,14 @@ impl RoomDurableObject {
             let projectile_changed = self.tick_projectiles()?;
             let mining_changed = self.tick_mining()?;
             let crafting_result = self.tick_crafting()?;
+            let drops_changed = self.tick_drops()?;
 
-            if movement_changed || projectile_changed || mining_changed || crafting_result.changed {
+            if movement_changed
+                || projectile_changed
+                || mining_changed
+                || crafting_result.changed
+                || drops_changed
+            {
                 self.snapshot_dirty.set(true);
                 if projectile_changed {
                     self.dirty_projectiles.set(true);
@@ -3587,6 +3974,9 @@ impl RoomDurableObject {
                 if crafting_result.inventory_changed {
                     self.dirty_inventory.set(true);
                 }
+                if drops_changed {
+                    self.dirty_drops.set(true);
+                }
             }
 
             if self.tick.get() % SNAPSHOT_INTERVAL_TICKS == 0 || self.snapshot_dirty.get() {
@@ -3597,6 +3987,7 @@ impl RoomDurableObject {
                 self.dirty_projectiles.set(false);
                 self.dirty_inventory.set(false);
                 self.dirty_mining.set(false);
+                self.dirty_drops.set(false);
                 self.dirty_crafting.set(false);
             }
 
@@ -3716,6 +4107,7 @@ impl RoomDurableObject {
         let mut inventory_players_to_persist = HashSet::new();
         let mut nodes_to_persist: Vec<RuntimeMiningNodeState> = Vec::new();
         let mut depleted_node_ids: HashSet<String> = HashSet::new();
+        let mut drops_to_spawn: Vec<(String, u32, f32, f32, String)> = Vec::new();
 
         {
             let mut runtime = self.runtime.borrow_mut();
@@ -3780,11 +4172,16 @@ impl RoomDurableObject {
                     .add_resource(current_node.kind.as_str(), mined_amount)
                     .is_err()
                 {
-                    runtime.mining_active.remove(active_player_id.as_str());
-                    changed = true;
-                    continue;
+                    drops_to_spawn.push((
+                        current_node.kind.clone(),
+                        mined_amount,
+                        current_node.x,
+                        current_node.y,
+                        active_player_id.clone(),
+                    ));
+                } else {
+                    inventory_players_to_persist.insert(active_player_id.clone());
                 }
-                inventory_players_to_persist.insert(active_player_id.clone());
 
                 let Some(node) = runtime.mining_nodes.get_mut(progress.node_id.as_str()) else {
                     runtime.mining_active.remove(active_player_id.as_str());
@@ -3832,8 +4229,23 @@ impl RoomDurableObject {
         for node in nodes_to_persist.iter() {
             self.persist_mining_node(node)?;
         }
+        for (resource, amount, x, y, owner_player_id) in drops_to_spawn.iter() {
+            self.spawn_world_drop(
+                resource.as_str(),
+                *amount,
+                *x,
+                *y,
+                Some(owner_player_id.as_str()),
+                now,
+            )?;
+        }
 
         Ok(changed)
+    }
+
+    fn tick_drops(&self) -> Result<bool> {
+        let now = now_ms();
+        self.prune_expired_drops(now)
     }
 
     fn tick_crafting(&self) -> Result<CraftingTickResult> {
@@ -3894,6 +4306,10 @@ impl RoomDurableObject {
         let online = connected_players.clone();
         let now = now_ms();
         let mining_discovered = self.materialize_mining_nodes_for_connected_players()?;
+        let drops_pruned = self.prune_expired_drops(now)?;
+        if drops_pruned {
+            self.dirty_drops.set(true);
+        }
 
         self.prune_stale_build_previews()?;
         let runtime = self.runtime.borrow();
@@ -4085,6 +4501,44 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let mut visible_drop_rows: Vec<&RuntimeDropState> = runtime
+            .drops
+            .values()
+            .filter(|drop| drop.expires_at > now)
+            .filter(|drop| {
+                connected_players.iter().any(|player_id| {
+                    runtime.players.get(player_id).is_some_and(|player| {
+                        (terrain_grid_axis(player.x) - terrain_grid_axis(drop.x)).abs()
+                            <= MINING_NODE_SCAN_RADIUS_TILES + 4
+                            && (terrain_grid_axis(player.y) - terrain_grid_axis(drop.y)).abs()
+                                <= MINING_NODE_SCAN_RADIUS_TILES + 4
+                    })
+                })
+            })
+            .collect();
+        visible_drop_rows.sort_by_key(|drop| std::cmp::Reverse(drop.updated_at));
+        let visible_drop_count = visible_drop_rows.len();
+        if visible_drop_rows.len() > MAX_DROPS_PER_SNAPSHOT {
+            visible_drop_rows.truncate(MAX_DROPS_PER_SNAPSHOT);
+        }
+
+        let drops: Vec<Value> = visible_drop_rows
+            .iter()
+            .map(|drop| {
+                json!({
+                    "id": drop.drop_id,
+                    "resource": drop.resource,
+                    "amount": drop.amount,
+                    "x": drop.x,
+                    "y": drop.y,
+                    "spawnedAt": drop.created_at,
+                    "expiresAt": drop.expires_at,
+                    "ownerPlayerId": drop.owner_player_id,
+                    "ownerExpiresAt": drop.owner_expires_at,
+                })
+            })
+            .collect();
+
         let mut crafting_queue_rows: Vec<(&String, &RuntimeCraftQueueState)> = runtime
             .craft_queues
             .iter()
@@ -4136,6 +4590,8 @@ impl RoomDurableObject {
         let include_inventory = full || self.dirty_inventory.get();
         let include_mining =
             full || self.dirty_mining.get() || mining_discovered || !mining_active.is_empty();
+        let include_drops =
+            full || self.dirty_drops.get() || drops_pruned || !visible_drop_rows.is_empty();
         let include_crafting = full || self.dirty_crafting.get();
         let include_combat = full;
         let include_character = full || self.dirty_presence.get();
@@ -4213,6 +4669,17 @@ impl RoomDurableObject {
                     "nodeCount": visible_mining_node_count,
                     "active": mining_active,
                     "activeCount": mining_active_count,
+                }),
+            );
+        }
+
+        if include_drops {
+            features.insert(
+                "drops".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "drops": drops,
+                    "dropCount": visible_drop_count,
                 }),
             );
         }
@@ -4357,6 +4824,11 @@ impl RoomDurableObject {
                 envelope.action.as_str(),
                 envelope.payload.clone(),
             ),
+            ProtocolFeature::Drops => self.handle_drops_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
             ProtocolFeature::Crafting => self.handle_crafting_command(
                 player_id,
                 envelope.action.as_str(),
@@ -4429,6 +4901,7 @@ impl DurableObject for RoomDurableObject {
             dirty_projectiles: Cell::new(false),
             dirty_inventory: Cell::new(false),
             dirty_mining: Cell::new(false),
+            dirty_drops: Cell::new(false),
             dirty_crafting: Cell::new(false),
             terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
@@ -4569,6 +5042,7 @@ impl DurableObject for RoomDurableObject {
                     self.dirty_projectiles.set(false);
                     self.dirty_inventory.set(false);
                     self.dirty_mining.set(false);
+                    self.dirty_drops.set(false);
                     self.dirty_crafting.set(false);
                 }
             }

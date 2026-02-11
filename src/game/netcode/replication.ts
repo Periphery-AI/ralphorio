@@ -141,6 +141,7 @@ export class ReplicationPipeline {
             terrain: snapshot.features.terrain ?? previous.features.terrain,
             inventory: snapshot.features.inventory ?? previous.features.inventory,
             mining: snapshot.features.mining ?? previous.features.mining,
+            drops: snapshot.features.drops ?? previous.features.drops,
             crafting: snapshot.features.crafting ?? previous.features.crafting,
             combat: snapshot.features.combat ?? previous.features.combat,
             character: snapshot.features.character ?? previous.features.character,
@@ -230,6 +231,7 @@ export class ReplicationPipeline {
     const previews = copyPreviews(latest.features.build?.previews ?? []);
     const terrain = latest.features.terrain ?? null;
     const mining = latest.features.mining ?? null;
+    const drops = latest.features.drops ?? null;
     const character = latest.features.character ?? null;
 
     return {
@@ -243,6 +245,7 @@ export class ReplicationPipeline {
       projectiles,
       terrain,
       mining,
+      drops,
       character,
     };
   }

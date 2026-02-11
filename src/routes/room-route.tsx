@@ -121,6 +121,7 @@ export function RoomRoute() {
   const [inventoryItemCount, setInventoryItemCount] = useState(0);
   const [miningNodeCount, setMiningNodeCount] = useState(0);
   const [miningActiveCount, setMiningActiveCount] = useState(0);
+  const [dropCount, setDropCount] = useState(0);
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [devInput, setDevInput] = useState('');
   const [devLog, setDevLog] = useState<string[]>([]);
@@ -219,6 +220,7 @@ export function RoomRoute() {
             const projectile = snapshot.features.projectile;
             const inventory = snapshot.features.inventory;
             const mining = snapshot.features.mining;
+            const drops = snapshot.features.drops;
 
             if (movement) {
               localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
@@ -252,6 +254,10 @@ export function RoomRoute() {
             if (mining) {
               setMiningNodeCount(mining.nodeCount);
               setMiningActiveCount(mining.activeCount);
+            }
+
+            if (drops) {
+              setDropCount(drops.dropCount);
             }
           },
           onAck: (seq) => {
@@ -436,6 +442,7 @@ export function RoomRoute() {
           <span className="hud-pill">Q = Build</span>
           <span className="hud-pill">Hold Click = Mine</span>
           <span className="hud-pill">Click = Place (Build Mode)</span>
+          <span className="hud-pill">E = Pickup</span>
           <span className="hud-pill">Space = Shoot</span>
           <MetricPill label="Tick" value={serverTick} />
           <MetricPill label="Sim" value={`${simRateHz}Hz`} />
@@ -448,6 +455,7 @@ export function RoomRoute() {
           <MetricPill label="Stacks" value={inventoryStackCount} />
           <MetricPill label="Nodes" value={miningNodeCount} />
           <MetricPill label="Mining" value={miningActiveCount} />
+          <MetricPill label="Drops" value={dropCount} />
           <MetricPill label="Structures" value={structureCount} />
           <MetricPill label="Projectiles" value={projectileCount} />
           <span className="hidden rounded-md border border-white/15 bg-[#101b31] px-3 py-1.5 text-[#cfddf9] md:inline-flex">
