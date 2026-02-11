@@ -997,10 +997,16 @@ export class RoomSocket {
   private readonly playerId: string;
   private readonly handlers: Handlers;
   private readonly authToken: string | null;
-  private readonly resumeToken: string | null;
+  private resumeToken: string | null;
   private seq = 1;
   private pingTimer: number | null = null;
   private pingSentAt = new Map<number, number>();
+  private reconnectTimer: number | null = null;
+  private reconnectAttempt = 0;
+  private disconnectRequested = false;
+
+  private static readonly RECONNECT_BASE_DELAY_MS = 300;
+  private static readonly RECONNECT_MAX_DELAY_MS = 5_000;
 
   constructor(
     roomCode: string,
@@ -1017,19 +1023,36 @@ export class RoomSocket {
   }
 
   async connect() {
+    this.disconnectRequested = false;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
+    this.openSocket();
+  }
+
+  private openSocket() {
     const baseUrl = buildWebSocketUrl(this.roomCode, this.playerId);
     const withResume = appendResumeToken(baseUrl, this.resumeToken);
     const url = appendAuthToken(withResume, this.authToken);
-    this.handlers.onStatus('Connecting...');
+    this.handlers.onStatus(this.reconnectAttempt > 0 ? 'Reconnecting...' : 'Connecting...');
 
-    this.socket = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.socket = socket;
 
-    this.socket.addEventListener('open', () => {
+    socket.addEventListener('open', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.handlers.onStatus('Connected');
+      this.reconnectAttempt = 0;
       this.startPingLoop();
     });
 
-    this.socket.addEventListener('message', (event) => {
+    socket.addEventListener('message', (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       if (typeof event.data !== 'string') {
         return;
       }
@@ -1044,6 +1067,7 @@ export class RoomSocket {
         if (!payload) {
           return;
         }
+        this.resumeToken = payload.resumeToken ?? this.resumeToken;
         this.handlers.onWelcome(payload);
         return;
       }
@@ -1091,14 +1115,29 @@ export class RoomSocket {
       }
     });
 
-    this.socket.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
+      this.socket = null;
       this.stopPingLoop();
-      this.handlers.onStatus('Disconnected');
+      if (this.disconnectRequested) {
+        this.handlers.onStatus('Disconnected');
+        return;
+      }
+      this.scheduleReconnect();
     });
 
-    this.socket.addEventListener('error', () => {
+    socket.addEventListener('error', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.stopPingLoop();
-      this.handlers.onStatus('Connection error');
+      this.handlers.onStatus(
+        this.disconnectRequested ? 'Connection error' : 'Connection lost, retrying...',
+      );
     });
   }
 
@@ -1163,6 +1202,36 @@ export class RoomSocket {
     this.pingSentAt.clear();
   }
 
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.disconnectRequested || this.reconnectTimer !== null) {
+      return;
+    }
+
+    this.reconnectAttempt += 1;
+    const attempt = this.reconnectAttempt;
+    const delayMs = Math.min(
+      RoomSocket.RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1),
+      RoomSocket.RECONNECT_MAX_DELAY_MS,
+    );
+    const delaySeconds = Math.max(1, Math.ceil(delayMs / 1000));
+    this.handlers.onStatus(`Reconnecting in ${delaySeconds}s...`);
+
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.disconnectRequested) {
+        return;
+      }
+      this.openSocket();
+    }, delayMs);
+  }
+
   private sendCommand(params: {
     feature: ProtocolFeature;
     action: string;
@@ -1189,10 +1258,14 @@ export class RoomSocket {
   }
 
   disconnect() {
+    this.disconnectRequested = true;
+    this.clearReconnectTimer();
     this.stopPingLoop();
     if (this.socket) {
-      this.socket.close();
+      const socket = this.socket;
       this.socket = null;
+      socket.close();
     }
+    this.handlers.onStatus('Disconnected');
   }
 }

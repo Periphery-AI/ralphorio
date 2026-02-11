@@ -103,7 +103,7 @@ Entry format:
 - decisions: Built entirely on existing authoritative combat snapshots + combat event feed (no combat protocol rewrite). In-world cues are now derived from snapshot health deltas to align feedback with server-resolved outcomes while keeping module boundaries intact.
 - files: game-client/src/lib.rs, src/routes/room-route.tsx, ralph/progress.txt
 - validation: npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
-- commit: pending
+- commit: 2b389c6
 
 - timestamp: 2026-02-11
 - item: RLP2-106
@@ -111,4 +111,12 @@ Entry format:
 - decisions: Kept the existing snapshot/event contract and avoided combat protocol rewrites; implemented feedback state as a lightweight client cache reset on session transitions to preserve Bevy system boundaries and avoid introducing non-authoritative cues.
 - files: game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
+- commit: f8a169d
+
+- timestamp: 2026-02-11
+- item: RLP2-108
+- summary: Implemented resilient room-session transport recovery by adding bounded exponential websocket auto-reconnect in the client, preserving resume-token continuity so transient disconnects recover without hard refresh and input/combat/build commands continue once reconnected.
+- decisions: Kept the existing worker authority model and snapshot protocol unchanged; implemented reconnect behavior entirely inside `RoomSocket` so room orchestration and Bevy command pumps remain intact instead of rewriting route/session systems.
+- files: src/game/network-client.ts, ralph/progress.txt
+- validation: npm run lint (pass); npm run build:web (pass); jq '.items[] | select(.id=="RLP2-108") | {id,passes,steps}' ralph/prd.json (pass, remains false pending full acceptance)
 - commit: pending
