@@ -8,11 +8,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bevy = { version = "0.14.2", default-features = false, features = [
+  "bevy_audio",
   "bevy_asset",
   "bevy_core_pipeline",
   "bevy_render",
   "bevy_sprite",
   "bevy_winit",
+  "mp3",
   "png",
   "webgl2",
 ] }

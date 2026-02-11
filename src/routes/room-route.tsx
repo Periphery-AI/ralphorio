@@ -1,13 +1,60 @@
 import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth, useUser } from '@clerk/clerk-react';
-import { bootGame, drainFeatureCommands, drainInputCommands, pushRenderSnapshot, setPlayerId } from '../game/bridge';
+import {
+  bootGame,
+  drainFeatureCommands,
+  drainInputCommands,
+  pushRenderSnapshot,
+  resetSessionState,
+  setPlayerId,
+} from '../game/bridge';
 import { RoomSocket } from '../game/network-client';
 import { ReplicationPipeline } from '../game/netcode/replication';
 import type { PlayerState, RoomSnapshot } from '../game/types';
 
 const CANVAS_ID = 'bevy-game-canvas';
 const DEFAULT_INTERP_DELAY_MS = 110;
+const CANVAS_STASH_ID = 'bevy-canvas-stash';
+
+let persistentCanvas: HTMLCanvasElement | null = null;
+
+function getCanvasStash() {
+  let stash = document.getElementById(CANVAS_STASH_ID) as HTMLDivElement | null;
+  if (stash) {
+    return stash;
+  }
+
+  stash = document.createElement('div');
+  stash.id = CANVAS_STASH_ID;
+  stash.style.position = 'fixed';
+  stash.style.left = '-10000px';
+  stash.style.top = '-10000px';
+  stash.style.width = '1px';
+  stash.style.height = '1px';
+  stash.style.overflow = 'hidden';
+  stash.style.pointerEvents = 'none';
+  stash.style.opacity = '0';
+  document.body.appendChild(stash);
+  return stash;
+}
+
+function getPersistentCanvas() {
+  if (persistentCanvas) {
+    return persistentCanvas;
+  }
+
+  const existing = document.getElementById(CANVAS_ID);
+  if (existing instanceof HTMLCanvasElement) {
+    persistentCanvas = existing;
+  } else {
+    persistentCanvas = document.createElement('canvas');
+    persistentCanvas.id = CANVAS_ID;
+  }
+
+  persistentCanvas.className = 'block h-full w-full';
+  return persistentCanvas;
+}
 
 function resumeTokenStorageKey(roomCode: string, playerId: string) {
   return `ralph-resume:${roomCode}:${playerId}`;
@@ -79,11 +126,28 @@ export function RoomRoute() {
   const replicationRef = useRef(new ReplicationPipeline());
   const localPosRef = useRef({ x: 0, y: 0 });
   const devInputRef = useRef<HTMLInputElement | null>(null);
+  const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const interpDelayRef = useRef(DEFAULT_INTERP_DELAY_MS);
 
   const pushDevLog = (line: string) => {
     setDevLog((existing) => [...existing.slice(-11), line]);
   };
+
+  useEffect(() => {
+    const host = canvasHostRef.current;
+    if (!host) {
+      return;
+    }
+
+    const canvas = getPersistentCanvas();
+    host.appendChild(canvas);
+
+    return () => {
+      if (canvas.parentElement === host) {
+        getCanvasStash().appendChild(canvas);
+      }
+    };
+  }, [roomCode]);
 
   useEffect(() => {
     if (!clientPlayerId) {
@@ -99,6 +163,7 @@ export function RoomRoute() {
     const start = async () => {
       setConnectionStatus('Booting game...');
       await bootGame(CANVAS_ID);
+      await resetSessionState();
       await setPlayerId(clientPlayerId);
       const clerkToken = await getToken();
       const storedResumeToken = window.localStorage.getItem(
@@ -360,7 +425,7 @@ export function RoomRoute() {
 
       <div className="min-h-0 p-2 md:p-3">
         <div className="relative h-full w-full overflow-hidden rounded-2xl border border-white/10 bg-[#060c16] shadow-[0_20px_80px_rgba(9,14,24,0.6)]">
-          <canvas id={CANVAS_ID} className="absolute inset-0 block h-full w-full" />
+          <div ref={canvasHostRef} className="absolute inset-0" />
           {showDevConsole ? (
             <div className="absolute inset-x-3 bottom-3 z-20 rounded-xl border border-[#6de7c0]/60 bg-[#071520]/88 p-3 backdrop-blur">
               <div className="mb-2 flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-[#b8ffe8]">

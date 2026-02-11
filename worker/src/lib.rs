@@ -439,6 +439,17 @@ fn chunk_coord_for_grid(grid_axis: i64) -> i64 {
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
+    let method = req.method();
+    let fetch_mode = req
+        .headers()
+        .get("Sec-Fetch-Mode")?
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let accept_header = req
+        .headers()
+        .get("Accept")?
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     if url.path() == "/api/health" {
         return Response::from_json(&json!({
@@ -465,7 +476,33 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     if let Ok(assets) = env.assets("ASSETS") {
-        return assets.fetch_request(req).await;
+        let asset_response = assets.fetch_request(req).await?;
+        if asset_response.status_code() != 404 {
+            return Ok(asset_response);
+        }
+
+        let is_get_or_head = matches!(method, Method::Get | Method::Head);
+        let is_html_navigation = fetch_mode == "navigate" || accept_header.contains("text/html");
+        let path = url.path();
+        let last_segment = path.rsplit('/').next().unwrap_or_default();
+        let looks_like_static_file = last_segment.contains('.');
+        if is_get_or_head
+            && is_html_navigation
+            && !path.starts_with("/api/")
+            && !looks_like_static_file
+        {
+            let mut index_url = url.clone();
+            index_url.set_path("/index.html");
+            index_url.set_query(None);
+            index_url.set_fragment(None);
+
+            let mut init = RequestInit::new();
+            init.with_method(method);
+            let index_request = Request::new_with_init(index_url.as_str(), &init)?;
+            return assets.fetch_request(index_request).await;
+        }
+
+        return Ok(asset_response);
     }
 
     Response::error("Not Found", 404)
@@ -1110,6 +1147,17 @@ impl RoomDurableObject {
                 .players
                 .entry(player_id.to_string())
                 .or_insert_with(|| Self::default_runtime_player(now));
+            // Input sequence numbers are connection-scoped. Reset on join so
+            // reconnecting clients that start from seq=1 are accepted immediately.
+            player.last_input_seq = 0;
+            player.input = InputState {
+                up: false,
+                down: false,
+                left: false,
+                right: false,
+            };
+            player.vx = 0.0;
+            player.vy = 0.0;
             player.connected = true;
             player.last_seen = now;
         }

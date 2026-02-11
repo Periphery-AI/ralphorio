@@ -5,6 +5,7 @@ import init, {
   push_snapshot,
   drain_input_events,
   drain_feature_commands,
+  reset_session_state,
 } from './wasm/client';
 
 let booted = false;
@@ -46,6 +47,11 @@ export async function bootGame(canvasId: string) {
 export async function setPlayerId(playerId: string) {
   await initialize();
   set_player_id(playerId);
+}
+
+export async function resetSessionState() {
+  await initialize();
+  reset_session_state();
 }
 
 export async function pushRenderSnapshot(payload: RenderSnapshotPayload) {

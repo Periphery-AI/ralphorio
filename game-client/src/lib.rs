@@ -18,6 +18,12 @@ const CHARACTER_FRAME_SIZE: f32 = 48.0;
 const CHARACTER_ANIMATION_FPS: f32 = 12.0;
 const CHARACTER_ANIMATION_FRAMES: usize = 4;
 const CHARACTER_SCALE: f32 = 1.75;
+const FOOTSTEP_TRIGGER_SPEED: f32 = 18.0;
+const FOOTSTEP_INTERVAL_SECONDS: f32 = 0.30;
+const FOOTSTEP_BASE_VOLUME: f32 = 0.52;
+const PLACEMENT_VOLUME: f32 = 0.55;
+const FOOTSTEP_VOLUME_VARIATION: [f32; 6] = [0.88, 1.0, 0.94, 1.06, 0.9, 1.02];
+const FOOTSTEP_SPEED_VARIATION: [f32; 6] = [0.96, 1.03, 0.99, 1.05, 0.97, 1.01];
 const STRUCTURE_SIZE: f32 = 18.0;
 const PROJECTILE_SIZE: f32 = 8.0;
 const MAP_LIMIT: f32 = 5000.0;
@@ -48,6 +54,7 @@ static OUTBOUND_FEATURE_COMMANDS: Lazy<Mutex<Vec<OutboundFeatureCommand>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 static NEXT_PLAYER_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static STARTED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+static PENDING_SESSION_RESET: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlayerState {
@@ -235,6 +242,31 @@ struct CharacterAtlasHandles {
     layout: Handle<TextureAtlasLayout>,
 }
 
+#[derive(Resource, Clone)]
+struct SfxAudioHandles {
+    footstep_clips: Vec<Handle<AudioSource>>,
+    placement_clip: Handle<AudioSource>,
+}
+
+#[derive(Resource)]
+struct FootstepState {
+    timer: Timer,
+    was_moving: bool,
+    clip_cursor: usize,
+    variation_cursor: usize,
+}
+
+impl Default for FootstepState {
+    fn default() -> Self {
+        Self {
+            timer: Timer::from_seconds(FOOTSTEP_INTERVAL_SECONDS, TimerMode::Repeating),
+            was_moving: false,
+            clip_cursor: 0,
+            variation_cursor: 0,
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 struct CurrentPlayerId(Option<String>);
 
@@ -272,9 +304,33 @@ impl Default for BuildPlacementState {
     }
 }
 
+fn clear_protocol_queues() {
+    if let Ok(mut queue) = INBOUND_SNAPSHOTS.lock() {
+        queue.clear();
+    }
+    if let Ok(mut queue) = OUTBOUND_INPUTS.lock() {
+        queue.clear();
+    }
+    if let Ok(mut queue) = OUTBOUND_FEATURE_COMMANDS.lock() {
+        queue.clear();
+    }
+}
+
+fn take_pending_session_reset() -> bool {
+    match PENDING_SESSION_RESET.lock() {
+        Ok(mut pending) => {
+            let was_pending = *pending;
+            *pending = false;
+            was_pending
+        }
+        Err(_) => false,
+    }
+}
+
 #[wasm_bindgen]
 pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    clear_protocol_queues();
 
     let mut started = STARTED
         .lock()
@@ -300,6 +356,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .insert_resource(NextInputSeq::default())
         .insert_resource(InputHistory::default())
         .insert_resource(BuildPlacementState::default())
+        .insert_resource(FootstepState::default())
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -316,8 +373,10 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .add_systems(
             Update,
             (
+                apply_pending_session_reset,
                 sync_player_id,
                 simulate_local_player,
+                emit_footstep_audio,
                 handle_build_placement_controls,
                 emit_projectile_fire_command,
                 simulate_predicted_projectiles,
@@ -331,6 +390,14 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
 
     app.run();
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn reset_session_state() {
+    clear_protocol_queues();
+    if let Ok(mut pending) = PENDING_SESSION_RESET.lock() {
+        *pending = true;
+    }
 }
 
 #[wasm_bindgen]
@@ -392,6 +459,14 @@ fn setup_world(
     asset_server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
 ) {
+    commands.insert_resource(SfxAudioHandles {
+        footstep_clips: vec![
+            asset_server.load("audio/footstep-a.mp3"),
+            asset_server.load("audio/footstep-b.mp3"),
+        ],
+        placement_clip: asset_server.load("audio/place-object-subtle.mp3"),
+    });
+
     commands.spawn(Camera2dBundle::default());
 
     for x in -25..=25 {
@@ -457,6 +532,83 @@ fn setup_world(
         },
         LocalBuildGhost,
     ));
+}
+
+fn apply_pending_session_reset(
+    mut commands: Commands,
+    mut current_player_id: ResMut<CurrentPlayerId>,
+    mut accumulator: ResMut<SimAccumulator>,
+    mut next_input_seq: ResMut<NextInputSeq>,
+    mut input_history: ResMut<InputHistory>,
+    mut placement: ResMut<BuildPlacementState>,
+    mut footstep_state: ResMut<FootstepState>,
+    mut local_query: Query<
+        (
+            &mut Transform,
+            &mut Actor,
+            &mut ActorVelocity,
+            &mut CharacterAnimator,
+            &mut TextureAtlas,
+        ),
+        (With<LocalActor>, Without<LocalBuildGhost>),
+    >,
+    mut local_build_ghost_query: Query<
+        (&mut Visibility, &mut Transform),
+        (With<LocalBuildGhost>, Without<LocalActor>),
+    >,
+    remote_query: Query<Entity, With<RemoteActor>>,
+    structure_query: Query<Entity, With<StructureActor>>,
+    preview_query: Query<Entity, With<BuildPreviewActor>>,
+    projectile_query: Query<Entity, With<ProjectileActor>>,
+    predicted_projectile_query: Query<Entity, With<PredictedProjectileActor>>,
+) {
+    if !take_pending_session_reset() {
+        return;
+    }
+
+    clear_protocol_queues();
+
+    current_player_id.0 = None;
+    accumulator.0 = 0.0;
+    next_input_seq.0 = 1;
+    input_history.0.clear();
+    *placement = BuildPlacementState::default();
+    *footstep_state = FootstepState::default();
+
+    if let Ok((mut transform, mut actor, mut velocity, mut animator, mut atlas)) =
+        local_query.get_single_mut()
+    {
+        transform.translation.x = 0.0;
+        transform.translation.y = 0.0;
+        velocity.0 = Vec2::ZERO;
+        actor.id = "local-pending".to_string();
+        animator.facing = FacingDirection::Down;
+        animator.frame = 0;
+        animator.timer.reset();
+        atlas.index = FacingDirection::Down.row_index() * CHARACTER_ANIMATION_FRAMES;
+    }
+
+    if let Ok((mut visibility, mut transform)) = local_build_ghost_query.get_single_mut() {
+        *visibility = Visibility::Hidden;
+        transform.translation.x = 0.0;
+        transform.translation.y = 0.0;
+    }
+
+    for entity in &remote_query {
+        commands.entity(entity).despawn_recursive();
+    }
+    for entity in &structure_query {
+        commands.entity(entity).despawn_recursive();
+    }
+    for entity in &preview_query {
+        commands.entity(entity).despawn_recursive();
+    }
+    for entity in &projectile_query {
+        commands.entity(entity).despawn_recursive();
+    }
+    for entity in &predicted_projectile_query {
+        commands.entity(entity).despawn_recursive();
+    }
 }
 
 fn sync_player_id(
@@ -577,9 +729,11 @@ fn disable_build_mode(placement: &mut BuildPlacementState) {
 }
 
 fn handle_build_placement_controls(
+    mut commands: Commands,
     time: Res<Time>,
     input: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
+    sfx_handles: Res<SfxAudioHandles>,
     mut placement: ResMut<BuildPlacementState>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -646,6 +800,13 @@ fn handle_build_placement_controls(
     }
 
     if mouse_buttons.just_pressed(MouseButton::Left) {
+        commands.spawn(AudioBundle {
+            source: sfx_handles.placement_clip.clone(),
+            settings: bevy::audio::PlaybackSettings::DESPAWN
+                .with_volume(bevy::audio::Volume::new(PLACEMENT_VOLUME)),
+            ..default()
+        });
+
         queue_feature_command(
             "build",
             "place",
@@ -738,6 +899,63 @@ fn simulate_local_player(
 
     if steps == MAX_SIM_STEPS_PER_FRAME && accumulator.0 >= CLIENT_SIM_DT {
         accumulator.0 = 0.0;
+    }
+}
+
+fn emit_footstep_audio(
+    mut commands: Commands,
+    time: Res<Time>,
+    sfx_handles: Res<SfxAudioHandles>,
+    mut footstep_state: ResMut<FootstepState>,
+    local_velocity_query: Query<&ActorVelocity, With<LocalActor>>,
+) {
+    let Ok(local_velocity) = local_velocity_query.get_single() else {
+        footstep_state.was_moving = false;
+        footstep_state.timer.reset();
+        return;
+    };
+
+    let moving =
+        local_velocity.0.length_squared() >= FOOTSTEP_TRIGGER_SPEED * FOOTSTEP_TRIGGER_SPEED;
+    if !moving {
+        footstep_state.was_moving = false;
+        footstep_state.timer.reset();
+        return;
+    }
+    if sfx_handles.footstep_clips.is_empty() {
+        return;
+    }
+
+    let play_footstep =
+        |commands: &mut Commands, handles: &SfxAudioHandles, state: &mut FootstepState| {
+            let clip_index = state.clip_cursor % handles.footstep_clips.len();
+            let variation_index = state.variation_cursor % FOOTSTEP_VOLUME_VARIATION.len();
+            let clip = handles.footstep_clips[clip_index].clone();
+            let volume = FOOTSTEP_BASE_VOLUME * FOOTSTEP_VOLUME_VARIATION[variation_index];
+            let speed = FOOTSTEP_SPEED_VARIATION[variation_index % FOOTSTEP_SPEED_VARIATION.len()];
+
+            commands.spawn(AudioBundle {
+                source: clip,
+                settings: bevy::audio::PlaybackSettings::DESPAWN
+                    .with_volume(bevy::audio::Volume::new(volume))
+                    .with_speed(speed),
+                ..default()
+            });
+
+            state.clip_cursor = (state.clip_cursor + 1) % handles.footstep_clips.len();
+            state.variation_cursor = (state.variation_cursor + 1) % FOOTSTEP_VOLUME_VARIATION.len();
+        };
+
+    if !footstep_state.was_moving {
+        footstep_state.was_moving = true;
+        footstep_state.timer.reset();
+        play_footstep(&mut commands, &sfx_handles, &mut footstep_state);
+        return;
+    }
+
+    footstep_state.timer.tick(time.delta());
+    if footstep_state.timer.just_finished() {
+        play_footstep(&mut commands, &sfx_handles, &mut footstep_state);
     }
 }
 
