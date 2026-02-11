@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value};
 use sim_core::domain::{
@@ -999,6 +1000,113 @@ fn now_ms() -> i64 {
 
 fn now_seconds() -> i64 {
     now_ms() / 1000
+}
+
+fn decode_payload<T>(
+    payload: Option<Value>,
+    missing_error: &'static str,
+    invalid_error: &'static str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let payload = payload.ok_or_else(|| Error::RustError(missing_error.into()))?;
+    serde_json::from_value(payload).map_err(|_| Error::RustError(invalid_error.into()))
+}
+
+fn parse_client_command_envelope_message(
+    message: WebSocketIncomingMessage,
+) -> Result<ClientCommandEnvelope> {
+    let raw = match message {
+        WebSocketIncomingMessage::String(text) => text,
+        WebSocketIncomingMessage::Binary(_) => {
+            return Err(Error::RustError(
+                "binary websocket payloads are not supported".into(),
+            ));
+        }
+    };
+
+    if raw.len() > 32 * 1024 {
+        return Err(Error::RustError("protocol envelope too large".into()));
+    }
+
+    let envelope: ClientCommandEnvelope = serde_json::from_str(&raw)
+        .map_err(|_| Error::RustError("malformed protocol envelope".into()))?;
+
+    if envelope.v != PROTOCOL_VERSION
+        || envelope.kind != ClientEnvelopeKind::Command
+        || envelope.seq < 1
+        || envelope.action.is_empty()
+        || envelope.action.len() > 32
+        || !is_valid_protocol_identifier(envelope.action.as_str())
+        || !envelope.client_time.is_finite()
+    {
+        return Err(Error::RustError("invalid protocol envelope".into()));
+    }
+
+    Ok(envelope)
+}
+
+fn validate_movement_input_batch_payload(payload: Option<Value>) -> Result<InputBatchPayload> {
+    let input_batch: InputBatchPayload = decode_payload(
+        payload,
+        "missing movement payload",
+        "invalid movement payload",
+    )?;
+
+    if input_batch.inputs.len() > 128 {
+        return Err(Error::RustError("input batch too large".into()));
+    }
+
+    Ok(input_batch)
+}
+
+fn validate_inventory_move_payload(payload: Option<Value>) -> Result<InventoryMovePayload> {
+    let move_payload: InventoryMovePayload = decode_payload(
+        payload,
+        "missing inventory payload",
+        "invalid inventory payload",
+    )?;
+
+    if move_payload.from_slot == move_payload.to_slot
+        || move_payload.from_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+        || move_payload.to_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+        || move_payload.amount.is_some_and(|amount| amount == 0)
+    {
+        return Err(Error::RustError("invalid inventory move payload".into()));
+    }
+
+    Ok(move_payload)
+}
+
+fn validate_inventory_split_payload(payload: Option<Value>) -> Result<InventorySplitPayload> {
+    let split_payload: InventorySplitPayload = decode_payload(
+        payload,
+        "missing inventory payload",
+        "invalid inventory payload",
+    )?;
+
+    if split_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16 || split_payload.amount == 0 {
+        return Err(Error::RustError("invalid inventory split payload".into()));
+    }
+
+    Ok(split_payload)
+}
+
+fn validate_inventory_discard_payload(payload: Option<Value>) -> Result<InventoryDiscardPayload> {
+    let discard_payload: InventoryDiscardPayload = decode_payload(
+        payload,
+        "missing inventory payload",
+        "invalid inventory payload",
+    )?;
+
+    if discard_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+        || discard_payload.amount.is_some_and(|amount| amount == 0)
+    {
+        return Err(Error::RustError("invalid inventory discard payload".into()));
+    }
+
+    Ok(discard_payload)
 }
 
 fn sanitize_room_code(input: &str) -> Option<String> {
@@ -3365,13 +3473,7 @@ impl RoomDurableObject {
     }
 
     fn handle_movement_input_batch(&self, player_id: &str, payload: Option<Value>) -> Result<bool> {
-        let payload = payload.ok_or_else(|| Error::RustError("missing movement payload".into()))?;
-        let input_batch: InputBatchPayload = serde_json::from_value(payload)
-            .map_err(|_| Error::RustError("invalid movement payload".into()))?;
-
-        if input_batch.inputs.len() > 128 {
-            return Err(Error::RustError("input batch too large".into()));
-        }
+        let input_batch = validate_movement_input_batch_payload(payload)?;
 
         if input_batch.inputs.is_empty() {
             return Ok(false);
@@ -3754,18 +3856,7 @@ impl RoomDurableObject {
 
         match action {
             "move" => {
-                let payload =
-                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
-                let move_payload: InventoryMovePayload = serde_json::from_value(payload)
-                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
-
-                if move_payload.from_slot == move_payload.to_slot
-                    || move_payload.from_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
-                    || move_payload.to_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
-                    || move_payload.amount.is_some_and(|amount| amount == 0)
-                {
-                    return Err(Error::RustError("invalid inventory move payload".into()));
-                }
+                let move_payload = validate_inventory_move_payload(payload)?;
 
                 {
                     let mut runtime = self.runtime.borrow_mut();
@@ -3786,16 +3877,7 @@ impl RoomDurableObject {
                 Ok(true)
             }
             "split" => {
-                let payload =
-                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
-                let split_payload: InventorySplitPayload = serde_json::from_value(payload)
-                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
-
-                if split_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
-                    || split_payload.amount == 0
-                {
-                    return Err(Error::RustError("invalid inventory split payload".into()));
-                }
+                let split_payload = validate_inventory_split_payload(payload)?;
 
                 {
                     let mut runtime = self.runtime.borrow_mut();
@@ -3812,16 +3894,7 @@ impl RoomDurableObject {
                 Ok(true)
             }
             "discard" => {
-                let payload =
-                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
-                let discard_payload: InventoryDiscardPayload = serde_json::from_value(payload)
-                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
-
-                if discard_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
-                    || discard_payload.amount.is_some_and(|amount| amount == 0)
-                {
-                    return Err(Error::RustError("invalid inventory discard payload".into()));
-                }
+                let discard_payload = validate_inventory_discard_payload(payload)?;
 
                 let (discarded_stack, player_x, player_y) = {
                     let mut runtime = self.runtime.borrow_mut();
@@ -5542,34 +5615,7 @@ impl RoomDurableObject {
         &self,
         message: WebSocketIncomingMessage,
     ) -> Result<ClientCommandEnvelope> {
-        let raw = match message {
-            WebSocketIncomingMessage::String(text) => text,
-            WebSocketIncomingMessage::Binary(_) => {
-                return Err(Error::RustError(
-                    "binary websocket payloads are not supported".into(),
-                ));
-            }
-        };
-
-        if raw.len() > 32 * 1024 {
-            return Err(Error::RustError("protocol envelope too large".into()));
-        }
-
-        let envelope: ClientCommandEnvelope = serde_json::from_str(&raw)
-            .map_err(|_| Error::RustError("malformed protocol envelope".into()))?;
-
-        if envelope.v != PROTOCOL_VERSION
-            || envelope.kind != ClientEnvelopeKind::Command
-            || envelope.seq < 1
-            || envelope.action.is_empty()
-            || envelope.action.len() > 32
-            || !is_valid_protocol_identifier(envelope.action.as_str())
-            || !envelope.client_time.is_finite()
-        {
-            return Err(Error::RustError("invalid protocol envelope".into()));
-        }
-
-        Ok(envelope)
+        parse_client_command_envelope_message(message)
     }
 
     fn apply_command(
@@ -5890,6 +5936,15 @@ impl DurableObject for RoomDurableObject {
 mod tests {
     use super::*;
 
+    fn assert_error_contains<T: std::fmt::Debug>(result: Result<T>, expected_substring: &str) {
+        let error = result.expect_err("operation should fail");
+        let message = format!("{error}");
+        assert!(
+            message.contains(expected_substring),
+            "expected error containing `{expected_substring}`, got `{message}`"
+        );
+    }
+
     fn slot_state(inventory: &RuntimeInventoryState, slot: usize) -> Option<(String, u32)> {
         inventory
             .slots
@@ -5900,6 +5955,156 @@ mod tests {
 
     fn resource_total(inventory: &RuntimeInventoryState, resource: &str) -> u32 {
         inventory.total_resource_amount(resource)
+    }
+
+    #[test]
+    fn protocol_envelope_parser_accepts_valid_command() {
+        let message = WebSocketIncomingMessage::String(
+            json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "command",
+                "seq": 42,
+                "feature": "inventory",
+                "action": "move",
+                "clientTime": 123.5,
+                "payload": {
+                    "fromSlot": 0,
+                    "toSlot": 1
+                }
+            })
+            .to_string(),
+        );
+
+        let envelope =
+            parse_client_command_envelope_message(message).expect("envelope should parse");
+        assert_eq!(envelope.seq, 42);
+        assert_eq!(envelope.feature, ProtocolFeature::Inventory);
+        assert_eq!(envelope.action, "move");
+    }
+
+    #[test]
+    fn protocol_envelope_parser_rejects_malformed_and_invalid_messages() {
+        assert_error_contains(
+            parse_client_command_envelope_message(WebSocketIncomingMessage::Binary(vec![1, 2, 3])),
+            "binary websocket payloads are not supported",
+        );
+
+        assert_error_contains(
+            parse_client_command_envelope_message(WebSocketIncomingMessage::String(
+                "not valid json".to_string(),
+            )),
+            "malformed protocol envelope",
+        );
+
+        let oversized = "x".repeat((32 * 1024) + 1);
+        assert_error_contains(
+            parse_client_command_envelope_message(WebSocketIncomingMessage::String(oversized)),
+            "protocol envelope too large",
+        );
+
+        let invalid_seq = WebSocketIncomingMessage::String(
+            json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "command",
+                "seq": 0,
+                "feature": "movement",
+                "action": "input_batch",
+                "clientTime": 1.0,
+                "payload": {
+                    "inputs": []
+                }
+            })
+            .to_string(),
+        );
+        assert_error_contains(
+            parse_client_command_envelope_message(invalid_seq),
+            "invalid protocol envelope",
+        );
+
+        let invalid_action = WebSocketIncomingMessage::String(
+            json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "command",
+                "seq": 1,
+                "feature": "movement",
+                "action": "bad action",
+                "clientTime": 1.0,
+                "payload": {
+                    "inputs": []
+                }
+            })
+            .to_string(),
+        );
+        assert_error_contains(
+            parse_client_command_envelope_message(invalid_action),
+            "invalid protocol envelope",
+        );
+    }
+
+    #[test]
+    fn movement_payload_validator_rejects_invalid_shapes() {
+        assert_error_contains(
+            validate_movement_input_batch_payload(None),
+            "missing movement payload",
+        );
+
+        assert_error_contains(
+            validate_movement_input_batch_payload(Some(json!({
+                "inputs": "bad-shape"
+            }))),
+            "invalid movement payload",
+        );
+
+        let oversized_inputs = (1..=129)
+            .map(|seq| {
+                json!({
+                    "seq": seq,
+                    "up": false,
+                    "down": false,
+                    "left": false,
+                    "right": false
+                })
+            })
+            .collect::<Vec<Value>>();
+        assert_error_contains(
+            validate_movement_input_batch_payload(Some(json!({
+                "inputs": oversized_inputs
+            }))),
+            "input batch too large",
+        );
+    }
+
+    #[test]
+    fn inventory_payload_validators_reject_malformed_payloads() {
+        assert_error_contains(
+            validate_inventory_move_payload(Some(json!({
+                "fromSlot": 2,
+                "toSlot": 2
+            }))),
+            "invalid inventory move payload",
+        );
+        assert_error_contains(
+            validate_inventory_move_payload(Some(json!({
+                "fromSlot": 0,
+                "toSlot": 1,
+                "amount": 0
+            }))),
+            "invalid inventory move payload",
+        );
+        assert_error_contains(
+            validate_inventory_split_payload(Some(json!({
+                "slot": 0,
+                "amount": 0
+            }))),
+            "invalid inventory split payload",
+        );
+        assert_error_contains(
+            validate_inventory_discard_payload(Some(json!({
+                "slot": 0,
+                "amount": 0
+            }))),
+            "invalid inventory discard payload",
+        );
     }
 
     #[test]

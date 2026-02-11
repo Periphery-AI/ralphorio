@@ -153,3 +153,11 @@ Format per entry:
 - files: src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: npm run build:web (pass); npx eslint src/routes/room-route.tsx (fails on pre-existing `react-hooks/set-state-in-effect` for synchronous `setCombatFeed` in effect)
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-015
+- summary: Completed protocol malformed-payload validation coverage with dedicated envelope/payload parser tests in worker, and added a repeatable pre-merge smoke-check pipeline command.
+- decisions: Extract protocol parsing/validation into pure helpers (`parse_client_command_envelope_message`, movement/inventory payload validators) so malformed cases are testable without DO runtime setup; codify required merge checks in `scripts/premerge-checks.sh` and expose via `npm run check:premerge`.
+- files: worker/src/lib.rs, scripts/premerge-checks.sh, package.json, README.md, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; npm run check:premerge (pass: sim-core tests 13/13, worker tests 23/23, worker check pass, game-client wasm check pass, build:web pass)
+- commit: feat(rl-015): add protocol malformed-payload tests and premerge checks

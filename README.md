@@ -98,6 +98,12 @@ npm run worker:dev
 npm run build
 ```
 
+Pre-merge smoke checks:
+
+```bash
+npm run check:premerge
+```
+
 ## Character Sprite Generation (Retro Diffusion)
 
 Generate/update one animated player spritesheet:

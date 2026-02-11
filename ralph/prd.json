@@ -194,7 +194,7 @@
         "Protocol validation tests cover malformed payload handling",
         "Build pipeline checks run clean before each merge"
       ],
-      "passes": false
+      "passes": true
     }
   ]
 }
