@@ -122,6 +122,26 @@ body::before {
   color: #c3d8ff;
 }
 
+.hud-metric {
+  min-width: 8.4rem;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding: 0.44rem 0.95rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+}
+
+.hud-metric-label {
+  color: #a9bfeb;
+}
+
+.hud-metric-value {
+  color: #e8f3ff;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .btn-neon,
 .btn-ghost {
   height: 3rem;

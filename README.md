@@ -1,54 +1,49 @@
 # Ralph Island Multiplayer Foundation
 
-A production-grade skeleton for a large co-op browser game:
+Production skeleton for a large co-op browser game:
 
 - Frontend: Vite + React + Tailwind + TanStack Router
 - Auth: Clerk
 - Game client: Rust + Bevy (WASM)
-- Shared simulation: Rust `sim-core` (WASM in DO + native crate in Bevy)
-- Multiplayer backend: Cloudflare Worker + Durable Objects + SQLite
+- Shared simulation math: Rust `sim-core`
+- Multiplayer backend: Rust Cloudflare Worker + Rust Durable Object + SQLite
 - Transport: WebSockets
-- Domain target: `will.ralph-island.com`
+- Domain: `will.ralph-island.com`
 
-## What is implemented now
+## Current capabilities
 
 - Room-based multiplayer (`/room/:roomCode`)
-- Server-authoritative simulation loop in Durable Objects
-- Rust `sim-core` executes authoritative movement/projectile integration in DO
-- Deterministic fixed simulation tick (`60Hz`) + snapshot stream (`20Hz`)
-- Client prediction + local reconciliation pipeline for movement
-- Snapshot interpolation buffer for smoother remote rendering
-- Authoritative structures and projectiles
-- Protocol v2 envelopes with command acks + ping/pong latency tracking
+- Rust Durable Object room authority with SQLite persistence
+- Server-authoritative movement, build objects, and projectiles
+- Fixed-step simulation (`60Hz`) and snapshots (`20Hz`)
+- Client prediction + server reconciliation for local player movement
+- Snapshot interpolation for smooth remote rendering
+- Protocol v2 envelopes with command ack and ping/pong
+- Clerk-backed websocket identity (token + user id validation in Rust)
 
 ## Runtime architecture
 
-### Durable Object (authority)
+### Rust Worker / Durable Object
 
+- Entry point: `worker/src/lib.rs`
 - One room code => one `RoomDurableObject`
-- Fixed-step simulation loop in `worker/src/index.ts`
-- Feature modules:
-  - `presence`
-  - `movement`
-  - `build`
-  - `projectile`
-- Per-feature SQLite migrations via `worker/src/framework/migrations.ts`
-- Shared Rust simulation runtime loaded in Worker from `worker/src/sim-core/sim_core.wasm`
+- SQLite tables for presence, movement, builds, and projectiles
+- Protocol command handling and snapshot broadcast
+- Clerk session verification in the websocket connect path
 
-### Browser client
+### Browser app
 
-- `src/game/network-client.ts`: protocol transport and command sending
-- `src/game/netcode/replication.ts`: clock sync + interpolation buffering
-- `src/routes/room-route.tsx`: room session orchestration, pumps input/render data
+- `src/routes/room-route.tsx`: session bootstrap and HUD
+- `src/game/network-client.ts`: websocket protocol transport
+- `src/game/netcode/replication.ts`: interpolation and render snapshots
 - `src/game/bridge.ts`: JS <-> Bevy WASM bridge
 
-### Bevy WASM
+### Bevy WASM client
 
 - `game-client/src/lib.rs`
-- Uses `sim-core` crate directly for deterministic movement stepping parity
 - Local fixed-step simulation and sequenced input emission
-- Authoritative correction + replay of unacked input history
-- Remote smoothing + rendering of structures/projectiles
+- Reconciliation against authoritative snapshots
+- Rendering of players, structures, and projectiles
 
 ## Development
 
@@ -60,43 +55,41 @@ A production-grade skeleton for a large co-op browser game:
 - `wasm32-unknown-unknown` target
 - Cloudflare account + `wrangler login`
 
-Install Rust target and wasm-pack once:
+Install once:
 
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 ```
 
-### Env setup
+### Local env
 
-```bash
-cp .env.example .env
-```
+Frontend:
 
-Set at least:
+- `.env.development` should include `VITE_CLERK_PUBLISHABLE_KEY`
 
-- `VITE_CLERK_PUBLISHABLE_KEY`
+Worker (local dev):
+
+- `worker/.dev.vars` should include `CLERK_SECRET_KEY`
 
 ### Run locally
 
-Install deps:
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-Run worker (terminal 1):
-
-```bash
-npm run worker:dev
-```
-
-(`worker:dev` builds `sim-core` WASM first.)
-
-Run frontend (terminal 2):
+Start frontend:
 
 ```bash
 npm run dev
+```
+
+Start worker:
+
+```bash
+npm run worker:dev
 ```
 
 ## Build
@@ -105,24 +98,23 @@ npm run dev
 npm run build
 ```
 
-This builds Bevy WASM first, then the web app.
-
 ## Deploy
 
 `worker/wrangler.toml` is configured for:
 
-- Durable Object binding `ROOMS`
-- SQLite DO class migration
-- Static assets from `dist/`
-- custom domain route for `will.ralph-island.com`
+- Durable Object namespace `ROOMS`
+- SQLite DO migrations
+- Static assets binding from `dist/`
+- Custom domain route `will.ralph-island.com`
+
+Ensure production secret exists:
+
+```bash
+wrangler secret put CLERK_SECRET_KEY --config worker/wrangler.toml
+```
 
 Deploy:
 
 ```bash
 npm run deploy
 ```
-
-## Notes
-
-- This rewrite is server-authoritative and netcode-focused so gameplay systems can be added safely.
-- Architecture details: `docs/networking-architecture.md`.

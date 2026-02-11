@@ -24,6 +24,15 @@ function buildWebSocketUrl(roomCode: string, playerId: string) {
   return `${protocol}//${host}/api/rooms/${encodedRoom}/ws?playerId=${encodedPlayer}`;
 }
 
+function appendAuthToken(url: string, token: string | null) {
+  if (!token) {
+    return url;
+  }
+
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}token=${encodeURIComponent(token)}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -112,18 +121,20 @@ export class RoomSocket {
   private readonly roomCode: string;
   private readonly playerId: string;
   private readonly handlers: Handlers;
+  private readonly authToken: string | null;
   private seq = 1;
   private pingTimer: number | null = null;
   private pingSentAt = new Map<number, number>();
 
-  constructor(roomCode: string, playerId: string, handlers: Handlers) {
+  constructor(roomCode: string, playerId: string, handlers: Handlers, authToken: string | null = null) {
     this.roomCode = roomCode;
     this.playerId = playerId;
     this.handlers = handlers;
+    this.authToken = authToken;
   }
 
-  connect() {
-    const url = buildWebSocketUrl(this.roomCode, this.playerId);
+  async connect() {
+    const url = appendAuthToken(buildWebSocketUrl(this.roomCode, this.playerId), this.authToken);
     this.handlers.onStatus('Connecting...');
 
     this.socket = new WebSocket(url);
@@ -201,47 +212,45 @@ export class RoomSocket {
     });
   }
 
-  sendInputCommands(inputs: InputCommand[]) {
+  sendBuildPlace(x: number, y: number, kind = 'beacon') {
+    this.sendFeatureCommand('build', 'place', {
+      x,
+      y,
+      kind,
+      clientBuildId: `build_${crypto.randomUUID()}`,
+    });
+  }
+
+  sendFeatureCommand(feature: string, action: string, payload?: unknown) {
+    return this.sendCommand({
+      feature,
+      action,
+      payload,
+    });
+  }
+
+  sendBuildRemove(id: string) {
+    this.sendFeatureCommand('build', 'remove', { id });
+  }
+
+  sendCorePing() {
+    return this.sendFeatureCommand('core', 'ping', null);
+  }
+
+  sendMovementInputBatch(inputs: InputCommand[]) {
     if (inputs.length === 0) {
-      return;
+      return null;
     }
 
-    this.sendCommand({
-      feature: 'movement',
-      action: 'input_batch',
-      payload: {
-        inputs,
-      },
-    });
+    return this.sendFeatureCommand('movement', 'input_batch', { inputs });
   }
 
-  sendBuildPlace(x: number, y: number, kind = 'beacon') {
-    this.sendCommand({
-      feature: 'build',
-      action: 'place',
-      payload: {
-        x,
-        y,
-        kind,
-        clientBuildId: `build_${crypto.randomUUID()}`,
-      },
-    });
-  }
-
-  sendProjectileFire(params: { x: number; y: number; vx: number; vy: number; clientProjectileId: string }) {
-    this.sendCommand({
-      feature: 'projectile',
-      action: 'fire',
-      payload: params,
-    });
+  sendInputCommands(inputs: InputCommand[]) {
+    this.sendMovementInputBatch(inputs);
   }
 
   private sendPing() {
-    const seq = this.sendCommand({
-      feature: 'core',
-      action: 'ping',
-      payload: null,
-    });
+    const seq = this.sendCorePing();
 
     if (seq !== null) {
       this.pingSentAt.set(seq, performance.now());

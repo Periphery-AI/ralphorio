@@ -1,19 +1,18 @@
-# Multiplayer Networking Architecture (Rewrite v2)
+# Multiplayer Networking Architecture (Rust DO)
 
-This project now uses a deterministic server-authoritative loop with explicit client prediction and reconciliation hooks.
+This project uses a server-authoritative Cloudflare Durable Object implemented in Rust, with client prediction and reconciliation in the Bevy WASM client.
 
 ## Goals
 
-- Server-authoritative gameplay state in Durable Objects
-- Fixed-step simulation (`60Hz`) with snapshot fanout (`20Hz`)
+- Server-authoritative room state with SQLite persistence
+- Fixed-step simulation (`60Hz`) + snapshot stream (`20Hz`)
 - Client prediction + server reconciliation for local movement
-- Snapshot interpolation for remote entities/projectiles
-- Feature-modular Durable Object runtime with per-feature SQLite migrations
-- Shared Rust simulation core (`sim-core`) reused by DO and Bevy client
+- Interpolated remote rendering for smooth visuals
+- Stable protocol and extensible feature surface for future systems
 
 ## Protocol v2
 
-All WebSocket messages are envelope-based.
+All websocket messages are envelope-based.
 
 ### Client -> Server
 
@@ -26,97 +25,86 @@ All WebSocket messages are envelope-based.
   "action": "input_batch",
   "clientTime": 1234.56,
   "payload": {
-    "inputs": [
-      { "seq": 101, "up": true, "down": false, "left": false, "right": true }
-    ]
+    "inputs": [{ "seq": 101, "up": true, "down": false, "left": false, "right": true }]
   }
 }
 ```
 
 ### Server -> Client
 
-- `welcome`: room metadata and simulation rates
-- `ack`: envelope-level ack for command sequencing
-- `snapshot`: authoritative world snapshot bundle
-- `event`: feature event stream
-- `pong`: latency/clock-sync support
-- `error`: protocol or validation errors
+- `welcome`: room metadata + rates
+- `ack`: command sequencing ack
+- `snapshot`: authoritative room state
+- `pong`: ping response for latency
+- `error`: protocol/auth/validation failures
+- `event`: reserved for feature event channels
 
-## Durable Object Runtime
+## Authority Runtime (Rust)
 
-File: `worker/src/index.ts`
+File: `worker/src/lib.rs`
 
-- Fixed simulation rate: `SIM_RATE_HZ = 60`
-- Snapshot broadcast rate: `SNAPSHOT_RATE_HZ = 20`
-- Main loop uses accumulated time and bounded catch-up steps
-- On each simulation tick:
-  1. call every feature `onTick` with fixed `dt`
-  2. emit feature tick events
-  3. broadcast snapshots on cadence (or dirty state)
+- Entrypoint routes:
+  - `/api/health`
+  - `/api/rooms/:roomCode/ws` (DO websocket)
+  - static assets via `ASSETS`
+- One room code maps to one `RoomDurableObject`
+- SQLite schema initialized inside the DO
+- Tick loop uses accumulator + bounded catch-up steps
+- Movement and projectile integration call `sim-core`
+- Snapshot payload includes:
+  - `features.presence`
+  - `features.movement`
+  - `features.build`
+  - `features.projectile`
 
-### Shared simulation runtime (Rust in DO)
+## Identity / Auth
 
-- Rust crate: `sim-core/`
-- Built as raw WASM and loaded by worker runtime: `worker/src/sim-core/runtime.ts`
-- Movement and projectile integration call Rust exports instead of duplicate TypeScript math:
-  - `worker/src/features/movement-feature.ts`
-  - `worker/src/features/projectile-feature.ts`
-- Build command: `npm run sim:build:worker`
+- Client sends `playerId` and Clerk session token (`token`) in websocket query params.
+- DO validates token claims and session status using `CLERK_SECRET_KEY`.
+- If no secret is configured, DO falls back to permissive `playerId` mode for local/dev workflows.
 
-## Feature Modules
-
-Each feature implements `RoomFeature` (`worker/src/framework/feature.ts`).
-
-- `presence`: online roster + count
-- `movement`: authoritative movement integration from input batches + input ack map
-- `build`: authoritative structure placement/removal
-- `projectile`: authoritative projectile creation/motion/expiry with client projectile id echo
-
-Migrations are tracked in `_feature_migrations` and applied by `worker/src/framework/migrations.ts`.
-
-## Client Netcode Pipeline
+## Client Netcode
 
 ### Transport
 
 File: `src/game/network-client.ts`
 
-- Protocol v2 envelopes
-- batched movement input commands (`movement.input_batch`)
-- periodic ping/pong latency measurement
+- Protocol envelope encode/decode
+- Sequenced commands and ping loop
+- Movement input batch send (`movement.input_batch`)
 
 ### Replication
 
 File: `src/game/netcode/replication.ts`
 
-- Maintains snapshot ring buffer
-- Estimates server clock offset
-- Renders remote state with interpolation delay (`~110ms`)
-- Uses latest authoritative local ack for reconciliation
+- Buffers snapshots and tracks clock offset
+- Uses interpolation delay (~110ms)
+- Keeps local player authoritative correction via `localAckSeq`
 
 ### Room orchestration
 
 File: `src/routes/room-route.tsx`
 
-- Input pump (`16ms`): drains WASM input commands and sends batches
-- Render pump (`16ms`): builds interpolated render snapshot and pushes into WASM
+- Boots Bevy client
+- Connects websocket with Clerk token
+- Input pump + render pump (`~16ms`)
 
-## Bevy WASM Client
+## Bevy WASM client
 
 File: `game-client/src/lib.rs`
 
-- Fixed-step local simulation (`60Hz`)
-- Uses `sim-core` Rust crate directly for movement stepping parity
-- Emits sequenced input commands for server processing
-- Maintains local input history
-- Reconciles local actor from authoritative position + replay of unacked inputs
-- Smooths remote actor motion and renders authoritative structures/projectiles
+- Local fixed-step sim (`60Hz`)
+- Predicts local movement using same `sim-core` math as server
+- Replays unacked input history after authoritative correction
+- Renders players, structures, and projectiles
 
-## Extending the Game
+## Extension strategy
 
-1. Add a feature module in `worker/src/features/`.
-2. Define feature migrations and snapshot shape.
-3. Add client command sender in `src/game/network-client.ts`.
-4. Add interpolation/reconciliation policy in `src/game/netcode/replication.ts`.
-5. Render state in Bevy (`game-client/src/lib.rs`).
+1. Add command handling branch in `worker/src/lib.rs` for new feature/action.
+2. Add SQLite tables/queries for authoritative state.
+3. Extend snapshot feature payload shape.
+4. Add transport command sender in `src/game/network-client.ts`.
+5. Add interpolation/reconciliation policy in `src/game/netcode/replication.ts`.
+6. Render/state handling in `game-client/src/lib.rs`.
 
-This layout keeps DO entrypoint stable while allowing parallel feature development.
+This keeps a single authoritative runtime while preserving clean protocol boundaries for parallel feature development.

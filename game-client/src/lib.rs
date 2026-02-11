@@ -2,9 +2,11 @@ use bevy::prelude::*;
 use bevy::window::WindowResolution;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sim_core::{movement_step, InputState as CoreInputState};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
 const TILE_SIZE: f32 = 32.0;
@@ -13,12 +15,17 @@ const STRUCTURE_SIZE: f32 = 18.0;
 const PROJECTILE_SIZE: f32 = 8.0;
 const MAP_LIMIT: f32 = 5000.0;
 const MOVE_SPEED: f32 = 220.0;
+const PROJECTILE_SPEED: f32 = 760.0;
+const PROJECTILE_TTL_SECONDS: f32 = 1.8;
 const CLIENT_SIM_HZ: f32 = 60.0;
 const CLIENT_SIM_DT: f32 = 1.0 / CLIENT_SIM_HZ;
 const MAX_SIM_STEPS_PER_FRAME: usize = 8;
 const MAX_INPUT_HISTORY: usize = 512;
 const MAX_OUTBOUND_INPUTS: usize = 256;
+const MAX_OUTBOUND_FEATURE_COMMANDS: usize = 128;
 const REMOTE_LERP_RATE: f32 = 18.0;
+const PROJECTILE_RECONCILE_BLEND_RATE: f32 = 10.0;
+const PROJECTILE_RECONCILE_HARD_SNAP_DISTANCE: f32 = 140.0;
 const SNAPSHOT_Z: f32 = 4.0;
 const STRUCTURE_Z: f32 = 3.0;
 const PROJECTILE_Z: f32 = 5.0;
@@ -26,6 +33,8 @@ const FLOOR_Z: f32 = 0.0;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static OUTBOUND_FEATURE_COMMANDS: Lazy<Mutex<Vec<OutboundFeatureCommand>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
 static NEXT_PLAYER_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static STARTED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
@@ -70,6 +79,8 @@ struct SnapshotPayload {
     sim_rate_hz: u32,
     #[serde(rename = "localAckSeq")]
     local_ack_seq: u32,
+    #[serde(rename = "renderDelayMs", default)]
+    render_delay_ms: f32,
     players: Vec<PlayerState>,
     #[serde(default)]
     structures: Vec<StructureState>,
@@ -92,6 +103,13 @@ struct InputCommand {
     down: bool,
     left: bool,
     right: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboundFeatureCommand {
+    feature: String,
+    action: String,
+    payload: Value,
 }
 
 #[derive(Clone)]
@@ -124,6 +142,23 @@ struct ProjectileActor {
     id: String,
 }
 
+#[derive(Component)]
+struct PredictedProjectileActor {
+    client_projectile_id: String,
+}
+
+#[derive(Component)]
+struct PredictedProjectileVelocity(Vec2);
+
+#[derive(Component)]
+struct PredictedProjectileLifetime(f32);
+
+#[derive(Component)]
+struct PredictedProjectileTarget {
+    has_target: bool,
+    position: Vec2,
+}
+
 #[derive(Resource, Default)]
 struct CurrentPlayerId(Option<String>);
 
@@ -146,7 +181,9 @@ struct InputHistory(VecDeque<InputHistoryEntry>);
 pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-    let mut started = STARTED.lock().map_err(|_| JsValue::from_str("mutex poisoned"))?;
+    let mut started = STARTED
+        .lock()
+        .map_err(|_| JsValue::from_str("mutex poisoned"))?;
     if *started {
         return Ok(());
     }
@@ -177,6 +214,8 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             (
                 sync_player_id,
                 simulate_local_player,
+                emit_projectile_fire_command,
+                simulate_predicted_projectiles,
                 apply_latest_snapshot,
                 smooth_remote_motion,
                 follow_camera,
@@ -224,6 +263,21 @@ pub fn drain_input_events() -> String {
     }
 
     let drained: Vec<InputCommand> = queue.drain(..).collect();
+    serde_json::to_string(&drained).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[wasm_bindgen]
+pub fn drain_feature_commands() -> String {
+    let mut queue = match OUTBOUND_FEATURE_COMMANDS.lock() {
+        Ok(queue) => queue,
+        Err(_) => return "[]".to_string(),
+    };
+
+    if queue.is_empty() {
+        return "[]".to_string();
+    }
+
+    let drained: Vec<OutboundFeatureCommand> = queue.drain(..).collect();
     serde_json::to_string(&drained).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -303,6 +357,46 @@ fn to_core_input(input: &InputState) -> CoreInputState {
     }
 }
 
+fn movement_direction_from_input(input: &ButtonInput<KeyCode>) -> Vec2 {
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+
+    if input.pressed(KeyCode::KeyD) || input.pressed(KeyCode::ArrowRight) {
+        dx += 1.0;
+    }
+    if input.pressed(KeyCode::KeyA) || input.pressed(KeyCode::ArrowLeft) {
+        dx -= 1.0;
+    }
+    if input.pressed(KeyCode::KeyW) || input.pressed(KeyCode::ArrowUp) {
+        dy += 1.0;
+    }
+    if input.pressed(KeyCode::KeyS) || input.pressed(KeyCode::ArrowDown) {
+        dy -= 1.0;
+    }
+
+    let direction = Vec2::new(dx, dy);
+    if direction.length_squared() <= f32::EPSILON {
+        Vec2::X
+    } else {
+        direction.normalize()
+    }
+}
+
+fn queue_feature_command(feature: &str, action: &str, payload: Value) {
+    if let Ok(mut queue) = OUTBOUND_FEATURE_COMMANDS.lock() {
+        queue.push(OutboundFeatureCommand {
+            feature: feature.to_string(),
+            action: action.to_string(),
+            payload,
+        });
+
+        if queue.len() > MAX_OUTBOUND_FEATURE_COMMANDS {
+            let overflow = queue.len() - MAX_OUTBOUND_FEATURE_COMMANDS;
+            queue.drain(0..overflow);
+        }
+    }
+}
+
 fn simulate_local_player(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -370,6 +464,103 @@ fn simulate_local_player(
     }
 }
 
+fn emit_projectile_fire_command(
+    mut commands: Commands,
+    input: Res<ButtonInput<KeyCode>>,
+    local_transform_query: Query<&Transform, With<LocalActor>>,
+) {
+    if !input.just_pressed(KeyCode::Space) {
+        return;
+    }
+
+    let Ok(local_transform) = local_transform_query.get_single() else {
+        return;
+    };
+
+    let direction = movement_direction_from_input(&input);
+    let velocity = direction * PROJECTILE_SPEED;
+    let client_projectile_id = format!("proj_{}", Uuid::new_v4());
+
+    queue_feature_command(
+        "projectile",
+        "fire",
+        json!({
+            "x": local_transform.translation.x,
+            "y": local_transform.translation.y,
+            "vx": velocity.x,
+            "vy": velocity.y,
+            "clientProjectileId": client_projectile_id,
+        }),
+    );
+
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: Color::srgb_u8(255, 214, 98),
+                custom_size: Some(Vec2::splat(PROJECTILE_SIZE)),
+                ..default()
+            },
+            transform: Transform::from_xyz(
+                local_transform.translation.x,
+                local_transform.translation.y,
+                PROJECTILE_Z + 0.2,
+            ),
+            ..default()
+        },
+        PredictedProjectileActor {
+            client_projectile_id,
+        },
+        PredictedProjectileVelocity(velocity),
+        PredictedProjectileLifetime(PROJECTILE_TTL_SECONDS),
+        PredictedProjectileTarget {
+            has_target: false,
+            position: Vec2::ZERO,
+        },
+    ));
+}
+
+fn simulate_predicted_projectiles(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut predicted_query: Query<
+        (
+            Entity,
+            &mut Transform,
+            &PredictedProjectileVelocity,
+            &mut PredictedProjectileLifetime,
+            &PredictedProjectileTarget,
+        ),
+        With<PredictedProjectileActor>,
+    >,
+) {
+    let dt = time.delta_seconds();
+    for (entity, mut transform, velocity, mut ttl, target) in &mut predicted_query {
+        transform.translation.x =
+            (transform.translation.x + velocity.0.x * dt).clamp(-MAP_LIMIT, MAP_LIMIT);
+        transform.translation.y =
+            (transform.translation.y + velocity.0.y * dt).clamp(-MAP_LIMIT, MAP_LIMIT);
+
+        let current = transform.translation.truncate();
+        let error = target.position - current;
+        if target.has_target {
+            if error.length() > PROJECTILE_RECONCILE_HARD_SNAP_DISTANCE {
+                transform.translation.x = target.position.x;
+                transform.translation.y = target.position.y;
+            } else {
+                let blend = 1.0 - (-PROJECTILE_RECONCILE_BLEND_RATE * dt).exp();
+                let corrected = current.lerp(target.position, blend.clamp(0.0, 1.0));
+                transform.translation.x = corrected.x;
+                transform.translation.y = corrected.y;
+            }
+        }
+
+        ttl.0 -= dt;
+        if ttl.0 <= 0.0 {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
 fn apply_latest_snapshot(
     mut commands: Commands,
     current_player_id: Res<CurrentPlayerId>,
@@ -378,6 +569,8 @@ fn apply_latest_snapshot(
     remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
     structure_query: Query<(Entity, &StructureActor)>,
     projectile_query: Query<(Entity, &ProjectileActor)>,
+    predicted_projectile_query: Query<(Entity, &PredictedProjectileActor)>,
+    mut predicted_target_query: Query<&mut PredictedProjectileTarget>,
 ) {
     let latest_snapshot = {
         let mut queue = match INBOUND_SNAPSHOTS.lock() {
@@ -445,9 +638,11 @@ fn apply_latest_snapshot(
 
     for structure in snapshot.structures {
         if let Some(entity) = structure_entities.remove(&structure.id) {
-            commands
-                .entity(entity)
-                .insert(Transform::from_xyz(structure.x, structure.y, STRUCTURE_Z));
+            commands.entity(entity).insert(Transform::from_xyz(
+                structure.x,
+                structure.y,
+                STRUCTURE_Z,
+            ));
         } else {
             spawn_structure_actor(&mut commands, &structure);
         }
@@ -461,12 +656,44 @@ fn apply_latest_snapshot(
         .iter()
         .map(|(entity, projectile)| (projectile.id.clone(), entity))
         .collect();
+    let mut predicted_projectile_entities: HashMap<String, Entity> = predicted_projectile_query
+        .iter()
+        .map(|(entity, predicted)| (predicted.client_projectile_id.clone(), entity))
+        .collect();
+    let local_player_id = current_player_id.0.clone();
 
     for projectile in snapshot.projectiles {
+        if local_player_id
+            .as_deref()
+            .is_some_and(|player_id| player_id == projectile.owner_id)
+        {
+            if let Some(client_projectile_id) = projectile.client_projectile_id.as_deref() {
+                if let Some(predicted_entity) =
+                    predicted_projectile_entities.remove(client_projectile_id)
+                {
+                    if let Ok(mut target) = predicted_target_query.get_mut(predicted_entity) {
+                        let projected_x =
+                            projectile.x + projectile.vx * (snapshot.render_delay_ms / 1000.0);
+                        let projected_y =
+                            projectile.y + projectile.vy * (snapshot.render_delay_ms / 1000.0);
+                        target.has_target = true;
+                        target.position = Vec2::new(projected_x, projected_y);
+                    }
+
+                    if let Some(authoritative_entity) = projectile_entities.remove(&projectile.id) {
+                        commands.entity(authoritative_entity).despawn_recursive();
+                    }
+                    continue;
+                }
+            }
+        }
+
         if let Some(entity) = projectile_entities.remove(&projectile.id) {
-            commands
-                .entity(entity)
-                .insert(Transform::from_xyz(projectile.x, projectile.y, PROJECTILE_Z));
+            commands.entity(entity).insert(Transform::from_xyz(
+                projectile.x,
+                projectile.y,
+                PROJECTILE_Z,
+            ));
         } else {
             spawn_projectile_actor(&mut commands, &projectile);
         }

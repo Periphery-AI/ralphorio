@@ -1,9 +1,10 @@
-import type { InputCommand, RenderSnapshotPayload } from './types';
+import type { InputCommand, OutboundFeatureCommand, RenderSnapshotPayload } from './types';
 import init, {
   boot_game,
   set_player_id,
   push_snapshot,
   drain_input_events,
+  drain_feature_commands,
 } from './wasm/client';
 
 let booted = false;
@@ -60,6 +61,18 @@ export async function drainInputCommands() {
     return JSON.parse(raw) as InputCommand[];
   } catch (error) {
     console.error('Failed to parse input commands from WASM.', error);
+    return [];
+  }
+}
+
+export async function drainFeatureCommands() {
+  await initialize();
+
+  try {
+    const raw = drain_feature_commands();
+    return JSON.parse(raw) as OutboundFeatureCommand[];
+  } catch (error) {
+    console.error('Failed to parse feature commands from WASM.', error);
     return [];
   }
 }

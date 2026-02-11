@@ -103,10 +103,17 @@ export type InputCommand = InputState & {
   seq: number;
 };
 
+export type OutboundFeatureCommand = {
+  feature: string;
+  action: string;
+  payload?: unknown;
+};
+
 export type RenderSnapshotPayload = {
   serverTick: number;
   simRateHz: number;
   localAckSeq: number;
+  renderDelayMs: number;
   players: PlayerState[];
   structures: BuildStructure[];
   projectiles: ProjectileState[];

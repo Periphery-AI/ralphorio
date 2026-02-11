@@ -114,7 +114,7 @@ function snapshotTime(snapshot: RoomSnapshot) {
 }
 
 export class ReplicationPipeline {
-  private readonly interpolationDelayMs: number;
+  private interpolationDelayMs: number;
   private readonly snapshots: RoomSnapshot[] = [];
   private clockOffsetMs = 0;
   private hasClockSync = false;
@@ -139,6 +139,22 @@ export class ReplicationPipeline {
       const overflow = this.snapshots.length - MAX_BUFFERED_SNAPSHOTS;
       this.snapshots.splice(0, overflow);
     }
+  }
+
+  setInterpolationDelayMs(delayMs: number) {
+    this.interpolationDelayMs = Math.max(0, Math.min(300, delayMs));
+  }
+
+  getInterpolationDelayMs() {
+    return this.interpolationDelayMs;
+  }
+
+  getDebugInfo() {
+    return {
+      interpolationDelayMs: this.interpolationDelayMs,
+      bufferedSnapshots: this.snapshots.length,
+      clockOffsetMs: this.clockOffsetMs,
+    };
   }
 
   buildRenderSnapshot(localPlayerId: string): RenderSnapshotPayload | null {
@@ -192,6 +208,7 @@ export class ReplicationPipeline {
       serverTick: latest.serverTick,
       simRateHz: latest.simRateHz,
       localAckSeq: latestMovement.inputAcks[localPlayerId] ?? 0,
+      renderDelayMs: this.interpolationDelayMs,
       players,
       structures,
       projectiles,

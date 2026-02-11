@@ -21,6 +21,7 @@ worker/.dev.vars
 
 game-client/target/*
 sim-core/target/*
+worker/target/*
 
 # Editor directories and files
 .vscode/*
