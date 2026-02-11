@@ -33,3 +33,11 @@ Format per entry:
 - files: sim-core/src/domain.rs, sim-core/src/lib.rs, sim-core/Cargo.toml, sim-core/Cargo.lock, worker/Cargo.lock, game-client/Cargo.lock, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path sim-core/Cargo.toml; cargo test --manifest-path sim-core/Cargo.toml (13 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
 - commit: 1f52970
+
+- timestamp: 2026-02-11
+- item: RL-002
+- summary: Completed protocol v2 envelope expansion for inventory/mining/crafting/combat/character channels with strict client/server validation and compact delta-safe snapshot behavior.
+- decisions: Promote protocol feature names to explicit enums/unions on both worker and web client; treat malformed/unsupported payloads as safe rejects; emit new gameplay snapshot channels as compact schemas (full snapshot baseline + delta-preserved merge path) while keeping existing build/movement/projectile behavior server-authoritative.
+- files: src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: pending

@@ -2,6 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value};
+use sim_core::domain::{DEFAULT_INVENTORY_MAX_SLOTS, GAMEPLAY_SCHEMA_VERSION};
 use sim_core::{
     deterministic_seed_from_room_code, movement_step_with_obstacles, projectile_step,
     InputState as CoreInputState, StructureObstacle, PLAYER_COLLIDER_RADIUS,
@@ -45,6 +46,29 @@ const MAX_PROJECTILES: usize = 4096;
 const MAX_PREVIEWS: usize = 256;
 const ROOM_META_ROOM_CODE_KEY: &str = "room_code";
 const ROOM_META_TERRAIN_SEED_KEY: &str = "terrain_seed";
+const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
+const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
+const MAX_CHARACTER_NAME_LEN: usize = 32;
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClientEnvelopeKind {
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProtocolFeature {
+    Core,
+    Movement,
+    Build,
+    Projectile,
+    Inventory,
+    Mining,
+    Crafting,
+    Combat,
+    Character,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SocketAttachment {
@@ -56,9 +80,9 @@ struct SocketAttachment {
 #[serde(rename_all = "camelCase")]
 struct ClientCommandEnvelope {
     v: u32,
-    kind: String,
+    kind: ClientEnvelopeKind,
     seq: u32,
-    feature: String,
+    feature: ProtocolFeature,
     action: String,
     client_time: f64,
     payload: Option<Value>,
@@ -132,6 +156,61 @@ struct ProjectileFirePayload {
     vx: f64,
     vy: f64,
     client_projectile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InventoryMovePayload {
+    from_slot: u16,
+    to_slot: u16,
+    amount: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InventorySplitPayload {
+    slot: u16,
+    amount: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MiningStartPayload {
+    node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MiningCancelPayload {
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CraftQueuePayload {
+    recipe: String,
+    count: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CraftCancelPayload {
+    recipe: Option<String>,
+    clear: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CombatAttackPayload {
+    target_id: String,
+    attack_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterMetadataPayload {
+    name: String,
+    sprite_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,6 +363,30 @@ fn sanitize_player_id(input: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn is_valid_protocol_identifier(input: &str) -> bool {
+    let candidate = input.trim();
+    if candidate.is_empty() || candidate.len() > MAX_PROTOCOL_IDENTIFIER_LEN {
+        return false;
+    }
+
+    candidate
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == ':')
+}
+
+fn sanitize_character_name(input: &str) -> Option<String> {
+    let candidate = input.trim();
+    if candidate.is_empty() || candidate.len() > MAX_CHARACTER_NAME_LEN {
+        return None;
+    }
+
+    if candidate.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+
+    Some(candidate.to_string())
 }
 
 fn random_player_id() -> String {
@@ -1080,7 +1183,9 @@ impl RoomDurableObject {
             }
         }
 
-        ids.into_iter().collect()
+        let mut sorted: Vec<String> = ids.into_iter().collect();
+        sorted.sort();
+        sorted
     }
 
     fn player_has_other_socket(&self, target_player_id: &str, excluding: &WebSocket) -> bool {
@@ -1567,6 +1672,251 @@ impl RoomDurableObject {
         Ok(true)
     }
 
+    fn handle_inventory_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "move" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
+                let move_payload: InventoryMovePayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
+
+                if move_payload.from_slot == move_payload.to_slot
+                    || move_payload.from_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+                    || move_payload.to_slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+                    || move_payload.amount.is_some_and(|amount| amount == 0)
+                {
+                    return Err(Error::RustError("invalid inventory move payload".into()));
+                }
+
+                Err(Error::RustError(
+                    "inventory commands are not implemented".into(),
+                ))
+            }
+            "split" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
+                let split_payload: InventorySplitPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
+
+                if split_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+                    || split_payload.amount == 0
+                {
+                    return Err(Error::RustError("invalid inventory split payload".into()));
+                }
+
+                Err(Error::RustError(
+                    "inventory commands are not implemented".into(),
+                ))
+            }
+            _ => Err(Error::RustError("invalid inventory action".into())),
+        }
+    }
+
+    fn handle_mining_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "start" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing mining payload".into()))?;
+                let start_payload: MiningStartPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid mining payload".into()))?;
+                if !is_valid_protocol_identifier(start_payload.node_id.as_str()) {
+                    return Err(Error::RustError("invalid mining node id".into()));
+                }
+
+                Err(Error::RustError(
+                    "mining commands are not implemented".into(),
+                ))
+            }
+            "cancel" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing mining payload".into()))?;
+                let cancel_payload: MiningCancelPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid mining payload".into()))?;
+
+                if let Some(node_id) = cancel_payload.node_id.as_deref() {
+                    if !is_valid_protocol_identifier(node_id) {
+                        return Err(Error::RustError("invalid mining node id".into()));
+                    }
+                }
+
+                Err(Error::RustError(
+                    "mining commands are not implemented".into(),
+                ))
+            }
+            _ => Err(Error::RustError("invalid mining action".into())),
+        }
+    }
+
+    fn handle_crafting_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "queue" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing crafting payload".into()))?;
+                let queue_payload: CraftQueuePayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid crafting payload".into()))?;
+
+                if queue_payload.count == 0
+                    || !is_valid_protocol_identifier(queue_payload.recipe.as_str())
+                {
+                    return Err(Error::RustError("invalid crafting queue payload".into()));
+                }
+
+                Err(Error::RustError(
+                    "crafting commands are not implemented".into(),
+                ))
+            }
+            "cancel" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing crafting payload".into()))?;
+                let cancel_payload: CraftCancelPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid crafting payload".into()))?;
+
+                let clear_requested = cancel_payload.clear.unwrap_or(false);
+                if !clear_requested && cancel_payload.recipe.is_none() {
+                    return Err(Error::RustError("invalid crafting cancel payload".into()));
+                }
+
+                if let Some(recipe) = cancel_payload.recipe.as_deref() {
+                    if !is_valid_protocol_identifier(recipe) {
+                        return Err(Error::RustError("invalid crafting recipe id".into()));
+                    }
+                }
+
+                Err(Error::RustError(
+                    "crafting commands are not implemented".into(),
+                ))
+            }
+            _ => Err(Error::RustError("invalid crafting action".into())),
+        }
+    }
+
+    fn handle_combat_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "attack" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing combat payload".into()))?;
+                let attack_payload: CombatAttackPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid combat payload".into()))?;
+
+                if !is_valid_protocol_identifier(attack_payload.target_id.as_str()) {
+                    return Err(Error::RustError("invalid combat target id".into()));
+                }
+
+                if let Some(attack_id) = attack_payload.attack_id.as_deref() {
+                    if !is_valid_protocol_identifier(attack_id) {
+                        return Err(Error::RustError("invalid combat attack id".into()));
+                    }
+                }
+
+                Err(Error::RustError(
+                    "combat commands are not implemented".into(),
+                ))
+            }
+            _ => Err(Error::RustError("invalid combat action".into())),
+        }
+    }
+
+    fn handle_character_command(
+        &self,
+        player_id: &str,
+        action: &str,
+        payload: Option<Value>,
+    ) -> Result<bool> {
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.last_seen = now;
+        }
+
+        match action {
+            "set_profile" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing character payload".into()))?;
+                let profile_payload: CharacterMetadataPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid character payload".into()))?;
+
+                if sanitize_character_name(profile_payload.name.as_str()).is_none() {
+                    return Err(Error::RustError("invalid character name".into()));
+                }
+
+                if let Some(sprite_id) = profile_payload.sprite_id.as_deref() {
+                    if !is_valid_protocol_identifier(sprite_id) {
+                        return Err(Error::RustError("invalid character sprite id".into()));
+                    }
+                }
+
+                Err(Error::RustError(
+                    "character metadata commands are not implemented".into(),
+                ))
+            }
+            _ => Err(Error::RustError("invalid character action".into())),
+        }
+    }
+
     fn run_simulation_until_now(&self) -> Result<()> {
         let now = now_ms() as f64;
         let elapsed = (now - self.last_loop_ms.get()).clamp(0.0, 250.0);
@@ -1801,9 +2151,25 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let character_profiles: Vec<Value> = connected_players
+            .iter()
+            .map(|player_id| {
+                json!({
+                    "playerId": player_id,
+                    "name": player_id,
+                    "spriteId": DEFAULT_CHARACTER_SPRITE_ID,
+                })
+            })
+            .collect();
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
+        let include_inventory = full;
+        let include_mining = full;
+        let include_crafting = full;
+        let include_combat = full;
+        let include_character = full || self.dirty_presence.get();
         let mut features = JsonMap::new();
 
         if include_presence {
@@ -1857,6 +2223,66 @@ impl RoomDurableObject {
             );
         }
 
+        if include_inventory {
+            features.insert(
+                "inventory".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "revision": self.tick.get(),
+                    "players": [],
+                    "playerCount": 0,
+                }),
+            );
+        }
+
+        if include_mining {
+            features.insert(
+                "mining".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "nodes": [],
+                    "nodeCount": 0,
+                    "active": [],
+                    "activeCount": 0,
+                }),
+            );
+        }
+
+        if include_crafting {
+            features.insert(
+                "crafting".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "queues": [],
+                    "queueCount": 0,
+                }),
+            );
+        }
+
+        if include_combat {
+            features.insert(
+                "combat".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "enemies": [],
+                    "enemyCount": 0,
+                    "players": [],
+                    "playerCount": 0,
+                }),
+            );
+        }
+
+        if include_character {
+            features.insert(
+                "character".to_string(),
+                json!({
+                    "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+                    "players": character_profiles,
+                    "playerCount": connected_players.len(),
+                }),
+            );
+        }
+
         Ok(json!({
             "roomCode": self.room_code.borrow().clone(),
             "serverTick": self.tick.get(),
@@ -1901,12 +2327,11 @@ impl RoomDurableObject {
             .map_err(|_| Error::RustError("malformed protocol envelope".into()))?;
 
         if envelope.v != PROTOCOL_VERSION
-            || envelope.kind != "command"
+            || envelope.kind != ClientEnvelopeKind::Command
             || envelope.seq < 1
-            || envelope.feature.is_empty()
             || envelope.action.is_empty()
-            || envelope.feature.len() > 32
             || envelope.action.len() > 32
+            || !is_valid_protocol_identifier(envelope.action.as_str())
             || !envelope.client_time.is_finite()
         {
             return Err(Error::RustError("invalid protocol envelope".into()));
@@ -1921,30 +2346,63 @@ impl RoomDurableObject {
         player_id: &str,
         envelope: &ClientCommandEnvelope,
     ) -> Result<bool> {
-        match (envelope.feature.as_str(), envelope.action.as_str()) {
-            ("core", "ping") => {
-                self.send_envelope(
-                    socket,
-                    "pong",
-                    "core",
-                    "pong",
-                    Some(envelope.seq),
-                    Some(json!({
-                        "clientTime": envelope.client_time,
-                    })),
-                );
-                Ok(false)
-            }
-            ("movement", "input_batch") => {
-                self.handle_movement_input_batch(player_id, envelope.payload.clone())
-            }
-            ("build", action) => {
-                self.handle_build_command(player_id, action, envelope.payload.clone())
-            }
-            ("projectile", "fire") => {
-                self.handle_projectile_fire(player_id, envelope.payload.clone())
-            }
-            _ => Err(Error::RustError("unknown feature/action".into())),
+        match envelope.feature {
+            ProtocolFeature::Core => match envelope.action.as_str() {
+                "ping" => {
+                    self.send_envelope(
+                        socket,
+                        "pong",
+                        "core",
+                        "pong",
+                        Some(envelope.seq),
+                        Some(json!({
+                            "clientTime": envelope.client_time,
+                        })),
+                    );
+                    Ok(false)
+                }
+                _ => Err(Error::RustError("invalid core action".into())),
+            },
+            ProtocolFeature::Movement => match envelope.action.as_str() {
+                "input_batch" => {
+                    self.handle_movement_input_batch(player_id, envelope.payload.clone())
+                }
+                _ => Err(Error::RustError("invalid movement action".into())),
+            },
+            ProtocolFeature::Build => self.handle_build_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
+            ProtocolFeature::Projectile => match envelope.action.as_str() {
+                "fire" => self.handle_projectile_fire(player_id, envelope.payload.clone()),
+                _ => Err(Error::RustError("invalid projectile action".into())),
+            },
+            ProtocolFeature::Inventory => self.handle_inventory_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
+            ProtocolFeature::Mining => self.handle_mining_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
+            ProtocolFeature::Crafting => self.handle_crafting_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
+            ProtocolFeature::Combat => self.handle_combat_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
+            ProtocolFeature::Character => self.handle_character_command(
+                player_id,
+                envelope.action.as_str(),
+                envelope.payload.clone(),
+            ),
         }
     }
 

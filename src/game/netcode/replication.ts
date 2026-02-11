@@ -139,6 +139,11 @@ export class ReplicationPipeline {
             build: snapshot.features.build ?? previous.features.build,
             projectile: snapshot.features.projectile ?? previous.features.projectile,
             terrain: snapshot.features.terrain ?? previous.features.terrain,
+            inventory: snapshot.features.inventory ?? previous.features.inventory,
+            mining: snapshot.features.mining ?? previous.features.mining,
+            crafting: snapshot.features.crafting ?? previous.features.crafting,
+            combat: snapshot.features.combat ?? previous.features.combat,
+            character: snapshot.features.character ?? previous.features.character,
           },
         }
       : snapshot;

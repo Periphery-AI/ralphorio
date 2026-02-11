@@ -51,7 +51,7 @@
         "Unknown/invalid payloads fail safely",
         "Snapshots include only required deltas or compact state"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-003",
