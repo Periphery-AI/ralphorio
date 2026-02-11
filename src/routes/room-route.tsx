@@ -1,5 +1,5 @@
 import { Link, useParams } from '@tanstack/react-router';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAuth, useUser } from '@clerk/clerk-react';
 import {
   bootGame,
@@ -11,7 +11,13 @@ import {
 } from '../game/bridge';
 import { RoomSocket } from '../game/network-client';
 import { ReplicationPipeline } from '../game/netcode/replication';
-import type { PlayerState, RoomSnapshot } from '../game/types';
+import type {
+  ActiveCraftState,
+  CraftQueueEntry,
+  InventoryStack,
+  PlayerState,
+  RoomSnapshot,
+} from '../game/types';
 
 const CANVAS_ID = 'bevy-game-canvas';
 const DEFAULT_INTERP_DELAY_MS = 110;
@@ -159,6 +165,58 @@ function MetricPill({ label, value }: { label: string; value: string | number })
   );
 }
 
+type InventoryPanelState = {
+  maxSlots: number;
+  stacks: InventoryStack[];
+};
+
+type CraftingPanelState = {
+  active: ActiveCraftState | null;
+  pending: CraftQueueEntry[];
+};
+
+type BuildPanelState = {
+  kind: string;
+  x: number;
+  y: number;
+};
+
+const EMPTY_INVENTORY_PANEL: InventoryPanelState = {
+  maxSlots: 0,
+  stacks: [],
+};
+
+const EMPTY_CRAFTING_PANEL: CraftingPanelState = {
+  active: null,
+  pending: [],
+};
+
+function titleCaseToken(token: string) {
+  return token
+    .split(/[_-]+/)
+    .filter((segment) => segment.length > 0)
+    .map((segment) => segment[0].toUpperCase() + segment.slice(1))
+    .join(' ');
+}
+
+function OverlayPanel({
+  eyebrow,
+  title,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="glass-panel pointer-events-auto min-w-[14.75rem] flex-1 rounded-xl border border-[#2e4f80]/80 bg-[#071120]/90 p-3 md:min-w-0">
+      <p className="text-[10px] uppercase tracking-[0.16em] text-[#89a8df]">{eyebrow}</p>
+      <p className="mt-1 font-display text-sm text-[#f2f7ff]">{title}</p>
+      <div className="mt-2">{children}</div>
+    </section>
+  );
+}
+
 export function RoomRoute() {
   const { roomCode } = useParams({ from: '/room/$roomCode' });
   const { isLoaded, isSignedIn, user } = useUser();
@@ -193,6 +251,10 @@ export function RoomRoute() {
   const [devLog, setDevLog] = useState<string[]>([]);
   const [combatFeed, setCombatFeed] = useState<string[]>([]);
   const [interpDelayMs, setInterpDelayMs] = useState(DEFAULT_INTERP_DELAY_MS);
+  const [inventoryPanel, setInventoryPanel] = useState<InventoryPanelState>(EMPTY_INVENTORY_PANEL);
+  const [craftingPanel, setCraftingPanel] = useState<CraftingPanelState>(EMPTY_CRAFTING_PANEL);
+  const [selectedBuildPanel, setSelectedBuildPanel] = useState<BuildPanelState | null>(null);
+  const [buildPreviewCount, setBuildPreviewCount] = useState(0);
 
   const socketRef = useRef<RoomSocket | null>(null);
   const replicationRef = useRef(new ReplicationPipeline());
@@ -234,6 +296,10 @@ export function RoomRoute() {
     authoritativePlayerIdRef.current = clientPlayerId;
     replicationRef.current = new ReplicationPipeline(interpDelayRef.current);
     setCombatFeed([]);
+    setInventoryPanel(EMPTY_INVENTORY_PANEL);
+    setCraftingPanel(EMPTY_CRAFTING_PANEL);
+    setSelectedBuildPanel(null);
+    setBuildPreviewCount(0);
 
     let inputPump: number | null = null;
     let renderPump: number | null = null;
@@ -293,6 +359,7 @@ export function RoomRoute() {
             const inventory = snapshot.features.inventory;
             const mining = snapshot.features.mining;
             const drops = snapshot.features.drops;
+            const crafting = snapshot.features.crafting;
 
             if (movement) {
               localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
@@ -300,6 +367,20 @@ export function RoomRoute() {
 
             if (build) {
               setStructureCount(build.structureCount);
+              setBuildPreviewCount(build.previewCount);
+
+              const localBuildPreview =
+                build.previews.find((preview) => preview.playerId === authoritativePlayerIdRef.current) ??
+                null;
+              setSelectedBuildPanel(
+                localBuildPreview
+                  ? {
+                      kind: localBuildPreview.kind,
+                      x: Math.round(localBuildPreview.x),
+                      y: Math.round(localBuildPreview.y),
+                    }
+                  : null,
+              );
             }
 
             if (projectile) {
@@ -315,11 +396,16 @@ export function RoomRoute() {
               if (!localInventory) {
                 setInventoryStackCount(0);
                 setInventoryItemCount(0);
+                setInventoryPanel(EMPTY_INVENTORY_PANEL);
               } else {
                 setInventoryStackCount(localInventory.stacks.length);
                 setInventoryItemCount(
                   localInventory.stacks.reduce((total, stack) => total + stack.amount, 0),
                 );
+                setInventoryPanel({
+                  maxSlots: localInventory.maxSlots,
+                  stacks: localInventory.stacks.map((stack) => ({ ...stack })),
+                });
               }
             }
 
@@ -330,6 +416,21 @@ export function RoomRoute() {
 
             if (drops) {
               setDropCount(drops.dropCount);
+            }
+
+            if (crafting) {
+              const localCraftQueue =
+                crafting.queues.find((queue) => queue.playerId === authoritativePlayerIdRef.current) ??
+                null;
+
+              if (!localCraftQueue) {
+                setCraftingPanel(EMPTY_CRAFTING_PANEL);
+              } else {
+                setCraftingPanel({
+                  active: localCraftQueue.active ? { ...localCraftQueue.active } : null,
+                  pending: localCraftQueue.pending.map((entry) => ({ ...entry })),
+                });
+              }
             }
           },
           onAck: (seq) => {
@@ -473,6 +574,15 @@ export function RoomRoute() {
     pushDevLog('unknown command');
   };
 
+  const sortedInventoryStacks = useMemo(() => {
+    return [...inventoryPanel.stacks].sort((left, right) => left.slot - right.slot);
+  }, [inventoryPanel.stacks]);
+
+  const inventorySlotsLabel =
+    inventoryPanel.maxSlots > 0
+      ? `${inventoryPanel.stacks.length}/${inventoryPanel.maxSlots}`
+      : `${inventoryPanel.stacks.length}`;
+
   if (!isLoaded) {
     return (
       <section className="grid h-full place-items-center bg-[#04070c] text-[#eaf1ff]">
@@ -514,7 +624,7 @@ export function RoomRoute() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2 text-xs sm:gap-3">
+        <div className="flex min-w-0 items-center gap-2 overflow-x-auto py-1 text-xs sm:gap-3">
           <span className="hud-pill">Q = Build</span>
           <span className="hud-pill">Hold Click = Mine</span>
           <span className="hud-pill">Click = Place (Build Mode)</span>
@@ -553,6 +663,104 @@ export function RoomRoute() {
                 {combatFeed.map((line, index) => (
                   <p key={`${line}-${index}`}>{line}</p>
                 ))}
+              </div>
+            </div>
+          ) : null}
+          {!showDevConsole ? (
+            <div className="pointer-events-none absolute inset-x-3 bottom-3 z-20">
+              <div className="flex gap-2 overflow-x-auto pb-1 md:grid md:grid-cols-3 md:overflow-visible md:pb-0">
+                <OverlayPanel
+                  eyebrow="Authoritative"
+                  title={`Inventory ${inventoryItemCount} items`}
+                >
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Stacks</p>
+                      <p className="text-sm font-semibold text-[#dce9ff]">{inventorySlotsLabel}</p>
+                    </div>
+                    <div className="rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Total</p>
+                      <p className="text-sm font-semibold text-[#dce9ff]">{inventoryItemCount}</p>
+                    </div>
+                  </div>
+                  <div className="mt-2 max-h-32 overflow-y-auto rounded-md border border-[#273f69] bg-[#081326]/86 p-2 text-xs text-[#d4e3ff]">
+                    {sortedInventoryStacks.length === 0 ? (
+                      <p className="text-[#8ea8d6]">No resources in inventory.</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {sortedInventoryStacks.map((stack) => (
+                          <div
+                            key={`${stack.slot}-${stack.resource}`}
+                            className="flex items-center justify-between rounded border border-[#2a3f66] bg-[#0b162a]/84 px-2 py-1"
+                          >
+                            <span>
+                              {stack.slot + 1}. {titleCaseToken(stack.resource)}
+                            </span>
+                            <span className="font-mono text-[#9ce7cf]">{stack.amount}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </OverlayPanel>
+
+                <OverlayPanel eyebrow="Authoritative" title="Crafting Queue">
+                  <div className="rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5 text-xs">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Active Craft</p>
+                    {craftingPanel.active ? (
+                      <p className="mt-1 text-[#dce9ff]">
+                        {titleCaseToken(craftingPanel.active.recipe)}{' '}
+                        <span className="font-mono text-[#9ce7cf]">
+                          ({craftingPanel.active.remainingTicks} ticks)
+                        </span>
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-[#8ea8d6]">Idle</p>
+                    )}
+                  </div>
+                  <div className="mt-2 max-h-32 overflow-y-auto rounded-md border border-[#273f69] bg-[#081326]/86 p-2 text-xs text-[#d4e3ff]">
+                    {craftingPanel.pending.length === 0 ? (
+                      <p className="text-[#8ea8d6]">No queued crafts.</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {craftingPanel.pending.map((entry, index) => (
+                          <div
+                            key={`${entry.recipe}-${index}`}
+                            className="flex items-center justify-between rounded border border-[#2a3f66] bg-[#0b162a]/84 px-2 py-1"
+                          >
+                            <span>{titleCaseToken(entry.recipe)}</span>
+                            <span className="font-mono text-[#9ce7cf]">x{entry.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </OverlayPanel>
+
+                <OverlayPanel eyebrow="Authoritative" title="Selected Build">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Placed</p>
+                      <p className="text-sm font-semibold text-[#dce9ff]">{structureCount}</p>
+                    </div>
+                    <div className="rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Previews</p>
+                      <p className="text-sm font-semibold text-[#dce9ff]">{buildPreviewCount}</p>
+                    </div>
+                  </div>
+                  <div className="mt-2 rounded-md border border-[#273f69] bg-[#081326]/86 px-2 py-2 text-xs">
+                    {selectedBuildPanel ? (
+                      <>
+                        <p className="text-[#dce9ff]">{titleCaseToken(selectedBuildPanel.kind)}</p>
+                        <p className="mt-1 font-mono text-[#9ce7cf]">
+                          x={selectedBuildPanel.x} y={selectedBuildPanel.y}
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-[#8ea8d6]">No active build preview. Press Q to enter build mode.</p>
+                    )}
+                  </div>
+                </OverlayPanel>
               </div>
             </div>
           ) : null}

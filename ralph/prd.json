@@ -183,7 +183,7 @@
         "UI state maps cleanly to authoritative game state",
         "No overlap/regression with existing top HUD"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-015",

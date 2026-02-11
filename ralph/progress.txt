@@ -145,3 +145,11 @@ Format per entry:
 - files: worker/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (19 passed); npm run build:web
 - commit: ae1155d
+
+- timestamp: 2026-02-11
+- item: RL-014
+- summary: Implemented initial in-room HUD panels for inventory, crafting, and selected build state using authoritative snapshot data and responsive mobile/desktop layout.
+- decisions: Derive panel state strictly from server snapshots (`features.inventory`, `features.crafting`, `features.build.previews`) keyed by authoritative player id; mount the panel tray inside the canvas viewport and hide it while the dev console is open to avoid HUD overlap regressions.
+- files: src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: npm run build:web (pass); npx eslint src/routes/room-route.tsx (fails on pre-existing `react-hooks/set-state-in-effect` for synchronous `setCombatFeed` in effect)
+- commit: pending
