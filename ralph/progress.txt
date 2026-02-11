@@ -119,4 +119,12 @@ Entry format:
 - decisions: Kept the existing worker authority model and snapshot protocol unchanged; implemented reconnect behavior entirely inside `RoomSocket` so room orchestration and Bevy command pumps remain intact instead of rewriting route/session systems.
 - files: src/game/network-client.ts, ralph/progress.txt
 - validation: npm run lint (pass); npm run build:web (pass); jq '.items[] | select(.id=="RLP2-108") | {id,passes,steps}' ralph/prd.json (pass, remains false pending full acceptance)
+- commit: 36b57c8
+
+- timestamp: 2026-02-11
+- item: RLP2-108
+- summary: Closed the remaining room-lifecycle acceptance gaps by refreshing Clerk auth tokens on every websocket connect/reconnect attempt and adding direct deep-link sign-in controls in the room route, so shared `/room/$roomCode` links can authenticate in-place and recover into active play without hard-refresh/lobby detours.
+- decisions: Built directly on the existing resume-token + exponential reconnect implementation and kept worker authority/protocol contracts unchanged; lifecycle hardening was isolated to `src` transport/orchestration code (`RoomSocket` + room unauthenticated entry UX) instead of rewriting routing or server systems.
+- files: src/game/network-client.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: npm run lint (pass); npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending

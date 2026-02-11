@@ -1,6 +1,6 @@
 import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useAuth, useUser } from '@clerk/clerk-react';
+import { SignInButton, SignUpButton, useAuth, useUser } from '@clerk/clerk-react';
 import {
   bootGame,
   drainFeatureCommands,
@@ -429,7 +429,6 @@ export function RoomRoute() {
       await bootGame(CANVAS_ID);
       await resetSessionState();
       await setPlayerId(clientPlayerId);
-      const clerkToken = await getToken();
       const storedResumeToken = window.localStorage.getItem(
         resumeTokenStorageKey(roomCode, clientPlayerId),
       );
@@ -605,7 +604,7 @@ export function RoomRoute() {
             setLatencyMs(Math.round(latency));
           },
         },
-        clerkToken ?? null,
+        async () => (await getToken()) ?? null,
         storedResumeToken,
       );
 
@@ -775,9 +774,20 @@ export function RoomRoute() {
         <div className="glass-panel max-w-lg rounded-3xl p-8">
           <p className="hud-pill w-fit">Authentication Required</p>
           <h1 className="mt-4 font-display text-3xl text-white">Sign in before joining rooms</h1>
+          <p className="mt-3 text-sm text-[#afc3e6]">
+            Deep link detected for room <span className="font-mono text-white">{roomCode}</span>.
+          </p>
+          <div className="mt-6 flex flex-col gap-3 sm:flex-row">
+            <SignInButton mode="modal">
+              <button className="btn-neon">Sign In</button>
+            </SignInButton>
+            <SignUpButton mode="modal">
+              <button className="btn-ghost">Create Account</button>
+            </SignUpButton>
+          </div>
           <Link
             to="/"
-            className="mt-7 inline-flex h-11 items-center justify-center rounded-xl border border-[#39507a] px-5 font-semibold text-[#d5e3ff] transition hover:border-[#8eb1ff] hover:text-white"
+            className="mt-5 inline-flex h-11 items-center justify-center rounded-xl border border-[#39507a] px-5 font-semibold text-[#d5e3ff] transition hover:border-[#8eb1ff] hover:text-white"
           >
             Back To Lobby
           </Link>

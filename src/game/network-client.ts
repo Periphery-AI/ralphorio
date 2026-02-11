@@ -17,6 +17,8 @@ type Handlers = {
   onPong?: (latencyMs: number) => void;
 };
 
+type AuthTokenProvider = () => Promise<string | null>;
+
 type SnapshotFeatures = RoomSnapshot['features'];
 type PresenceSnapshot = NonNullable<SnapshotFeatures['presence']>;
 type MovementSnapshot = NonNullable<SnapshotFeatures['movement']>;
@@ -996,7 +998,7 @@ export class RoomSocket {
   private readonly roomCode: string;
   private readonly playerId: string;
   private readonly handlers: Handlers;
-  private readonly authToken: string | null;
+  private readonly authTokenProvider: AuthTokenProvider | null;
   private resumeToken: string | null;
   private seq = 1;
   private pingTimer: number | null = null;
@@ -1004,6 +1006,7 @@ export class RoomSocket {
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private disconnectRequested = false;
+  private socketOpenAttemptId = 0;
 
   private static readonly RECONNECT_BASE_DELAY_MS = 300;
   private static readonly RECONNECT_MAX_DELAY_MS = 5_000;
@@ -1012,13 +1015,13 @@ export class RoomSocket {
     roomCode: string,
     playerId: string,
     handlers: Handlers,
-    authToken: string | null = null,
+    authTokenProvider: AuthTokenProvider | null = null,
     resumeToken: string | null = null,
   ) {
     this.roomCode = roomCode;
     this.playerId = playerId;
     this.handlers = handlers;
-    this.authToken = authToken;
+    this.authTokenProvider = authTokenProvider;
     this.resumeToken = resumeToken;
   }
 
@@ -1026,14 +1029,38 @@ export class RoomSocket {
     this.disconnectRequested = false;
     this.reconnectAttempt = 0;
     this.clearReconnectTimer();
-    this.openSocket();
+    await this.openSocket();
   }
 
-  private openSocket() {
+  private async resolveAuthToken() {
+    if (!this.authTokenProvider) {
+      return null;
+    }
+
+    try {
+      return await this.authTokenProvider();
+    } catch (error) {
+      console.error('Failed to refresh auth token for room websocket.', error);
+      return null;
+    }
+  }
+
+  private async openSocket() {
+    const openAttemptId = ++this.socketOpenAttemptId;
+    if (this.disconnectRequested) {
+      return;
+    }
+
+    this.handlers.onStatus(this.reconnectAttempt > 0 ? 'Reconnecting...' : 'Connecting...');
+
+    const authToken = await this.resolveAuthToken();
+    if (this.disconnectRequested || openAttemptId !== this.socketOpenAttemptId) {
+      return;
+    }
+
     const baseUrl = buildWebSocketUrl(this.roomCode, this.playerId);
     const withResume = appendResumeToken(baseUrl, this.resumeToken);
-    const url = appendAuthToken(withResume, this.authToken);
-    this.handlers.onStatus(this.reconnectAttempt > 0 ? 'Reconnecting...' : 'Connecting...');
+    const url = appendAuthToken(withResume, authToken);
 
     const socket = new WebSocket(url);
     this.socket = socket;
@@ -1228,7 +1255,7 @@ export class RoomSocket {
       if (this.disconnectRequested) {
         return;
       }
-      this.openSocket();
+      void this.openSocket();
     }, delayMs);
   }
 
@@ -1259,6 +1286,7 @@ export class RoomSocket {
 
   disconnect() {
     this.disconnectRequested = true;
+    this.socketOpenAttemptId += 1;
     this.clearReconnectTimer();
     this.stopPingLoop();
     if (this.socket) {

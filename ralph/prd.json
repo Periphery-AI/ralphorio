@@ -113,7 +113,7 @@
         "Room switching/rejoin works without hard refresh",
         "Input/combat/build controls remain functional after reconnect"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-109",
