@@ -113,3 +113,11 @@ Format per entry:
 - files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (10 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
 - commit: feat(drops): add authoritative world drop persistence and pickup flow
+
+- timestamp: 2026-02-11
+- item: RL-011
+- summary: Hardened drop replication against desync by switching to per-recipient drop visibility snapshots and always emitting the `drops` feature in delta snapshots so out-of-range drops are actively cleared client-side.
+- decisions: Keep drop visibility server-authoritative per socket attachment instead of global connected-player unions; always include `features.drops` to avoid stale merged client state after movement/reconnect; keep RL-011 `passes` false because combat-driven drop emission still depends on RL-012/RL-013.
+- files: worker/src/lib.rs, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (13 passed); npm run build:web
+- commit: pending

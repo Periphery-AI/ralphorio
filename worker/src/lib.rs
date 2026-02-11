@@ -1055,6 +1055,16 @@ fn player_within_drop_pickup_range(player_x: f32, player_y: f32, drop: &RuntimeD
     dx * dx + dy * dy <= DROP_PICKUP_RANGE * DROP_PICKUP_RANGE
 }
 
+fn player_within_drop_visibility_range(
+    player: &RuntimePlayerState,
+    drop: &RuntimeDropState,
+) -> bool {
+    (terrain_grid_axis(player.x) - terrain_grid_axis(drop.x)).abs()
+        <= MINING_NODE_SCAN_RADIUS_TILES + 4
+        && (terrain_grid_axis(player.y) - terrain_grid_axis(drop.y)).abs()
+            <= MINING_NODE_SCAN_RADIUS_TILES + 4
+}
+
 fn drop_pickup_allowed_for_player(drop: &RuntimeDropState, player_id: &str, now: i64) -> bool {
     match drop.owner_player_id.as_deref() {
         None => true,
@@ -2928,18 +2938,6 @@ impl RoomDurableObject {
         );
     }
 
-    fn broadcast_envelope(
-        &self,
-        kind: &'static str,
-        feature: &'static str,
-        action: &'static str,
-        payload: Option<Value>,
-    ) {
-        for socket in self.state.get_websockets() {
-            self.send_envelope(&socket, kind, feature, action, None, payload.clone());
-        }
-    }
-
     fn on_connect_player(&self, player_id: &str) -> Result<()> {
         let now = now_ms();
         let sql = self.sql();
@@ -4300,7 +4298,7 @@ impl RoomDurableObject {
         Ok(result)
     }
 
-    fn snapshot_payload(&self, full: bool) -> Result<Value> {
+    fn snapshot_payload(&self, full: bool, recipient_player_id: Option<&str>) -> Result<Value> {
         let connected_players = self.connected_player_ids();
         let connected_set: HashSet<&str> = connected_players.iter().map(String::as_str).collect();
         let online = connected_players.clone();
@@ -4501,19 +4499,25 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let observer_player = recipient_player_id
+            .and_then(|player_id| runtime.players.get(player_id))
+            .filter(|player| player.connected);
+
         let mut visible_drop_rows: Vec<&RuntimeDropState> = runtime
             .drops
             .values()
             .filter(|drop| drop.expires_at > now)
             .filter(|drop| {
-                connected_players.iter().any(|player_id| {
-                    runtime.players.get(player_id).is_some_and(|player| {
-                        (terrain_grid_axis(player.x) - terrain_grid_axis(drop.x)).abs()
-                            <= MINING_NODE_SCAN_RADIUS_TILES + 4
-                            && (terrain_grid_axis(player.y) - terrain_grid_axis(drop.y)).abs()
-                                <= MINING_NODE_SCAN_RADIUS_TILES + 4
+                if let Some(player) = observer_player {
+                    player_within_drop_visibility_range(player, drop)
+                } else {
+                    connected_players.iter().any(|player_id| {
+                        runtime
+                            .players
+                            .get(player_id)
+                            .is_some_and(|player| player_within_drop_visibility_range(player, drop))
                     })
-                })
+                }
             })
             .collect();
         visible_drop_rows.sort_by_key(|drop| std::cmp::Reverse(drop.updated_at));
@@ -4590,8 +4594,9 @@ impl RoomDurableObject {
         let include_inventory = full || self.dirty_inventory.get();
         let include_mining =
             full || self.dirty_mining.get() || mining_discovered || !mining_active.is_empty();
-        let include_drops =
-            full || self.dirty_drops.get() || drops_pruned || !visible_drop_rows.is_empty();
+        // Always emit drops so delta snapshots can clear stale client-side drop state as players
+        // move across visibility boundaries.
+        let include_drops = true;
         let include_crafting = full || self.dirty_crafting.get();
         let include_combat = full;
         let include_character = full || self.dirty_presence.get();
@@ -4731,14 +4736,17 @@ impl RoomDurableObject {
     }
 
     fn send_snapshot_to(&self, socket: &WebSocket, full: bool) {
-        if let Ok(payload) = self.snapshot_payload(full) {
+        let recipient_player_id = self
+            .read_socket_attachment(socket)
+            .map(|attachment| attachment.player_id);
+        if let Ok(payload) = self.snapshot_payload(full, recipient_player_id.as_deref()) {
             self.send_envelope(socket, "snapshot", "core", "state", None, Some(payload));
         }
     }
 
     fn broadcast_snapshot(&self, full: bool) {
-        if let Ok(payload) = self.snapshot_payload(full) {
-            self.broadcast_envelope("snapshot", "core", "state", Some(payload));
+        for socket in self.state.get_websockets() {
+            self.send_snapshot_to(&socket, full);
         }
     }
 
@@ -5217,6 +5225,103 @@ mod tests {
         assert_eq!(mining_progress_ratio(&progress, 0), 0.0);
         assert!((mining_progress_ratio(&progress, 1_500) - 0.5).abs() < f32::EPSILON);
         assert_eq!(mining_progress_ratio(&progress, 3_000), 1.0);
+    }
+
+    #[test]
+    fn drop_pickup_owner_grace_is_enforced() {
+        let drop = RuntimeDropState {
+            drop_id: "drop:test".to_string(),
+            resource: "iron_ore".to_string(),
+            amount: 3,
+            x: 0.0,
+            y: 0.0,
+            owner_player_id: Some("owner".to_string()),
+            owner_expires_at: 10_000,
+            expires_at: 30_000,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(drop_pickup_allowed_for_player(&drop, "owner", 2_000));
+        assert!(!drop_pickup_allowed_for_player(&drop, "other", 9_999));
+        assert!(drop_pickup_allowed_for_player(&drop, "other", 10_000));
+    }
+
+    #[test]
+    fn drop_pickup_range_uses_distance_check() {
+        let drop = RuntimeDropState {
+            drop_id: "drop:test".to_string(),
+            resource: "iron_ore".to_string(),
+            amount: 1,
+            x: 0.0,
+            y: 0.0,
+            owner_player_id: None,
+            owner_expires_at: 0,
+            expires_at: 30_000,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(player_within_drop_pickup_range(
+            DROP_PICKUP_RANGE,
+            0.0,
+            &drop
+        ));
+        assert!(!player_within_drop_pickup_range(
+            DROP_PICKUP_RANGE + 0.05,
+            0.0,
+            &drop
+        ));
+    }
+
+    #[test]
+    fn drop_visibility_range_tracks_terrain_grid_radius() {
+        let player = RuntimePlayerState {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            input: InputState {
+                up: false,
+                down: false,
+                left: false,
+                right: false,
+            },
+            last_input_seq: 0,
+            connected: true,
+            last_seen: 0,
+            last_preview_cmd_at: 0,
+            last_place_cmd_at: 0,
+            last_projectile_fire_at: 0,
+        };
+
+        let visible_drop = RuntimeDropState {
+            drop_id: "drop:visible".to_string(),
+            resource: "iron_ore".to_string(),
+            amount: 1,
+            x: ((MINING_NODE_SCAN_RADIUS_TILES + 4) * TERRAIN_TILE_SIZE as i32) as f32,
+            y: 0.0,
+            owner_player_id: None,
+            owner_expires_at: 0,
+            expires_at: 30_000,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(player_within_drop_visibility_range(&player, &visible_drop));
+
+        let hidden_drop = RuntimeDropState {
+            drop_id: "drop:hidden".to_string(),
+            resource: "iron_ore".to_string(),
+            amount: 1,
+            x: ((MINING_NODE_SCAN_RADIUS_TILES + 5) * TERRAIN_TILE_SIZE as i32) as f32,
+            y: 0.0,
+            owner_player_id: None,
+            owner_expires_at: 0,
+            expires_at: 30_000,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!player_within_drop_visibility_range(&player, &hidden_drop));
     }
 
     #[test]
