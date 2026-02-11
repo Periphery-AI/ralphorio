@@ -121,3 +121,11 @@ Format per entry:
 - files: worker/src/lib.rs, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (13 passed); npm run build:web
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-012
+- summary: Completed server-authoritative enemy combat foundation with deterministic enemy materialization/AI, authoritative health and damage resolution, projectile hit handling, and enemy-death drop/event fanout.
+- decisions: Keep enemy state authoritative in the worker runtime (non-persistent for now) and deterministically materialize from terrain seed + grid hash near connected players; use tick-based enemy attack cooldowns for deterministic simulation cadence; emit `combat` feature deltas plus `combat` events (`enemy_damaged`, `enemy_defeated`, `player_damaged`, `player_defeated`) and spawn authoritative world drops on enemy death.
+- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (15 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: pending

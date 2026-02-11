@@ -8,9 +8,9 @@ use sim_core::domain::{
 };
 use sim_core::{
     deterministic_seed_from_room_code, movement_step_with_obstacles, projectile_step,
-    sample_terrain, InputState as CoreInputState, StructureObstacle, TerrainResourceKind,
-    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT, TERRAIN_GENERATOR_VERSION,
-    TERRAIN_TILE_SIZE,
+    sample_terrain, InputState as CoreInputState, StructureObstacle, TerrainBaseKind,
+    TerrainResourceKind, PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+    TERRAIN_GENERATOR_VERSION, TERRAIN_TILE_SIZE,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +51,27 @@ const MINING_NODE_SCAN_RADIUS_TILES: i32 = 14;
 const MAX_MINING_NODES: usize = 4096;
 const MAX_MINING_NODES_PER_SNAPSHOT: usize = 384;
 const MAX_MINING_ACTIVE_PER_SNAPSHOT: usize = 256;
+const ENEMY_SCAN_RADIUS_TILES: i32 = 18;
+const ENEMY_DESPAWN_RADIUS_TILES: i32 = ENEMY_SCAN_RADIUS_TILES + 8;
+const ENEMY_MIN_PLAYER_DISTANCE: f32 = 112.0;
+const ENEMY_AGGRO_RANGE: f32 = 320.0;
+const ENEMY_ATTACK_RANGE: f32 = 42.0;
+const ENEMY_PROJECTILE_HIT_RADIUS: f32 = 20.0;
+const ENEMY_MOVE_SPEED: f32 = 86.0;
+const ENEMY_ATTACK_COOLDOWN_TICKS: u64 = 24;
+const ENEMY_SPAWN_MODULUS: u64 = 997;
+const ENEMY_SPAWN_THRESHOLD: u64 = 11;
+const ENEMY_SPAWN_SALT: u64 = 0x6d13_ef42_2dd9_1f7a;
+const ENEMY_KIND_BITER: &str = "biter";
+const ENEMY_MAX_HEALTH: u16 = 64;
+const ENEMY_ATTACK_POWER: u16 = 7;
+const ENEMY_ARMOR: u16 = 1;
+const PLAYER_COMBAT_MAX_HEALTH: u16 = 100;
+const PLAYER_COMBAT_ATTACK_POWER: u16 = 18;
+const PLAYER_COMBAT_ARMOR: u16 = 1;
+const PROJECTILE_BASE_DAMAGE: u16 = 12;
+const MAX_ENEMIES: usize = 1024;
+const MAX_ENEMIES_PER_SNAPSHOT: usize = 320;
 const DROP_TTL_MS: i64 = 30_000;
 const DROP_OWNER_GRACE_MS: i64 = 4_000;
 const DROP_PICKUP_RANGE: f32 = 84.0;
@@ -494,6 +515,42 @@ struct RuntimeDropState {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeEnemyState {
+    enemy_id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    health: u16,
+    max_health: u16,
+    attack_power: u16,
+    armor: u16,
+    target_player_id: Option<String>,
+    last_attack_tick: u64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePlayerCombatState {
+    health: u16,
+    max_health: u16,
+    attack_power: u16,
+    armor: u16,
+}
+
+impl Default for RuntimePlayerCombatState {
+    fn default() -> Self {
+        Self {
+            health: PLAYER_COMBAT_MAX_HEALTH,
+            max_health: PLAYER_COMBAT_MAX_HEALTH,
+            attack_power: PLAYER_COMBAT_ATTACK_POWER,
+            armor: PLAYER_COMBAT_ARMOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeCraftQueueEntry {
     recipe: String,
     count: u16,
@@ -515,6 +572,13 @@ struct RuntimeCraftQueueState {
 struct CraftingTickResult {
     changed: bool,
     inventory_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CombatTickResult {
+    changed: bool,
+    projectiles_changed: bool,
+    drops_changed: bool,
 }
 
 impl RuntimeInventoryState {
@@ -921,6 +985,8 @@ struct RoomRuntimeState {
     mining_nodes: HashMap<String, RuntimeMiningNodeState>,
     mining_active: HashMap<String, RuntimeMiningProgressState>,
     drops: HashMap<String, RuntimeDropState>,
+    enemies: HashMap<String, RuntimeEnemyState>,
+    combat_players: HashMap<String, RuntimePlayerCombatState>,
     craft_queues: HashMap<String, RuntimeCraftQueueState>,
 }
 
@@ -1026,6 +1092,48 @@ fn mining_node_id_for_grid(grid_x: i32, grid_y: i32) -> String {
     format!("node:{grid_x}:{grid_y}")
 }
 
+fn enemy_id_for_grid(grid_x: i32, grid_y: i32) -> String {
+    format!("enemy:{grid_x}:{grid_y}")
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn hash_grid(seed: u64, grid_x: i32, grid_y: i32) -> u64 {
+    let x_bits = grid_x as i64 as u64;
+    let y_bits = grid_y as i64 as u64;
+    splitmix64(
+        seed ^ x_bits.wrapping_mul(0x517c_c1b7_2722_0a95)
+            ^ y_bits.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+    )
+}
+
+fn sample_enemy_spawn(seed: u64, grid_x: i32, grid_y: i32) -> Option<(String, u16, u16, u16)> {
+    let terrain = sample_terrain(seed, grid_x, grid_y);
+    if matches!(
+        terrain.base,
+        TerrainBaseKind::DeepWater | TerrainBaseKind::ShallowWater
+    ) {
+        return None;
+    }
+
+    let spawn_roll = hash_grid(seed ^ ENEMY_SPAWN_SALT, grid_x, grid_y) % ENEMY_SPAWN_MODULUS;
+    if spawn_roll > ENEMY_SPAWN_THRESHOLD {
+        return None;
+    }
+
+    Some((
+        ENEMY_KIND_BITER.to_string(),
+        ENEMY_MAX_HEALTH,
+        ENEMY_ATTACK_POWER,
+        ENEMY_ARMOR,
+    ))
+}
+
 fn terrain_grid_axis(world_axis: f32) -> i32 {
     (world_axis / TERRAIN_TILE_SIZE as f32).floor() as i32
 }
@@ -1053,6 +1161,32 @@ fn player_within_drop_pickup_range(player_x: f32, player_y: f32, drop: &RuntimeD
     let dx = player_x - drop.x;
     let dy = player_y - drop.y;
     dx * dx + dy * dy <= DROP_PICKUP_RANGE * DROP_PICKUP_RANGE
+}
+
+fn enemy_within_despawn_range(player: &RuntimePlayerState, enemy: &RuntimeEnemyState) -> bool {
+    (terrain_grid_axis(player.x) - terrain_grid_axis(enemy.x)).abs() <= ENEMY_DESPAWN_RADIUS_TILES
+        && (terrain_grid_axis(player.y) - terrain_grid_axis(enemy.y)).abs()
+            <= ENEMY_DESPAWN_RADIUS_TILES
+}
+
+fn enemy_within_aggro_range(player: &RuntimePlayerState, enemy: &RuntimeEnemyState) -> bool {
+    let dx = player.x - enemy.x;
+    let dy = player.y - enemy.y;
+    dx * dx + dy * dy <= ENEMY_AGGRO_RANGE * ENEMY_AGGRO_RANGE
+}
+
+fn resolve_damage(current_health: u16, armor: u16, incoming: u16) -> (u16, u16, bool) {
+    let mitigated = incoming.saturating_sub(armor).max(1);
+    let applied = mitigated.min(current_health);
+    let remaining = current_health.saturating_sub(applied);
+    (applied, remaining, remaining == 0)
+}
+
+fn enemy_drop_for_kind(kind: &str) -> (&'static str, u32) {
+    match kind {
+        ENEMY_KIND_BITER => ("gear", 1),
+        _ => ("iron_ore", 1),
+    }
 }
 
 fn player_within_drop_visibility_range(
@@ -1366,6 +1500,7 @@ pub struct RoomDurableObject {
     dirty_mining: Cell<bool>,
     dirty_drops: Cell<bool>,
     dirty_crafting: Cell<bool>,
+    dirty_combat: Cell<bool>,
     terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
 }
@@ -1476,6 +1611,9 @@ impl RoomDurableObject {
         runtime.mining_nodes.clear();
         runtime.mining_active.clear();
         runtime.drops.clear();
+        runtime.enemies.clear();
+        runtime.combat_players.clear();
+        runtime.craft_queues.clear();
 
         for row in player_rows {
             runtime.players.insert(
@@ -1499,6 +1637,10 @@ impl RoomDurableObject {
                     last_projectile_fire_at: 0,
                 },
             );
+            runtime
+                .combat_players
+                .entry(row.player_id)
+                .or_insert_with(RuntimePlayerCombatState::default);
         }
 
         for row in structure_rows {
@@ -1704,6 +1846,14 @@ impl RoomDurableObject {
             .inventories
             .entry(player_id.to_string())
             .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+    }
+
+    fn ensure_runtime_combat_for_player(&self, player_id: &str) {
+        let mut runtime = self.runtime.borrow_mut();
+        runtime
+            .combat_players
+            .entry(player_id.to_string())
+            .or_insert_with(RuntimePlayerCombatState::default);
     }
 
     fn persist_inventory_for_player(&self, player_id: &str) -> Result<()> {
@@ -2006,6 +2156,119 @@ impl RoomDurableObject {
 
         for node in discovered.iter() {
             self.persist_mining_node(node)?;
+        }
+
+        Ok(true)
+    }
+
+    fn materialize_enemies_for_connected_players(&self) -> Result<bool> {
+        let connected_players = self.connected_player_ids();
+        if connected_players.is_empty() {
+            return Ok(false);
+        }
+
+        let player_positions: Vec<(f32, f32)> = {
+            let runtime = self.runtime.borrow();
+            connected_players
+                .iter()
+                .filter_map(|player_id| runtime.players.get(player_id))
+                .filter(|player| player.connected)
+                .map(|player| (player.x, player.y))
+                .collect()
+        };
+        if player_positions.is_empty() {
+            return Ok(false);
+        }
+
+        let player_centers: Vec<(i32, i32)> = player_positions
+            .iter()
+            .map(|(x, y)| (terrain_grid_axis(*x), terrain_grid_axis(*y)))
+            .collect();
+
+        let seed = self.terrain_seed.get();
+        let now = now_ms();
+        let mut discovered: Vec<RuntimeEnemyState> = Vec::new();
+        let mut discovered_ids = HashSet::new();
+        let mut reached_capacity = false;
+
+        {
+            let runtime = self.runtime.borrow();
+            for (center_x, center_y) in player_centers.iter().copied() {
+                for grid_x in
+                    (center_x - ENEMY_SCAN_RADIUS_TILES)..=(center_x + ENEMY_SCAN_RADIUS_TILES)
+                {
+                    for grid_y in
+                        (center_y - ENEMY_SCAN_RADIUS_TILES)..=(center_y + ENEMY_SCAN_RADIUS_TILES)
+                    {
+                        if runtime.enemies.len() + discovered.len() >= MAX_ENEMIES {
+                            reached_capacity = true;
+                            break;
+                        }
+
+                        let enemy_id = enemy_id_for_grid(grid_x, grid_y);
+                        if runtime.enemies.contains_key(enemy_id.as_str())
+                            || discovered_ids.contains(enemy_id.as_str())
+                        {
+                            continue;
+                        }
+
+                        let Some((kind, max_health, attack_power, armor)) =
+                            sample_enemy_spawn(seed, grid_x, grid_y)
+                        else {
+                            continue;
+                        };
+
+                        let x = (grid_x as f32) * TERRAIN_TILE_SIZE as f32;
+                        let y = (grid_y as f32) * TERRAIN_TILE_SIZE as f32;
+                        let too_close_to_player =
+                            player_positions.iter().any(|(player_x, player_y)| {
+                                let dx = *player_x - x;
+                                let dy = *player_y - y;
+                                dx * dx + dy * dy
+                                    < ENEMY_MIN_PLAYER_DISTANCE * ENEMY_MIN_PLAYER_DISTANCE
+                            });
+                        if too_close_to_player {
+                            continue;
+                        }
+
+                        discovered_ids.insert(enemy_id.clone());
+                        discovered.push(RuntimeEnemyState {
+                            enemy_id,
+                            kind,
+                            x,
+                            y,
+                            vx: 0.0,
+                            vy: 0.0,
+                            health: max_health,
+                            max_health,
+                            attack_power,
+                            armor,
+                            target_player_id: None,
+                            last_attack_tick: 0,
+                            updated_at: now,
+                        });
+                    }
+
+                    if reached_capacity {
+                        break;
+                    }
+                }
+
+                if reached_capacity {
+                    break;
+                }
+            }
+        }
+
+        if discovered.is_empty() {
+            return Ok(false);
+        }
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            for enemy in discovered.into_iter() {
+                runtime.enemies.insert(enemy.enemy_id.clone(), enemy);
+            }
         }
 
         Ok(true)
@@ -2906,6 +3169,19 @@ impl RoomDurableObject {
         let _ = socket.send(&envelope);
     }
 
+    fn broadcast_combat_event(&self, action: &'static str, payload: Value) {
+        for socket in self.state.get_websockets() {
+            self.send_envelope(
+                &socket,
+                "event",
+                "combat",
+                action,
+                None,
+                Some(payload.clone()),
+            );
+        }
+    }
+
     fn send_ack(&self, socket: &WebSocket, feature: &'static str, action: &'static str, seq: u32) {
         self.send_envelope(
             socket,
@@ -2953,7 +3229,9 @@ impl RoomDurableObject {
 
         self.ensure_default_character_profile(player_id)?;
         self.ensure_runtime_inventory_for_player(player_id);
+        self.ensure_runtime_combat_for_player(player_id);
         let mining_discovered = self.materialize_mining_nodes_for_connected_players()?;
+        let _combat_discovered = self.materialize_enemies_for_connected_players()?;
 
         {
             let mut runtime = self.runtime.borrow_mut();
@@ -2986,6 +3264,7 @@ impl RoomDurableObject {
         if mining_discovered {
             self.dirty_mining.set(true);
         }
+        self.dirty_combat.set(true);
         Ok(())
     }
 
@@ -3018,6 +3297,7 @@ impl RoomDurableObject {
         self.dirty_inventory.set(true);
         self.dirty_mining.set(true);
         self.dirty_crafting.set(true);
+        self.dirty_combat.set(true);
         Ok(())
     }
 
@@ -3948,12 +4228,14 @@ impl RoomDurableObject {
             let connected_players = self.connected_player_ids();
             let movement_changed = self.tick_movement(&connected_players)?;
             let projectile_changed = self.tick_projectiles()?;
+            let combat_result = self.tick_combat()?;
             let mining_changed = self.tick_mining()?;
             let crafting_result = self.tick_crafting()?;
             let drops_changed = self.tick_drops()?;
 
             if movement_changed
                 || projectile_changed
+                || combat_result.changed
                 || mining_changed
                 || crafting_result.changed
                 || drops_changed
@@ -3961,6 +4243,15 @@ impl RoomDurableObject {
                 self.snapshot_dirty.set(true);
                 if projectile_changed {
                     self.dirty_projectiles.set(true);
+                }
+                if combat_result.changed {
+                    self.dirty_combat.set(true);
+                }
+                if combat_result.projectiles_changed {
+                    self.dirty_projectiles.set(true);
+                }
+                if combat_result.drops_changed {
+                    self.dirty_drops.set(true);
                 }
                 if mining_changed {
                     self.dirty_mining.set(true);
@@ -3987,6 +4278,7 @@ impl RoomDurableObject {
                 self.dirty_mining.set(false);
                 self.dirty_drops.set(false);
                 self.dirty_crafting.set(false);
+                self.dirty_combat.set(false);
             }
 
             self.checkpoint_runtime_if_due()?;
@@ -4097,6 +4389,308 @@ impl RoomDurableObject {
         }
 
         Ok(changed)
+    }
+
+    fn tick_combat(&self) -> Result<CombatTickResult> {
+        let now = now_ms();
+        let tick = self.tick.get();
+        let mut result = CombatTickResult::default();
+        if self.materialize_enemies_for_connected_players()? {
+            result.changed = true;
+        }
+
+        let mut drops_to_spawn: Vec<(String, u32, f32, f32, Option<String>)> = Vec::new();
+        let mut combat_events: Vec<(&'static str, Value)> = Vec::new();
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let connected_player_ids: Vec<String> = runtime
+                .players
+                .iter()
+                .filter(|(_, player)| player.connected)
+                .map(|(player_id, _)| player_id.clone())
+                .collect();
+
+            for player_id in connected_player_ids.iter() {
+                runtime
+                    .combat_players
+                    .entry(player_id.clone())
+                    .or_insert_with(RuntimePlayerCombatState::default);
+            }
+
+            if connected_player_ids.is_empty() {
+                if !runtime.enemies.is_empty() {
+                    runtime.enemies.clear();
+                    result.changed = true;
+                }
+                return Ok(result);
+            }
+
+            let stale_enemy_ids: Vec<String> = runtime
+                .enemies
+                .values()
+                .filter(|enemy| {
+                    !connected_player_ids.iter().any(|player_id| {
+                        runtime
+                            .players
+                            .get(player_id.as_str())
+                            .is_some_and(|player| enemy_within_despawn_range(player, enemy))
+                    })
+                })
+                .map(|enemy| enemy.enemy_id.clone())
+                .collect();
+            if !stale_enemy_ids.is_empty() {
+                for enemy_id in stale_enemy_ids.iter() {
+                    runtime.enemies.remove(enemy_id.as_str());
+                }
+                result.changed = true;
+            }
+
+            let projectile_ids: Vec<String> = runtime.projectiles.keys().cloned().collect();
+            let mut defeated_enemies: Vec<(RuntimeEnemyState, Option<String>)> = Vec::new();
+            for projectile_id in projectile_ids {
+                let Some(projectile) = runtime.projectiles.get(projectile_id.as_str()).cloned()
+                else {
+                    continue;
+                };
+
+                let mut hit_enemy_id: Option<String> = None;
+                let mut nearest_hit_distance_sq = f32::MAX;
+                for enemy in runtime.enemies.values() {
+                    if enemy.health == 0 {
+                        continue;
+                    }
+                    let dx = projectile.x - enemy.x;
+                    let dy = projectile.y - enemy.y;
+                    let distance_sq = dx * dx + dy * dy;
+                    if distance_sq > ENEMY_PROJECTILE_HIT_RADIUS * ENEMY_PROJECTILE_HIT_RADIUS {
+                        continue;
+                    }
+                    if distance_sq < nearest_hit_distance_sq {
+                        nearest_hit_distance_sq = distance_sq;
+                        hit_enemy_id = Some(enemy.enemy_id.clone());
+                    }
+                }
+
+                let Some(hit_enemy_id) = hit_enemy_id else {
+                    continue;
+                };
+
+                let owner_attack_power = runtime
+                    .combat_players
+                    .get(projectile.owner_id.as_str())
+                    .map(|stats| stats.attack_power)
+                    .unwrap_or(PLAYER_COMBAT_ATTACK_POWER);
+                let incoming_damage = owner_attack_power.saturating_add(PROJECTILE_BASE_DAMAGE);
+
+                let mut defeated_enemy: Option<RuntimeEnemyState> = None;
+                let mut remaining_health = 0u16;
+                let mut applied_damage = 0u16;
+                if let Some(enemy) = runtime.enemies.get_mut(hit_enemy_id.as_str()) {
+                    let (applied, remaining, defeated) =
+                        resolve_damage(enemy.health, enemy.armor, incoming_damage);
+                    applied_damage = applied;
+                    remaining_health = remaining;
+                    enemy.health = remaining;
+                    enemy.updated_at = now;
+                    if defeated {
+                        defeated_enemy = Some(enemy.clone());
+                    }
+                }
+
+                runtime.projectiles.remove(projectile_id.as_str());
+                result.projectiles_changed = true;
+                result.changed = true;
+
+                if let Some(defeated_enemy) = defeated_enemy {
+                    defeated_enemies.push((defeated_enemy, Some(projectile.owner_id.clone())));
+                } else if applied_damage > 0 {
+                    combat_events.push((
+                        "enemy_damaged",
+                        json!({
+                            "enemyId": hit_enemy_id,
+                            "attackerPlayerId": projectile.owner_id,
+                            "remainingHealth": remaining_health,
+                        }),
+                    ));
+                }
+            }
+
+            let enemy_ids: Vec<String> = runtime.enemies.keys().cloned().collect();
+            let mut pending_player_damage: HashMap<String, u16> = HashMap::new();
+            for enemy_id in enemy_ids {
+                let Some(enemy_snapshot) = runtime.enemies.get(enemy_id.as_str()).cloned() else {
+                    continue;
+                };
+                if enemy_snapshot.health == 0 {
+                    continue;
+                }
+
+                let mut target_player: Option<(String, f32, f32, f32)> = None;
+                for player_id in connected_player_ids.iter() {
+                    let Some(player) = runtime.players.get(player_id.as_str()) else {
+                        continue;
+                    };
+                    let Some(player_combat) = runtime.combat_players.get(player_id.as_str()) else {
+                        continue;
+                    };
+                    if player_combat.health == 0
+                        || !enemy_within_aggro_range(player, &enemy_snapshot)
+                    {
+                        continue;
+                    }
+
+                    let dx = player.x - enemy_snapshot.x;
+                    let dy = player.y - enemy_snapshot.y;
+                    let distance_sq = dx * dx + dy * dy;
+                    match target_player {
+                        Some((_, _, _, current_best_distance_sq))
+                            if distance_sq >= current_best_distance_sq => {}
+                        _ => {
+                            target_player =
+                                Some((player_id.clone(), player.x, player.y, distance_sq));
+                        }
+                    }
+                }
+
+                let Some(enemy) = runtime.enemies.get_mut(enemy_id.as_str()) else {
+                    continue;
+                };
+                let previous_target = enemy.target_player_id.clone();
+                let previous_x = enemy.x;
+                let previous_y = enemy.y;
+                let previous_vx = enemy.vx;
+                let previous_vy = enemy.vy;
+                let previous_attack_tick = enemy.last_attack_tick;
+
+                if let Some((target_player_id, target_x, target_y, target_distance_sq)) =
+                    target_player
+                {
+                    enemy.target_player_id = Some(target_player_id.clone());
+
+                    if target_distance_sq <= ENEMY_ATTACK_RANGE * ENEMY_ATTACK_RANGE {
+                        enemy.vx = 0.0;
+                        enemy.vy = 0.0;
+                        if tick.saturating_sub(enemy.last_attack_tick)
+                            >= ENEMY_ATTACK_COOLDOWN_TICKS
+                        {
+                            let total_damage =
+                                pending_player_damage.entry(target_player_id).or_insert(0);
+                            *total_damage = total_damage.saturating_add(enemy.attack_power);
+                            enemy.last_attack_tick = tick;
+                        }
+                    } else {
+                        let distance = target_distance_sq.sqrt().max(f32::EPSILON);
+                        let direction_x = (target_x - enemy.x) / distance;
+                        let direction_y = (target_y - enemy.y) / distance;
+                        enemy.vx = direction_x * ENEMY_MOVE_SPEED;
+                        enemy.vy = direction_y * ENEMY_MOVE_SPEED;
+                        enemy.x = (enemy.x + enemy.vx * SIM_DT_SECONDS)
+                            .clamp(-MOVEMENT_MAP_LIMIT, MOVEMENT_MAP_LIMIT);
+                        enemy.y = (enemy.y + enemy.vy * SIM_DT_SECONDS)
+                            .clamp(-MOVEMENT_MAP_LIMIT, MOVEMENT_MAP_LIMIT);
+                    }
+                } else {
+                    enemy.target_player_id = None;
+                    enemy.vx = 0.0;
+                    enemy.vy = 0.0;
+                }
+
+                enemy.updated_at = now;
+
+                if enemy.target_player_id != previous_target
+                    || (enemy.x - previous_x).abs() > f32::EPSILON
+                    || (enemy.y - previous_y).abs() > f32::EPSILON
+                    || (enemy.vx - previous_vx).abs() > f32::EPSILON
+                    || (enemy.vy - previous_vy).abs() > f32::EPSILON
+                    || enemy.last_attack_tick != previous_attack_tick
+                {
+                    result.changed = true;
+                }
+            }
+
+            for (player_id, incoming_damage) in pending_player_damage.into_iter() {
+                let Some(player_combat) = runtime.combat_players.get_mut(player_id.as_str()) else {
+                    continue;
+                };
+                let previous_health = player_combat.health;
+                let (applied_damage, remaining_health, defeated) =
+                    resolve_damage(previous_health, player_combat.armor, incoming_damage);
+                if applied_damage == 0 {
+                    continue;
+                }
+
+                player_combat.health = remaining_health;
+                result.changed = true;
+                combat_events.push((
+                    "player_damaged",
+                    json!({
+                        "playerId": player_id,
+                        "damage": applied_damage,
+                        "remainingHealth": remaining_health,
+                    }),
+                ));
+                if defeated {
+                    combat_events.push((
+                        "player_defeated",
+                        json!({
+                            "playerId": player_id,
+                        }),
+                    ));
+                }
+            }
+
+            for (defeated_enemy, attacker_player_id) in defeated_enemies.into_iter() {
+                if runtime
+                    .enemies
+                    .remove(defeated_enemy.enemy_id.as_str())
+                    .is_none()
+                {
+                    continue;
+                }
+
+                let (drop_resource, drop_amount) =
+                    enemy_drop_for_kind(defeated_enemy.kind.as_str());
+                drops_to_spawn.push((
+                    drop_resource.to_string(),
+                    drop_amount,
+                    defeated_enemy.x,
+                    defeated_enemy.y,
+                    attacker_player_id.clone(),
+                ));
+                result.changed = true;
+                result.drops_changed = true;
+                combat_events.push((
+                    "enemy_defeated",
+                    json!({
+                        "enemyId": defeated_enemy.enemy_id,
+                        "enemyKind": defeated_enemy.kind,
+                        "x": defeated_enemy.x,
+                        "y": defeated_enemy.y,
+                        "byPlayerId": attacker_player_id,
+                        "dropResource": drop_resource,
+                        "dropAmount": drop_amount,
+                    }),
+                ));
+            }
+        }
+
+        for (resource, amount, x, y, owner_player_id) in drops_to_spawn.iter() {
+            self.spawn_world_drop(
+                resource.as_str(),
+                *amount,
+                *x,
+                *y,
+                owner_player_id.as_deref(),
+                now,
+            )?;
+        }
+
+        for (action, payload) in combat_events.into_iter() {
+            self.broadcast_combat_event(action, payload);
+        }
+
+        Ok(result)
     }
 
     fn tick_mining(&self) -> Result<bool> {
@@ -4304,6 +4898,10 @@ impl RoomDurableObject {
         let online = connected_players.clone();
         let now = now_ms();
         let mining_discovered = self.materialize_mining_nodes_for_connected_players()?;
+        let enemies_discovered = self.materialize_enemies_for_connected_players()?;
+        if enemies_discovered {
+            self.dirty_combat.set(true);
+        }
         let drops_pruned = self.prune_expired_drops(now)?;
         if drops_pruned {
             self.dirty_drops.set(true);
@@ -4588,6 +5186,50 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let mut enemy_rows: Vec<&RuntimeEnemyState> = runtime
+            .enemies
+            .values()
+            .filter(|enemy| enemy.health > 0)
+            .collect();
+        enemy_rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+        let enemy_count = enemy_rows.len();
+        if enemy_rows.len() > MAX_ENEMIES_PER_SNAPSHOT {
+            enemy_rows.truncate(MAX_ENEMIES_PER_SNAPSHOT);
+        }
+        let enemies: Vec<Value> = enemy_rows
+            .iter()
+            .map(|enemy| {
+                json!({
+                    "id": enemy.enemy_id,
+                    "kind": enemy.kind,
+                    "x": enemy.x,
+                    "y": enemy.y,
+                    "health": enemy.health,
+                    "maxHealth": enemy.max_health,
+                    "targetPlayerId": enemy.target_player_id,
+                })
+            })
+            .collect();
+
+        let combat_players: Vec<Value> = connected_players
+            .iter()
+            .map(|player_id| {
+                let player_combat = runtime
+                    .combat_players
+                    .get(player_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+
+                json!({
+                    "playerId": player_id,
+                    "health": player_combat.health,
+                    "maxHealth": player_combat.max_health,
+                    "attackPower": player_combat.attack_power,
+                    "armor": player_combat.armor,
+                })
+            })
+            .collect();
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
@@ -4598,7 +5240,7 @@ impl RoomDurableObject {
         // move across visibility boundaries.
         let include_drops = true;
         let include_crafting = full || self.dirty_crafting.get();
-        let include_combat = full;
+        let include_combat = full || self.dirty_combat.get() || enemies_discovered;
         let include_character = full || self.dirty_presence.get();
         let mut features = JsonMap::new();
 
@@ -4705,10 +5347,10 @@ impl RoomDurableObject {
                 "combat".to_string(),
                 json!({
                     "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
-                    "enemies": [],
-                    "enemyCount": 0,
-                    "players": [],
-                    "playerCount": 0,
+                    "enemies": enemies,
+                    "enemyCount": enemy_count,
+                    "players": combat_players,
+                    "playerCount": connected_players.len(),
                 }),
             );
         }
@@ -4876,6 +5518,10 @@ impl RoomDurableObject {
                     .inventories
                     .entry(player_id.clone())
                     .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                runtime
+                    .combat_players
+                    .entry(player_id.clone())
+                    .or_insert_with(RuntimePlayerCombatState::default);
             }
         }
         for player_id in players {
@@ -4911,6 +5557,7 @@ impl DurableObject for RoomDurableObject {
             dirty_mining: Cell::new(false),
             dirty_drops: Cell::new(false),
             dirty_crafting: Cell::new(false),
+            dirty_combat: Cell::new(false),
             terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
         };
@@ -5052,6 +5699,7 @@ impl DurableObject for RoomDurableObject {
                     self.dirty_mining.set(false);
                     self.dirty_drops.set(false);
                     self.dirty_crafting.set(false);
+                    self.dirty_combat.set(false);
                 }
             }
             Err(error) => {
@@ -5390,5 +6038,37 @@ mod tests {
         }
 
         assert!(recipe_kind_from_id("unknown_recipe").is_none());
+    }
+
+    #[test]
+    fn enemy_spawn_sampling_is_deterministic_per_seed_and_grid() {
+        let seed = deterministic_seed_from_room_code("ALPHA-ROOM");
+        let sample_a = sample_enemy_spawn(seed, 12, -9);
+        let sample_b = sample_enemy_spawn(seed, 12, -9);
+        assert_eq!(sample_a, sample_b);
+
+        let changed_seed = deterministic_seed_from_room_code("BRAVO-ROOM");
+        let changed_sample = sample_enemy_spawn(changed_seed, 12, -9);
+        if sample_a.is_some() && changed_sample.is_some() {
+            assert_ne!(sample_a, changed_sample);
+        }
+    }
+
+    #[test]
+    fn damage_resolution_applies_armor_and_detects_defeat() {
+        let (applied_1, remaining_1, defeated_1) = resolve_damage(40, 3, 9);
+        assert_eq!(applied_1, 6);
+        assert_eq!(remaining_1, 34);
+        assert!(!defeated_1);
+
+        let (applied_2, remaining_2, defeated_2) = resolve_damage(5, 10, 1);
+        assert_eq!(applied_2, 1);
+        assert_eq!(remaining_2, 4);
+        assert!(!defeated_2);
+
+        let (applied_3, remaining_3, defeated_3) = resolve_damage(4, 0, 12);
+        assert_eq!(applied_3, 4);
+        assert_eq!(remaining_3, 0);
+        assert!(defeated_3);
     }
 }

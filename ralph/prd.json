@@ -161,7 +161,7 @@
         "Combat damage and health are server authoritative",
         "Enemy death emits drops/events to all clients"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-013",
