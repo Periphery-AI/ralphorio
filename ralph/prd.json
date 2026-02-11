@@ -73,7 +73,7 @@
         "Selection persists and rehydrates from server state",
         "Visual quality is consistent with existing HUD style"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-005",

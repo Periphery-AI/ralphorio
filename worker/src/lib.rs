@@ -50,6 +50,7 @@ const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
 const DEFAULT_CHARACTER_PROFILE_ID: &str = "default";
 const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
+const MAX_CHARACTER_PROFILE_SLOTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +70,12 @@ enum ProtocolFeature {
     Crafting,
     Combat,
     Character,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomApiEndpoint {
+    WebSocket,
+    CharacterProfiles,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +227,21 @@ struct CharacterMetadataPayload {
 #[serde(rename_all = "camelCase")]
 struct CharacterSelectPayload {
     character_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterProfileUpsertPayload {
+    character_id: String,
+    name: String,
+    sprite_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterProfilesUpdatePayload {
+    profiles: Vec<CharacterProfileUpsertPayload>,
+    active_character_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -447,17 +469,24 @@ fn random_player_id() -> String {
     format!("anon_{:x}", time ^ random)
 }
 
-fn parse_room_code_from_path(path: &str) -> Option<String> {
+fn parse_room_endpoint(path: &str) -> Option<(String, RoomApiEndpoint)> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() != 5 {
         return None;
     }
 
-    if parts[1] != "api" || parts[2] != "rooms" || parts[4] != "ws" {
+    if parts[1] != "api" || parts[2] != "rooms" {
         return None;
     }
 
-    sanitize_room_code(parts[3])
+    let room_code = sanitize_room_code(parts[3])?;
+    let endpoint = match parts[4] {
+        "ws" => RoomApiEndpoint::WebSocket,
+        "character-profiles" => RoomApiEndpoint::CharacterProfiles,
+        _ => return None,
+    };
+
+    Some((room_code, endpoint))
 }
 
 fn parse_query_param(url: &Url, key: &str) -> Option<String> {
@@ -616,17 +645,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }));
     }
 
-    if let Some(room_code) = parse_room_code_from_path(url.path()) {
-        let upgrade = req
-            .headers()
-            .get("Upgrade")?
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if upgrade != "websocket" {
-            return json_response(json!({ "error": "Expected websocket upgrade." }), 426);
-        }
-
+    if let Some((room_code, _endpoint)) = parse_room_endpoint(url.path()) {
         let namespace = env.durable_object("ROOMS")?;
         let object_id = namespace.id_from_name(&room_code)?;
         let stub = object_id.get_stub()?;
@@ -1117,6 +1136,167 @@ impl RoomDurableObject {
             name: default_character_name_for_player(user_id),
             sprite_id: DEFAULT_CHARACTER_SPRITE_ID.to_string(),
         })
+    }
+
+    fn load_character_profiles(&self, user_id: &str) -> Result<Vec<CharacterProfileRow>> {
+        self.sql()
+            .exec(
+                "
+                SELECT character_id, name, sprite_id
+                FROM character_profiles
+                WHERE user_id = ?
+                ORDER BY created_at ASC, character_id ASC
+                ",
+                Some(vec![user_id.into()]),
+            )?
+            .to_array()
+    }
+
+    fn character_profile_exists(&self, user_id: &str, character_id: &str) -> Result<bool> {
+        let rows: Vec<CharacterIdRow> = self
+            .sql()
+            .exec(
+                "
+                SELECT character_id
+                FROM character_profiles
+                WHERE user_id = ? AND character_id = ?
+                LIMIT 1
+                ",
+                Some(vec![user_id.into(), character_id.into()]),
+            )?
+            .to_array()?;
+        Ok(!rows.is_empty())
+    }
+
+    fn character_profiles_payload(&self, user_id: &str) -> Result<Value> {
+        self.ensure_default_character_profile(user_id)?;
+        let active_profile = self.load_active_character_profile(user_id)?;
+        let profiles = self.load_character_profiles(user_id)?;
+        let profile_count = profiles.len();
+        let profiles = profiles
+            .into_iter()
+            .map(|profile| {
+                json!({
+                    "characterId": profile.character_id,
+                    "name": profile.name,
+                    "spriteId": profile.sprite_id,
+                })
+            })
+            .collect::<Vec<Value>>();
+
+        Ok(json!({
+            "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+            "activeCharacterId": active_profile.character_id,
+            "profiles": profiles,
+            "profileCount": profile_count,
+        }))
+    }
+
+    fn apply_character_profiles_update(
+        &self,
+        user_id: &str,
+        payload: CharacterProfilesUpdatePayload,
+    ) -> Result<()> {
+        if payload.profiles.is_empty() {
+            return Err(Error::RustError(
+                "profiles payload must include at least one slot".into(),
+            ));
+        }
+
+        if payload.profiles.len() > MAX_CHARACTER_PROFILE_SLOTS {
+            return Err(Error::RustError("too many character profile slots".into()));
+        }
+
+        let active_character_id = sanitize_character_id(payload.active_character_id.as_str())
+            .ok_or_else(|| Error::RustError("invalid active character id".into()))?;
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut normalized_profiles: Vec<(String, String, String)> =
+            Vec::with_capacity(payload.profiles.len());
+
+        for profile in payload.profiles {
+            let character_id = sanitize_character_id(profile.character_id.as_str())
+                .ok_or_else(|| Error::RustError("invalid character id".into()))?;
+            if !seen_ids.insert(character_id.clone()) {
+                return Err(Error::RustError("duplicate character id".into()));
+            }
+
+            let name = sanitize_character_name(profile.name.as_str())
+                .ok_or_else(|| Error::RustError("invalid character name".into()))?;
+            let sprite_id = profile
+                .sprite_id
+                .unwrap_or_else(|| DEFAULT_CHARACTER_SPRITE_ID.to_string());
+
+            if sprite_id.is_empty()
+                || sprite_id.len() > MAX_PROTOCOL_IDENTIFIER_LEN
+                || !is_valid_protocol_identifier(sprite_id.as_str())
+            {
+                return Err(Error::RustError("invalid character sprite id".into()));
+            }
+            normalized_profiles.push((character_id, name, sprite_id));
+        }
+
+        let active_in_payload = normalized_profiles
+            .iter()
+            .any(|(character_id, _, _)| character_id.as_str() == active_character_id.as_str());
+        if !active_in_payload
+            && !self.character_profile_exists(user_id, active_character_id.as_str())?
+        {
+            return Err(Error::RustError(
+                "active character profile does not exist".into(),
+            ));
+        }
+
+        for (character_id, name, sprite_id) in normalized_profiles {
+            self.upsert_character_profile(
+                user_id,
+                character_id.as_str(),
+                name.as_str(),
+                sprite_id.as_str(),
+                false,
+            )?;
+        }
+
+        self.set_active_character_profile(user_id, active_character_id.as_str())?;
+        self.dirty_presence.set(true);
+
+        Ok(())
+    }
+
+    async fn handle_character_profiles_request(
+        &self,
+        mut req: Request,
+        url: &Url,
+    ) -> Result<Response> {
+        let player_id = authenticate_player(url, &self.env).await?;
+        self.ensure_default_character_profile(player_id.as_str())?;
+
+        match req.method() {
+            Method::Get => json_response(self.character_profiles_payload(player_id.as_str())?, 200),
+            Method::Put => {
+                let raw_body = req.text().await?;
+                let payload =
+                    match serde_json::from_str::<CharacterProfilesUpdatePayload>(raw_body.as_str())
+                    {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            return json_response(
+                                json!({ "error": "invalid character profiles payload" }),
+                                400,
+                            );
+                        }
+                    };
+
+                match self.apply_character_profiles_update(player_id.as_str(), payload) {
+                    Ok(()) => {
+                        self.broadcast_snapshot(false);
+                        self.dirty_presence.set(false);
+                        json_response(self.character_profiles_payload(player_id.as_str())?, 200)
+                    }
+                    Err(error) => json_response(json!({ "error": format!("{error}") }), 400),
+                }
+            }
+            _ => json_response(json!({ "error": "method not allowed" }), 405),
+        }
     }
 
     fn initialize_schema(&self) -> Result<()> {
@@ -2804,61 +2984,69 @@ impl DurableObject for RoomDurableObject {
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
-        let room_code = parse_room_code_from_path(url.path())
+        let (room_code, endpoint) = parse_room_endpoint(url.path())
             .ok_or_else(|| Error::RustError("invalid room endpoint".into()))?;
 
         self.room_code.replace(room_code.clone());
         self.persist_room_code(&room_code)?;
         self.ensure_terrain_seed(&room_code)?;
 
-        let upgrade = req
-            .headers()
-            .get("Upgrade")?
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        match endpoint {
+            RoomApiEndpoint::CharacterProfiles => {
+                self.handle_character_profiles_request(req, &url).await
+            }
+            RoomApiEndpoint::WebSocket => {
+                let upgrade = req
+                    .headers()
+                    .get("Upgrade")?
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
 
-        if upgrade != "websocket" {
-            return json_response(json!({ "error": "WebSocket upgrade required." }), 426);
+                if upgrade != "websocket" {
+                    return json_response(json!({ "error": "WebSocket upgrade required." }), 426);
+                }
+
+                let resume_token_hint = parse_query_param(&url, "resumeToken")
+                    .or_else(|| parse_query_param(&url, "resume"));
+                let player_id = authenticate_player(&url, &self.env).await?;
+                let resume_token =
+                    self.issue_resume_token(&player_id, resume_token_hint.as_deref())?;
+
+                let pair = WebSocketPair::new()?;
+                let server = pair.server;
+                let client = pair.client;
+
+                self.state
+                    .accept_websocket_with_tags(&server, &[player_id.as_str()]);
+
+                server.serialize_attachment(SocketAttachment {
+                    player_id: player_id.clone(),
+                    last_seq: 0,
+                })?;
+
+                self.on_connect_player(&player_id)?;
+
+                self.send_envelope(
+                    &server,
+                    "welcome",
+                    "core",
+                    "connected",
+                    None,
+                    Some(json!({
+                        "roomCode": room_code,
+                        "playerId": player_id,
+                        "simRateHz": SIM_RATE_HZ,
+                        "snapshotRateHz": SNAPSHOT_RATE_HZ,
+                        "resumeToken": resume_token,
+                    })),
+                );
+
+                self.send_snapshot_to(&server, true);
+                self.broadcast_snapshot(false);
+
+                Response::from_websocket(client)
+            }
         }
-
-        let resume_token_hint =
-            parse_query_param(&url, "resumeToken").or_else(|| parse_query_param(&url, "resume"));
-        let player_id = authenticate_player(&url, &self.env).await?;
-        let resume_token = self.issue_resume_token(&player_id, resume_token_hint.as_deref())?;
-
-        let pair = WebSocketPair::new()?;
-        let server = pair.server;
-        let client = pair.client;
-
-        self.state
-            .accept_websocket_with_tags(&server, &[player_id.as_str()]);
-
-        server.serialize_attachment(SocketAttachment {
-            player_id: player_id.clone(),
-            last_seq: 0,
-        })?;
-
-        self.on_connect_player(&player_id)?;
-
-        self.send_envelope(
-            &server,
-            "welcome",
-            "core",
-            "connected",
-            None,
-            Some(json!({
-                "roomCode": room_code,
-                "playerId": player_id,
-                "simRateHz": SIM_RATE_HZ,
-                "snapshotRateHz": SNAPSHOT_RATE_HZ,
-                "resumeToken": resume_token,
-            })),
-        );
-
-        self.send_snapshot_to(&server, true);
-        self.broadcast_snapshot(false);
-
-        Response::from_websocket(client)
     }
 
     async fn websocket_message(

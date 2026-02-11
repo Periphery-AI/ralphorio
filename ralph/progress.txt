@@ -49,3 +49,11 @@ Format per entry:
 - files: worker/src/lib.rs, docs/networking-architecture.md, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: da62676
+
+- timestamp: 2026-02-11
+- item: RL-004
+- summary: Implemented a pre-room character selector with three editable slots, room-scoped server rehydration, and active slot persistence before room connect.
+- decisions: Add room DO HTTP endpoint `/api/rooms/:roomCode/character-profiles` (`GET` + `PUT`) so selector state can load/save before websocket connect; keep slot ids stable (`default`, `slot-02`, `slot-03`) and treat worker-side validation failures as safe 400 responses.
+- files: worker/src/lib.rs, src/game/character-profiles.ts, src/routes/connect-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: pending
