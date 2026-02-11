@@ -25,3 +25,11 @@ Format per entry:
 - files: sim-core/src/lib.rs, worker/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo test --manifest-path sim-core/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
 - commit: b8765e1
+
+- timestamp: 2026-02-11
+- item: RL-001
+- summary: Added a dedicated shared gameplay domain module in `sim-core` with versioned schema contracts for resources, recipes, inventory, combat stats, placeables, and deterministic simulation tick IO.
+- decisions: Keep shared model in `sim-core::domain` to avoid UI coupling; use explicit `schema_version` on state/input/output (`GAMEPLAY_SCHEMA_VERSION = 1`); drive deterministic tick behavior with ordered structures (`BTreeMap`) and pure `simulate_step` command/event flow.
+- files: sim-core/src/domain.rs, sim-core/src/lib.rs, sim-core/Cargo.toml, sim-core/Cargo.lock, worker/Cargo.lock, game-client/Cargo.lock, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path sim-core/Cargo.toml; cargo test --manifest-path sim-core/Cargo.toml (13 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
+- commit: pending

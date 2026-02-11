@@ -463,6 +463,9 @@ dependencies = [
 [[package]]
 name = "sim-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"

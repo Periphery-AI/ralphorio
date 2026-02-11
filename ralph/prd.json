@@ -28,7 +28,7 @@
         "Model supports deterministic simulation step inputs/outputs",
         "Serialization schema versioning is explicit"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-016",
