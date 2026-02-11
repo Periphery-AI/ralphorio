@@ -128,7 +128,7 @@
         "Queue supports at least single and repeated crafts",
         "Craft outputs appear in inventory on completion"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-010",

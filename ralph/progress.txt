@@ -89,3 +89,11 @@ Format per entry:
 - files: game-client/Cargo.toml, game-client/Cargo.lock, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path game-client/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-009
+- summary: Implemented server-authoritative crafting recipes/queue flow with repeat counts, tick-based progression, inventory consumption/output application, and synchronized crafting snapshot payloads.
+- decisions: Reused `sim-core::domain` recipe definitions (`RecipeKind` + `recipe_definition`) so worker crafting inputs/outputs stay aligned with shared deterministic gameplay schema; kept crafting queue runtime state in-memory per room/player while continuing to persist authoritative inventory mutations in SQLite.
+- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: feat(worker): implement authoritative crafting queue execution

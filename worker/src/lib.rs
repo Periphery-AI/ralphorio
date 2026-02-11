@@ -2,7 +2,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value};
-use sim_core::domain::{DEFAULT_INVENTORY_MAX_SLOTS, GAMEPLAY_SCHEMA_VERSION};
+use sim_core::domain::{
+    recipe_definition, RecipeKind, ResourceKind, DEFAULT_INVENTORY_MAX_SLOTS,
+    GAMEPLAY_SCHEMA_VERSION,
+};
 use sim_core::{
     deterministic_seed_from_room_code, movement_step_with_obstacles, projectile_step,
     sample_terrain, InputState as CoreInputState, StructureObstacle, TerrainResourceKind,
@@ -48,6 +51,10 @@ const MINING_NODE_SCAN_RADIUS_TILES: i32 = 14;
 const MAX_MINING_NODES: usize = 4096;
 const MAX_MINING_NODES_PER_SNAPSHOT: usize = 384;
 const MAX_MINING_ACTIVE_PER_SNAPSHOT: usize = 256;
+const MAX_CRAFT_QUEUE_ENTRIES_PER_PLAYER: usize = 32;
+const MAX_CRAFT_QUEUE_TOTAL_PER_PLAYER: u32 = 512;
+const MAX_CRAFT_QUEUES_PER_SNAPSHOT: usize = 128;
+const MAX_CRAFT_PENDING_ENTRIES_PER_SNAPSHOT_QUEUE: usize = 24;
 
 const MAX_STRUCTURES: usize = 1024;
 const MAX_PROJECTILES: usize = 4096;
@@ -442,6 +449,30 @@ struct RuntimeMiningProgressState {
     completes_at: i64,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeCraftQueueEntry {
+    recipe: String,
+    count: u16,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeActiveCraftState {
+    recipe: String,
+    remaining_ticks: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeCraftQueueState {
+    pending: Vec<RuntimeCraftQueueEntry>,
+    active: Option<RuntimeActiveCraftState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CraftingTickResult {
+    changed: bool,
+    inventory_changed: bool,
+}
+
 impl RuntimeInventoryState {
     fn new(max_slots: u8) -> Self {
         Self {
@@ -665,6 +696,168 @@ impl RuntimeInventoryState {
 
         Ok(())
     }
+
+    #[allow(dead_code)]
+    fn total_resource_amount(&self, resource: &str) -> u32 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|stack| stack.resource == resource)
+            .map(|stack| stack.amount)
+            .sum()
+    }
+}
+
+impl RuntimeCraftQueueState {
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.active.is_none()
+    }
+
+    fn pending_total_count(&self) -> u32 {
+        self.pending.iter().map(|entry| entry.count as u32).sum()
+    }
+
+    fn peek_pending_recipe(&self) -> Option<&str> {
+        self.pending.first().map(|entry| entry.recipe.as_str())
+    }
+
+    fn consume_one_pending(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        let mut remove_head = false;
+        let recipe = {
+            let head = self.pending.first_mut()?;
+            if head.count == 0 {
+                remove_head = true;
+                head.recipe.clone()
+            } else {
+                head.count -= 1;
+                if head.count == 0 {
+                    remove_head = true;
+                }
+                head.recipe.clone()
+            }
+        };
+
+        if remove_head {
+            self.pending.remove(0);
+        }
+        Some(recipe)
+    }
+}
+
+fn recipe_kind_from_id(recipe_id: &str) -> Option<RecipeKind> {
+    match recipe_id {
+        "smelt_iron_plate" => Some(RecipeKind::SmeltIronPlate),
+        "smelt_copper_plate" => Some(RecipeKind::SmeltCopperPlate),
+        "craft_gear" => Some(RecipeKind::CraftGear),
+        _ => None,
+    }
+}
+
+fn recipe_id_from_kind(recipe: RecipeKind) -> &'static str {
+    match recipe {
+        RecipeKind::SmeltIronPlate => "smelt_iron_plate",
+        RecipeKind::SmeltCopperPlate => "smelt_copper_plate",
+        RecipeKind::CraftGear => "craft_gear",
+    }
+}
+
+fn resource_id_from_kind(resource: ResourceKind) -> &'static str {
+    match resource {
+        ResourceKind::IronOre => "iron_ore",
+        ResourceKind::CopperOre => "copper_ore",
+        ResourceKind::Coal => "coal",
+        ResourceKind::Stone => "stone",
+        ResourceKind::IronPlate => "iron_plate",
+        ResourceKind::CopperPlate => "copper_plate",
+        ResourceKind::Gear => "gear",
+    }
+}
+
+fn advance_crafting_queue(
+    inventory: &mut RuntimeInventoryState,
+    queue: &mut RuntimeCraftQueueState,
+) -> CraftingTickResult {
+    let mut result = CraftingTickResult::default();
+    inventory.normalize();
+
+    if queue.active.is_none() {
+        let next_recipe = queue.peek_pending_recipe().map(str::to_string);
+        if let Some(next_recipe) = next_recipe {
+            if let Some(recipe_kind) = recipe_kind_from_id(next_recipe.as_str()) {
+                let definition = recipe_definition(recipe_kind);
+                let mut consumed_inventory = inventory.clone();
+                let mut can_start = true;
+                for input in definition.inputs.iter() {
+                    if consumed_inventory
+                        .remove_resource(resource_id_from_kind(input.resource), input.amount)
+                        .is_err()
+                    {
+                        can_start = false;
+                        break;
+                    }
+                }
+
+                if can_start {
+                    *inventory = consumed_inventory;
+                    if let Some(started_recipe) = queue.consume_one_pending() {
+                        queue.active = Some(RuntimeActiveCraftState {
+                            recipe: started_recipe,
+                            remaining_ticks: definition.craft_ticks.max(1),
+                        });
+                        result.changed = true;
+                        result.inventory_changed = true;
+                    }
+                }
+            } else {
+                queue.consume_one_pending();
+                result.changed = true;
+            }
+        }
+    }
+
+    let completed_recipe = {
+        let Some(active) = queue.active.as_mut() else {
+            return result;
+        };
+        if active.remaining_ticks > 0 {
+            active.remaining_ticks -= 1;
+            result.changed = true;
+        }
+        if active.remaining_ticks == 0 {
+            Some(active.recipe.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(completed_recipe) = completed_recipe else {
+        return result;
+    };
+
+    queue.active = None;
+    result.changed = true;
+
+    let Some(recipe_kind) = recipe_kind_from_id(completed_recipe.as_str()) else {
+        return result;
+    };
+    let definition = recipe_definition(recipe_kind);
+    let mut produced_inventory = inventory.clone();
+    for output in definition.outputs.iter() {
+        if produced_inventory
+            .add_resource(resource_id_from_kind(output.resource), output.amount)
+            .is_err()
+        {
+            return result;
+        }
+    }
+
+    *inventory = produced_inventory;
+    result.inventory_changed = true;
+    result
 }
 
 #[derive(Debug, Default)]
@@ -676,6 +869,7 @@ struct RoomRuntimeState {
     inventories: HashMap<String, RuntimeInventoryState>,
     mining_nodes: HashMap<String, RuntimeMiningNodeState>,
     mining_active: HashMap<String, RuntimeMiningProgressState>,
+    craft_queues: HashMap<String, RuntimeCraftQueueState>,
 }
 
 fn now_ms() -> i64 {
@@ -1054,6 +1248,7 @@ pub struct RoomDurableObject {
     dirty_projectiles: Cell<bool>,
     dirty_inventory: Cell<bool>,
     dirty_mining: Cell<bool>,
+    dirty_crafting: Cell<bool>,
     terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
 }
@@ -2466,6 +2661,7 @@ impl RoomDurableObject {
         self.snapshot_dirty.set(true);
         self.dirty_presence.set(true);
         self.dirty_inventory.set(true);
+        self.dirty_crafting.set(true);
         if mining_discovered {
             self.dirty_mining.set(true);
         }
@@ -2489,6 +2685,7 @@ impl RoomDurableObject {
             }
             runtime.previews.remove(player_id);
             runtime.mining_active.remove(player_id);
+            runtime.craft_queues.remove(player_id);
         }
 
         self.checkpoint_runtime_players_to_db()?;
@@ -2499,6 +2696,7 @@ impl RoomDurableObject {
         self.dirty_build.set(true);
         self.dirty_inventory.set(true);
         self.dirty_mining.set(true);
+        self.dirty_crafting.set(true);
         Ok(())
     }
 
@@ -3079,10 +3277,51 @@ impl RoomDurableObject {
                 {
                     return Err(Error::RustError("invalid crafting queue payload".into()));
                 }
+                let recipe_kind = recipe_kind_from_id(queue_payload.recipe.as_str())
+                    .ok_or_else(|| Error::RustError("unknown crafting recipe".into()))?;
+                let recipe_id = recipe_id_from_kind(recipe_kind).to_string();
 
-                Err(Error::RustError(
-                    "crafting commands are not implemented".into(),
-                ))
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let queue = runtime
+                        .craft_queues
+                        .entry(player_id.to_string())
+                        .or_insert_with(RuntimeCraftQueueState::default);
+
+                    let queued_total = queue.pending_total_count();
+                    let next_total = queued_total
+                        .checked_add(queue_payload.count as u32)
+                        .ok_or_else(|| Error::RustError("crafting queue is full".into()))?;
+                    if next_total > MAX_CRAFT_QUEUE_TOTAL_PER_PLAYER {
+                        return Err(Error::RustError("crafting queue is full".into()));
+                    }
+
+                    if let Some(last_entry) = queue.pending.last_mut() {
+                        if last_entry.recipe == recipe_id {
+                            last_entry.count = last_entry
+                                .count
+                                .checked_add(queue_payload.count)
+                                .ok_or_else(|| Error::RustError("crafting queue is full".into()))?;
+                        } else {
+                            if queue.pending.len() >= MAX_CRAFT_QUEUE_ENTRIES_PER_PLAYER {
+                                return Err(Error::RustError("crafting queue is full".into()));
+                            }
+                            queue.pending.push(RuntimeCraftQueueEntry {
+                                recipe: recipe_id,
+                                count: queue_payload.count,
+                            });
+                        }
+                    } else {
+                        queue.pending.push(RuntimeCraftQueueEntry {
+                            recipe: recipe_id,
+                            count: queue_payload.count,
+                        });
+                    }
+                }
+
+                self.dirty_crafting.set(true);
+                self.snapshot_dirty.set(true);
+                Ok(true)
             }
             "cancel" => {
                 let payload =
@@ -3100,10 +3339,57 @@ impl RoomDurableObject {
                         return Err(Error::RustError("invalid crafting recipe id".into()));
                     }
                 }
+                let recipe_to_cancel = if clear_requested {
+                    None
+                } else {
+                    let recipe = cancel_payload.recipe.as_deref().ok_or_else(|| {
+                        Error::RustError("invalid crafting cancel payload".into())
+                    })?;
+                    let kind = recipe_kind_from_id(recipe)
+                        .ok_or_else(|| Error::RustError("unknown crafting recipe".into()))?;
+                    Some(recipe_id_from_kind(kind).to_string())
+                };
 
-                Err(Error::RustError(
-                    "crafting commands are not implemented".into(),
-                ))
+                let changed = {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let Some(mut queue) = runtime.craft_queues.remove(player_id) else {
+                        return Ok(false);
+                    };
+
+                    let mut changed = false;
+                    if clear_requested {
+                        if !queue.pending.is_empty() || queue.active.is_some() {
+                            queue.pending.clear();
+                            queue.active = None;
+                            changed = true;
+                        }
+                    } else if let Some(recipe_id) = recipe_to_cancel.as_deref() {
+                        let pending_before = queue.pending.len();
+                        queue.pending.retain(|entry| entry.recipe != recipe_id);
+                        if queue.pending.len() != pending_before {
+                            changed = true;
+                        }
+                        if queue
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.recipe == recipe_id)
+                        {
+                            queue.active = None;
+                            changed = true;
+                        }
+                    }
+
+                    if !queue.is_empty() {
+                        runtime.craft_queues.insert(player_id.to_string(), queue);
+                    }
+                    changed
+                };
+
+                if changed {
+                    self.dirty_crafting.set(true);
+                    self.snapshot_dirty.set(true);
+                }
+                Ok(changed)
             }
             _ => Err(Error::RustError("invalid crafting action".into())),
         }
@@ -3236,14 +3522,21 @@ impl RoomDurableObject {
             let movement_changed = self.tick_movement(&connected_players)?;
             let projectile_changed = self.tick_projectiles()?;
             let mining_changed = self.tick_mining()?;
+            let crafting_result = self.tick_crafting()?;
 
-            if movement_changed || projectile_changed || mining_changed {
+            if movement_changed || projectile_changed || mining_changed || crafting_result.changed {
                 self.snapshot_dirty.set(true);
                 if projectile_changed {
                     self.dirty_projectiles.set(true);
                 }
                 if mining_changed {
                     self.dirty_mining.set(true);
+                    self.dirty_inventory.set(true);
+                }
+                if crafting_result.changed {
+                    self.dirty_crafting.set(true);
+                }
+                if crafting_result.inventory_changed {
                     self.dirty_inventory.set(true);
                 }
             }
@@ -3256,6 +3549,7 @@ impl RoomDurableObject {
                 self.dirty_projectiles.set(false);
                 self.dirty_inventory.set(false);
                 self.dirty_mining.set(false);
+                self.dirty_crafting.set(false);
             }
 
             self.checkpoint_runtime_if_due()?;
@@ -3494,6 +3788,58 @@ impl RoomDurableObject {
         Ok(changed)
     }
 
+    fn tick_crafting(&self) -> Result<CraftingTickResult> {
+        let mut result = CraftingTickResult::default();
+        let mut inventory_players_to_persist: HashSet<String> = HashSet::new();
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            if runtime.craft_queues.is_empty() {
+                return Ok(result);
+            }
+
+            let players: Vec<String> = runtime.craft_queues.keys().cloned().collect();
+            for player_id in players {
+                let Some(mut queue) = runtime.craft_queues.remove(player_id.as_str()) else {
+                    continue;
+                };
+
+                let connected = runtime
+                    .players
+                    .get(player_id.as_str())
+                    .is_some_and(|player| player.connected);
+                if !connected {
+                    result.changed = true;
+                    continue;
+                }
+
+                let inventory = runtime
+                    .inventories
+                    .entry(player_id.clone())
+                    .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                let player_result = advance_crafting_queue(inventory, &mut queue);
+
+                if player_result.inventory_changed {
+                    inventory_players_to_persist.insert(player_id.clone());
+                }
+                result.changed |= player_result.changed;
+                result.inventory_changed |= player_result.inventory_changed;
+
+                if !queue.is_empty() {
+                    runtime.craft_queues.insert(player_id, queue);
+                } else if player_result.changed {
+                    result.changed = true;
+                }
+            }
+        }
+
+        for player_id in inventory_players_to_persist.iter() {
+            self.persist_inventory_for_player(player_id.as_str())?;
+        }
+
+        Ok(result)
+    }
+
     fn snapshot_payload(&self, full: bool) -> Result<Value> {
         let connected_players = self.connected_player_ids();
         let connected_set: HashSet<&str> = connected_players.iter().map(String::as_str).collect();
@@ -3691,13 +4037,58 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let mut crafting_queue_rows: Vec<(&String, &RuntimeCraftQueueState)> = runtime
+            .craft_queues
+            .iter()
+            .filter(|(player_id, queue)| {
+                connected_set.contains(player_id.as_str())
+                    && (!queue.pending.is_empty() || queue.active.is_some())
+            })
+            .collect();
+        crafting_queue_rows.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+        let crafting_queue_count = crafting_queue_rows.len();
+        if crafting_queue_rows.len() > MAX_CRAFT_QUEUES_PER_SNAPSHOT {
+            crafting_queue_rows.truncate(MAX_CRAFT_QUEUES_PER_SNAPSHOT);
+        }
+
+        let crafting_queues: Vec<Value> = crafting_queue_rows
+            .iter()
+            .map(|(player_id, queue)| {
+                let pending: Vec<Value> = queue
+                    .pending
+                    .iter()
+                    .filter(|entry| entry.count > 0)
+                    .take(MAX_CRAFT_PENDING_ENTRIES_PER_SNAPSHOT_QUEUE)
+                    .map(|entry| {
+                        json!({
+                            "recipe": entry.recipe,
+                            "count": entry.count,
+                        })
+                    })
+                    .collect();
+
+                let active = queue.active.as_ref().map_or(Value::Null, |active| {
+                    json!({
+                        "recipe": active.recipe,
+                        "remainingTicks": active.remaining_ticks.max(1),
+                    })
+                });
+
+                json!({
+                    "playerId": *player_id,
+                    "pending": pending,
+                    "active": active,
+                })
+            })
+            .collect();
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
         let include_inventory = full || self.dirty_inventory.get();
         let include_mining =
             full || self.dirty_mining.get() || mining_discovered || !mining_active.is_empty();
-        let include_crafting = full;
+        let include_crafting = full || self.dirty_crafting.get();
         let include_combat = full;
         let include_character = full || self.dirty_presence.get();
         let mut features = JsonMap::new();
@@ -3783,8 +4174,8 @@ impl RoomDurableObject {
                 "crafting".to_string(),
                 json!({
                     "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
-                    "queues": [],
-                    "queueCount": 0,
+                    "queues": crafting_queues,
+                    "queueCount": crafting_queue_count,
                 }),
             );
         }
@@ -3990,6 +4381,7 @@ impl DurableObject for RoomDurableObject {
             dirty_projectiles: Cell::new(false),
             dirty_inventory: Cell::new(false),
             dirty_mining: Cell::new(false),
+            dirty_crafting: Cell::new(false),
             terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
         };
@@ -4129,6 +4521,7 @@ impl DurableObject for RoomDurableObject {
                     self.dirty_projectiles.set(false);
                     self.dirty_inventory.set(false);
                     self.dirty_mining.set(false);
+                    self.dirty_crafting.set(false);
                 }
             }
             Err(error) => {
@@ -4179,6 +4572,10 @@ mod tests {
             .get(slot)
             .and_then(|stack| stack.as_ref())
             .map(|stack| (stack.resource.clone(), stack.amount))
+    }
+
+    fn resource_total(inventory: &RuntimeInventoryState, resource: &str) -> u32 {
+        inventory.total_resource_amount(resource)
     }
 
     #[test]
@@ -4266,5 +4663,73 @@ mod tests {
         assert_eq!(mining_progress_ratio(&progress, 0), 0.0);
         assert!((mining_progress_ratio(&progress, 1_500) - 0.5).abs() < f32::EPSILON);
         assert_eq!(mining_progress_ratio(&progress, 3_000), 1.0);
+    }
+
+    #[test]
+    fn crafting_tick_requires_input_resources_before_starting() {
+        let mut inventory = RuntimeInventoryState::new(4);
+        let mut queue = RuntimeCraftQueueState {
+            pending: vec![RuntimeCraftQueueEntry {
+                recipe: "craft_gear".to_string(),
+                count: 1,
+            }],
+            active: None,
+        };
+
+        let tick_result = advance_crafting_queue(&mut inventory, &mut queue);
+        assert!(!tick_result.changed);
+        assert!(!tick_result.inventory_changed);
+        assert_eq!(queue.pending_total_count(), 1);
+        assert!(queue.active.is_none());
+    }
+
+    #[test]
+    fn crafting_tick_supports_repeated_queue_and_outputs_inventory() {
+        let mut inventory = RuntimeInventoryState::new(8);
+        inventory.add_resource("iron_ore", 2).expect("seed ore");
+
+        let mut queue = RuntimeCraftQueueState {
+            pending: vec![RuntimeCraftQueueEntry {
+                recipe: "smelt_iron_plate".to_string(),
+                count: 2,
+            }],
+            active: None,
+        };
+
+        let tick_1 = advance_crafting_queue(&mut inventory, &mut queue);
+        assert!(tick_1.changed);
+        assert!(tick_1.inventory_changed);
+        assert_eq!(resource_total(&inventory, "iron_ore"), 1);
+        assert_eq!(queue.pending_total_count(), 1);
+        assert!(queue.active.is_some());
+
+        let tick_2 = advance_crafting_queue(&mut inventory, &mut queue);
+        assert!(tick_2.changed);
+        assert!(tick_2.inventory_changed);
+        assert_eq!(resource_total(&inventory, "iron_plate"), 1);
+        assert!(queue.active.is_none());
+        assert_eq!(queue.pending_total_count(), 1);
+
+        let tick_3 = advance_crafting_queue(&mut inventory, &mut queue);
+        assert!(tick_3.changed);
+        assert!(tick_3.inventory_changed);
+        assert_eq!(resource_total(&inventory, "iron_ore"), 0);
+        assert!(queue.active.is_some());
+
+        let tick_4 = advance_crafting_queue(&mut inventory, &mut queue);
+        assert!(tick_4.changed);
+        assert!(tick_4.inventory_changed);
+        assert_eq!(resource_total(&inventory, "iron_plate"), 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn crafting_recipe_ids_map_to_supported_domain_recipes() {
+        for recipe_id in ["smelt_iron_plate", "smelt_copper_plate", "craft_gear"] {
+            let recipe = recipe_kind_from_id(recipe_id).expect("recipe should be supported");
+            assert_eq!(recipe_id_from_kind(recipe), recipe_id);
+        }
+
+        assert!(recipe_kind_from_id("unknown_recipe").is_none());
     }
 }
