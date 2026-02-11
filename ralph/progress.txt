@@ -41,3 +41,11 @@ Format per entry:
 - files: src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: a1357eb
+
+- timestamp: 2026-02-11
+- item: RL-003
+- summary: Added durable character profile persistence keyed by user/character id with active profile selection and server snapshot integration.
+- decisions: Store profiles in `character_profiles(user_id, character_id)` and active selection in `active_character_profiles(user_id)`; implement `character.set_profile` upsert + `character.set_active`; backfill legacy `presence_players` into default profiles on schema init and document migration behavior in architecture docs.
+- files: worker/src/lib.rs, docs/networking-architecture.md, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: pending

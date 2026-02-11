@@ -62,7 +62,7 @@
         "Supports character name + sprite reference",
         "Migration-safe initialization and backfill behavior documented"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-004",

@@ -47,6 +47,7 @@ const MAX_PREVIEWS: usize = 256;
 const ROOM_META_ROOM_CODE_KEY: &str = "room_code";
 const ROOM_META_TERRAIN_SEED_KEY: &str = "terrain_seed";
 const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
+const DEFAULT_CHARACTER_PROFILE_ID: &str = "default";
 const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
 
@@ -209,8 +210,16 @@ struct CombatAttackPayload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CharacterMetadataPayload {
+    character_id: Option<String>,
     name: String,
     sprite_id: Option<String>,
+    set_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterSelectPayload {
+    character_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,6 +257,19 @@ struct SessionTokenRow {
     token: String,
     player_id: String,
     expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterProfileRow {
+    character_id: String,
+    name: String,
+    sprite_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterIdRow {
+    #[serde(rename = "character_id")]
+    _character_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +409,36 @@ fn sanitize_character_name(input: &str) -> Option<String> {
     }
 
     Some(candidate.to_string())
+}
+
+fn sanitize_character_id(input: &str) -> Option<String> {
+    let candidate = input.trim();
+    if !is_valid_protocol_identifier(candidate) {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn default_character_name_for_player(player_id: &str) -> String {
+    let trimmed = player_id.trim();
+    let mut display_name = String::new();
+    let mut count = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if count >= MAX_CHARACTER_NAME_LEN {
+            break;
+        }
+        display_name.push(ch);
+        count += 1;
+    }
+
+    if display_name.is_empty() {
+        "Player".to_string()
+    } else {
+        display_name
+    }
 }
 
 fn random_player_id() -> String {
@@ -865,6 +917,208 @@ impl RoomDurableObject {
         Ok(())
     }
 
+    fn backfill_character_profiles_from_presence(&self) -> Result<()> {
+        let now = now_ms();
+        let sql = self.sql();
+
+        sql.exec(
+            "
+            INSERT INTO character_profiles (user_id, character_id, name, sprite_id, created_at, updated_at)
+            SELECT p.player_id,
+                   ?,
+                   CASE
+                     WHEN LENGTH(TRIM(p.player_id)) = 0 THEN ?
+                     ELSE SUBSTR(TRIM(p.player_id), 1, ?)
+                   END,
+                   ?,
+                   ?,
+                   ?
+            FROM presence_players p
+            LEFT JOIN character_profiles cp
+              ON cp.user_id = p.player_id
+             AND cp.character_id = ?
+            WHERE cp.user_id IS NULL
+            ",
+            Some(vec![
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+                "Player".into(),
+                (MAX_CHARACTER_NAME_LEN as i64).into(),
+                DEFAULT_CHARACTER_SPRITE_ID.into(),
+                now.into(),
+                now.into(),
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+            ]),
+        )?;
+
+        sql.exec(
+            "
+            INSERT INTO active_character_profiles (user_id, character_id, updated_at)
+            SELECT cp.user_id, ?, ?
+            FROM character_profiles cp
+            LEFT JOIN active_character_profiles ap ON ap.user_id = cp.user_id
+            WHERE cp.character_id = ?
+              AND ap.user_id IS NULL
+            ",
+            Some(vec![
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+                now.into(),
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+            ]),
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure_default_character_profile(&self, user_id: &str) -> Result<()> {
+        let now = now_ms();
+        let default_name = default_character_name_for_player(user_id);
+        let sql = self.sql();
+
+        sql.exec(
+            "
+            INSERT INTO character_profiles (user_id, character_id, name, sprite_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, character_id) DO NOTHING
+            ",
+            Some(vec![
+                user_id.into(),
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+                default_name.into(),
+                DEFAULT_CHARACTER_SPRITE_ID.into(),
+                now.into(),
+                now.into(),
+            ]),
+        )?;
+
+        sql.exec(
+            "
+            INSERT INTO active_character_profiles (user_id, character_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            ",
+            Some(vec![
+                user_id.into(),
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+                now.into(),
+            ]),
+        )?;
+
+        Ok(())
+    }
+
+    fn upsert_character_profile(
+        &self,
+        user_id: &str,
+        character_id: &str,
+        name: &str,
+        sprite_id: &str,
+        set_active: bool,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.sql().exec(
+            "
+            INSERT INTO character_profiles (user_id, character_id, name, sprite_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, character_id) DO UPDATE SET
+              name = excluded.name,
+              sprite_id = excluded.sprite_id,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                user_id.into(),
+                character_id.into(),
+                name.into(),
+                sprite_id.into(),
+                now.into(),
+                now.into(),
+            ]),
+        )?;
+
+        if set_active {
+            self.set_active_character_profile(user_id, character_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn set_active_character_profile(&self, user_id: &str, character_id: &str) -> Result<()> {
+        let rows: Vec<CharacterIdRow> = self
+            .sql()
+            .exec(
+                "
+                SELECT character_id
+                FROM character_profiles
+                WHERE user_id = ? AND character_id = ?
+                LIMIT 1
+                ",
+                Some(vec![user_id.into(), character_id.into()]),
+            )?
+            .to_array()?;
+
+        if rows.is_empty() {
+            return Err(Error::RustError("character profile does not exist".into()));
+        }
+
+        let now = now_ms();
+        self.sql().exec(
+            "
+            INSERT INTO active_character_profiles (user_id, character_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              character_id = excluded.character_id,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![user_id.into(), character_id.into(), now.into()]),
+        )?;
+
+        Ok(())
+    }
+
+    fn load_active_character_profile(&self, user_id: &str) -> Result<CharacterProfileRow> {
+        let rows: Vec<CharacterProfileRow> = self
+            .sql()
+            .exec(
+                "
+                SELECT cp.character_id, cp.name, cp.sprite_id
+                FROM active_character_profiles ap
+                JOIN character_profiles cp
+                  ON cp.user_id = ap.user_id
+                 AND cp.character_id = ap.character_id
+                WHERE ap.user_id = ?
+                LIMIT 1
+                ",
+                Some(vec![user_id.into()]),
+            )?
+            .to_array()?;
+
+        if let Some(profile) = rows.into_iter().next() {
+            return Ok(profile);
+        }
+
+        // Repair missing/partial legacy rows by restoring a stable default profile.
+        self.ensure_default_character_profile(user_id)?;
+        self.sql().exec(
+            "
+            INSERT INTO active_character_profiles (user_id, character_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              character_id = excluded.character_id,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                user_id.into(),
+                DEFAULT_CHARACTER_PROFILE_ID.into(),
+                now_ms().into(),
+            ]),
+        )?;
+
+        Ok(CharacterProfileRow {
+            character_id: DEFAULT_CHARACTER_PROFILE_ID.to_string(),
+            name: default_character_name_for_player(user_id),
+            sprite_id: DEFAULT_CHARACTER_SPRITE_ID.to_string(),
+        })
+    }
+
     fn initialize_schema(&self) -> Result<()> {
         let sql = self.sql();
 
@@ -896,6 +1150,37 @@ impl RoomDurableObject {
               player_id TEXT PRIMARY KEY,
               connected INTEGER NOT NULL DEFAULT 0,
               last_seen INTEGER NOT NULL
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "
+            CREATE TABLE IF NOT EXISTS character_profiles (
+              user_id TEXT NOT NULL,
+              character_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              sprite_id TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY(user_id, character_id)
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_character_profiles_user ON character_profiles(user_id)",
+            None,
+        )?;
+
+        sql.exec(
+            "
+            CREATE TABLE IF NOT EXISTS active_character_profiles (
+              user_id TEXT PRIMARY KEY,
+              character_id TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
             )
             ",
             None,
@@ -1046,6 +1331,8 @@ impl RoomDurableObject {
             "DELETE FROM session_tokens WHERE expires_at < ?",
             Some(vec![now_ms().into()]),
         )?;
+
+        self.backfill_character_profiles_from_presence()?;
 
         Ok(())
     }
@@ -1283,6 +1570,8 @@ impl RoomDurableObject {
             ",
             Some(vec![player_id.into(), now.into()]),
         )?;
+
+        self.ensure_default_character_profile(player_id)?;
 
         {
             let mut runtime = self.runtime.borrow_mut();
@@ -1898,20 +2187,47 @@ impl RoomDurableObject {
                     payload.ok_or_else(|| Error::RustError("missing character payload".into()))?;
                 let profile_payload: CharacterMetadataPayload = serde_json::from_value(payload)
                     .map_err(|_| Error::RustError("invalid character payload".into()))?;
+                let name = sanitize_character_name(profile_payload.name.as_str())
+                    .ok_or_else(|| Error::RustError("invalid character name".into()))?;
+                let character_id = match profile_payload.character_id.as_deref() {
+                    Some(raw_character_id) => sanitize_character_id(raw_character_id)
+                        .ok_or_else(|| Error::RustError("invalid character id".into()))?,
+                    None => DEFAULT_CHARACTER_PROFILE_ID.to_string(),
+                };
+                let sprite_id = profile_payload
+                    .sprite_id
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
 
-                if sanitize_character_name(profile_payload.name.as_str()).is_none() {
-                    return Err(Error::RustError("invalid character name".into()));
+                if !is_valid_protocol_identifier(sprite_id) {
+                    return Err(Error::RustError("invalid character sprite id".into()));
                 }
 
-                if let Some(sprite_id) = profile_payload.sprite_id.as_deref() {
-                    if !is_valid_protocol_identifier(sprite_id) {
-                        return Err(Error::RustError("invalid character sprite id".into()));
-                    }
-                }
+                self.upsert_character_profile(
+                    player_id,
+                    character_id.as_str(),
+                    name.as_str(),
+                    sprite_id,
+                    profile_payload.set_active.unwrap_or(true),
+                )?;
+                self.snapshot_dirty.set(true);
+                self.dirty_presence.set(true);
+                Ok(true)
+            }
+            "set_active" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing character payload".into()))?;
+                let select_payload: CharacterSelectPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid character payload".into()))?;
+                let character_id = sanitize_character_id(select_payload.character_id.as_str())
+                    .ok_or_else(|| Error::RustError("invalid character id".into()))?;
 
-                Err(Error::RustError(
-                    "character metadata commands are not implemented".into(),
-                ))
+                self.ensure_default_character_profile(player_id)?;
+                self.set_active_character_profile(player_id, character_id.as_str())?;
+                self.snapshot_dirty.set(true);
+                self.dirty_presence.set(true);
+                Ok(true)
             }
             _ => Err(Error::RustError("invalid character action".into())),
         }
@@ -2151,16 +2467,16 @@ impl RoomDurableObject {
             })
             .collect();
 
-        let character_profiles: Vec<Value> = connected_players
-            .iter()
-            .map(|player_id| {
-                json!({
-                    "playerId": player_id,
-                    "name": player_id,
-                    "spriteId": DEFAULT_CHARACTER_SPRITE_ID,
-                })
-            })
-            .collect();
+        let mut character_profiles = Vec::with_capacity(connected_players.len());
+        for player_id in connected_players.iter() {
+            let profile = self.load_active_character_profile(player_id)?;
+            character_profiles.push(json!({
+                "playerId": player_id,
+                "characterId": profile.character_id,
+                "name": profile.name,
+                "spriteId": profile.sprite_id,
+            }));
+        }
 
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();

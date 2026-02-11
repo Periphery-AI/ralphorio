@@ -72,11 +72,19 @@ File: `worker/src/lib.rs`
   - room metadata
   - structures
   - player checkpoints (position, velocity, input, presence)
+  - character profiles (`character_profiles`) keyed by `(user_id, character_id)`
+  - active character selection (`active_character_profiles`) keyed by `user_id`
   - resumable session tokens
 - **Ephemeral (in-memory):**
   - build previews
   - active projectiles
   - high-frequency simulation state
+
+### Character Profile Migration/Backfill
+
+- Schema initialization creates `character_profiles` and `active_character_profiles` with `CREATE TABLE IF NOT EXISTS`, so deploys are idempotent.
+- On startup, legacy users discovered in `presence_players` are backfilled into `character_profiles` with the default character id (`default`), preserving migration safety for existing rooms.
+- Missing active selections are backfilled to `default`, and snapshot assembly repairs partial/corrupt rows by recreating/selecting a valid default profile.
 
 ## Identity / Auth
 
