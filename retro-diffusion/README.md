@@ -14,7 +14,7 @@ You can also override it at runtime:
 RD_API_KEY=your_key_here node retro-diffusion/generate-character.mjs
 ```
 
-## Generate a character spritesheet
+## Generate a single character spritesheet
 
 Default command:
 
@@ -26,6 +26,34 @@ This generates:
 
 - `public/sprites/factorio-character-sheet.png`
 - `public/sprites/factorio-character-sheet.png.json` (prompt/seed/credits metadata)
+
+## Generate the selectable 3-variant sprite set
+
+Use the curated preset generator:
+
+```bash
+node retro-diffusion/generate-character-set.mjs
+```
+
+This regenerates:
+
+- `public/sprites/character-engineer-default.png`
+- `public/sprites/character-surveyor-cyan.png`
+- `public/sprites/character-machinist-rose.png`
+- each `*.png.json` metadata file
+- `public/sprites/character-sprites.json` manifest
+
+Generate one preset only:
+
+```bash
+node retro-diffusion/generate-character-set.mjs --only surveyor-cyan
+```
+
+Check cost for the preset workflow without writing assets:
+
+```bash
+node retro-diffusion/generate-character-set.mjs --check-cost
+```
 
 ## Useful options
 
@@ -62,10 +90,11 @@ node retro-diffusion/generate-character.mjs --check-cost
 
 ## Integration target
 
-The game client expects the generated spritesheet at:
+The curated multiplayer character set is consumed by:
 
-- `public/sprites/factorio-character-sheet.png`
+- `src/game/character-sprites.ts` (web selector metadata)
+- `worker/src/lib.rs` (allowed sprite id validation)
+- `game-client/src/lib.rs` (WASM sprite atlas mapping)
 
-If you generate to a different file, update the path in:
-
-- `game-client/src/lib.rs`
+When adding/replacing variants, keep sprite ids and paths consistent across those files and
+regenerate `public/sprites/character-sprites.json`.

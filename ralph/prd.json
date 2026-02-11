@@ -84,7 +84,7 @@
         "Sprite metadata integrated into runtime selection",
         "Asset pipeline instructions captured for future regeneration"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-006",

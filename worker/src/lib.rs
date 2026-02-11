@@ -47,6 +47,8 @@ const MAX_PREVIEWS: usize = 256;
 const ROOM_META_ROOM_CODE_KEY: &str = "room_code";
 const ROOM_META_TERRAIN_SEED_KEY: &str = "terrain_seed";
 const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
+const SUPPORTED_CHARACTER_SPRITE_IDS: [&str; 3] =
+    ["engineer-default", "surveyor-cyan", "machinist-rose"];
 const DEFAULT_CHARACTER_PROFILE_ID: &str = "default";
 const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
@@ -439,6 +441,12 @@ fn sanitize_character_id(input: &str) -> Option<String> {
         return None;
     }
     Some(candidate.to_string())
+}
+
+fn is_supported_character_sprite_id(sprite_id: &str) -> bool {
+    SUPPORTED_CHARACTER_SPRITE_IDS
+        .iter()
+        .any(|supported| supported == &sprite_id)
 }
 
 fn default_character_name_for_player(player_id: &str) -> String {
@@ -1229,6 +1237,7 @@ impl RoomDurableObject {
             if sprite_id.is_empty()
                 || sprite_id.len() > MAX_PROTOCOL_IDENTIFIER_LEN
                 || !is_valid_protocol_identifier(sprite_id.as_str())
+                || !is_supported_character_sprite_id(sprite_id.as_str())
             {
                 return Err(Error::RustError("invalid character sprite id".into()));
             }
@@ -2381,6 +2390,9 @@ impl RoomDurableObject {
                     .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
 
                 if !is_valid_protocol_identifier(sprite_id) {
+                    return Err(Error::RustError("invalid character sprite id".into()));
+                }
+                if !is_supported_character_sprite_id(sprite_id) {
                     return Err(Error::RustError("invalid character sprite id".into()));
                 }
 

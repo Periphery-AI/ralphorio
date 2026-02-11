@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "defaultSpriteId": "engineer-default",
+  "sprites": [
+    {
+      "id": "engineer-default",
+      "label": "Engineer",
+      "description": "Balanced starter silhouette with high-contrast orange jacket.",
+      "sheetPath": "/sprites/character-engineer-default.png",
+      "metadataPath": "/sprites/character-engineer-default.png.json",
+      "previewFrame": { "x": 0, "y": 96 }
+    },
+    {
+      "id": "surveyor-cyan",
+      "label": "Surveyor",
+      "description": "Cool-toned scout kit with cyan highlights for quick readability.",
+      "sheetPath": "/sprites/character-surveyor-cyan.png",
+      "metadataPath": "/sprites/character-surveyor-cyan.png.json",
+      "previewFrame": { "x": 0, "y": 96 }
+    },
+    {
+      "id": "machinist-rose",
+      "label": "Machinist",
+      "description": "Darker workwear palette with brass accents and heavier profile.",
+      "sheetPath": "/sprites/character-machinist-rose.png",
+      "metadataPath": "/sprites/character-machinist-rose.png.json",
+      "previewFrame": { "x": 0, "y": 96 }
+    }
+  ]
+}

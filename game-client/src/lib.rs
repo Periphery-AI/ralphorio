@@ -19,6 +19,12 @@ const CHARACTER_FRAME_SIZE: f32 = 48.0;
 const CHARACTER_ANIMATION_FPS: f32 = 12.0;
 const CHARACTER_ANIMATION_FRAMES: usize = 4;
 const CHARACTER_SCALE: f32 = 1.75;
+const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
+const CHARACTER_SPRITE_VARIANTS: [(&str, &str); 3] = [
+    ("engineer-default", "sprites/character-engineer-default.png"),
+    ("surveyor-cyan", "sprites/character-surveyor-cyan.png"),
+    ("machinist-rose", "sprites/character-machinist-rose.png"),
+];
 const FOOTSTEP_TRIGGER_SPEED: f32 = 18.0;
 const FOOTSTEP_INTERVAL_SECONDS: f32 = 0.30;
 const FOOTSTEP_BASE_VOLUME: f32 = 0.52;
@@ -110,6 +116,19 @@ struct TerrainSnapshotState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct CharacterProfileSnapshotState {
+    #[serde(rename = "playerId")]
+    player_id: String,
+    #[serde(rename = "spriteId")]
+    sprite_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CharacterSnapshotState {
+    players: Vec<CharacterProfileSnapshotState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotPayload {
     #[serde(rename = "serverTick")]
     server_tick: u32,
@@ -128,6 +147,8 @@ struct SnapshotPayload {
     projectiles: Vec<ProjectileState>,
     #[serde(default)]
     terrain: Option<TerrainSnapshotState>,
+    #[serde(default)]
+    character: Option<CharacterSnapshotState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +194,9 @@ struct LocalActor;
 
 #[derive(Component)]
 struct RemoteActor;
+
+#[derive(Component)]
+struct CharacterSpriteId(String);
 
 #[derive(Component)]
 struct RemoteTarget(Vec2);
@@ -261,10 +285,32 @@ impl Default for CharacterAnimator {
     }
 }
 
-#[derive(Resource, Clone)]
-struct CharacterAtlasHandles {
+#[derive(Clone)]
+struct CharacterAtlasHandle {
     texture: Handle<Image>,
     layout: Handle<TextureAtlasLayout>,
+}
+
+#[derive(Resource, Clone)]
+struct CharacterAtlasHandles {
+    default_sprite_id: String,
+    by_sprite_id: HashMap<String, CharacterAtlasHandle>,
+}
+
+impl CharacterAtlasHandles {
+    fn resolve(&self, sprite_id: &str) -> (CharacterAtlasHandle, String) {
+        if let Some(entry) = self.by_sprite_id.get(sprite_id) {
+            return (entry.clone(), sprite_id.to_string());
+        }
+
+        let fallback_id = self.default_sprite_id.clone();
+        let fallback = self
+            .by_sprite_id
+            .get(fallback_id.as_str())
+            .expect("default character sprite atlas missing")
+            .clone();
+        (fallback, fallback_id)
+    }
 }
 
 #[derive(Resource, Clone)]
@@ -419,23 +465,32 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
                 .set(ImagePlugin::default_nearest()),
         )
         .add_systems(Startup, setup_world)
+        .add_systems(Update, apply_pending_session_reset)
+        .add_systems(Update, sync_player_id.after(apply_pending_session_reset))
+        .add_systems(Update, simulate_local_player.after(sync_player_id))
+        .add_systems(Update, emit_footstep_audio.after(simulate_local_player))
         .add_systems(
             Update,
-            (
-                apply_pending_session_reset,
-                sync_player_id,
-                simulate_local_player,
-                emit_footstep_audio,
-                handle_build_placement_controls,
-                emit_projectile_fire_command,
-                simulate_predicted_projectiles,
-                apply_latest_snapshot,
-                smooth_remote_motion,
-                animate_character_sprites,
-                follow_camera,
-            )
-                .chain(),
-        );
+            handle_build_placement_controls.after(emit_footstep_audio),
+        )
+        .add_systems(
+            Update,
+            emit_projectile_fire_command.after(handle_build_placement_controls),
+        )
+        .add_systems(
+            Update,
+            simulate_predicted_projectiles.after(emit_projectile_fire_command),
+        )
+        .add_systems(
+            Update,
+            apply_latest_snapshot.after(simulate_predicted_projectiles),
+        )
+        .add_systems(Update, smooth_remote_motion.after(apply_latest_snapshot))
+        .add_systems(
+            Update,
+            animate_character_sprites.after(smooth_remote_motion),
+        )
+        .add_systems(Update, follow_camera.after(animate_character_sprites));
     app.add_systems(Update, sync_terrain_tiles.after(apply_latest_snapshot));
 
     app.run();
@@ -504,6 +559,35 @@ pub fn drain_feature_commands() -> String {
     serde_json::to_string(&drained).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn build_character_atlas_handles(
+    asset_server: &AssetServer,
+    atlas_layouts: &mut Assets<TextureAtlasLayout>,
+) -> CharacterAtlasHandles {
+    let layout = atlas_layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(CHARACTER_FRAME_SIZE as u32),
+        CHARACTER_ANIMATION_FRAMES as u32,
+        4,
+        None,
+        None,
+    ));
+
+    let mut by_sprite_id = HashMap::new();
+    for (sprite_id, texture_path) in CHARACTER_SPRITE_VARIANTS {
+        by_sprite_id.insert(
+            sprite_id.to_string(),
+            CharacterAtlasHandle {
+                texture: asset_server.load(texture_path),
+                layout: layout.clone(),
+            },
+        );
+    }
+
+    CharacterAtlasHandles {
+        default_sprite_id: DEFAULT_CHARACTER_SPRITE_ID.to_string(),
+        by_sprite_id,
+    }
+}
+
 fn setup_world(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -519,35 +603,30 @@ fn setup_world(
 
     commands.spawn(Camera2dBundle::default());
 
-    let texture = asset_server.load("sprites/factorio-character-sheet.png");
-    let layout = atlas_layouts.add(TextureAtlasLayout::from_grid(
-        UVec2::splat(CHARACTER_FRAME_SIZE as u32),
-        CHARACTER_ANIMATION_FRAMES as u32,
-        4,
-        None,
-        None,
-    ));
-
-    commands.insert_resource(CharacterAtlasHandles {
-        texture: texture.clone(),
-        layout: layout.clone(),
-    });
+    let atlas_handles = build_character_atlas_handles(&asset_server, &mut atlas_layouts);
+    let (default_atlas, resolved_sprite_id) = atlas_handles.resolve(DEFAULT_CHARACTER_SPRITE_ID);
 
     commands.spawn((
         SpriteBundle {
-            texture,
+            texture: default_atlas.texture.clone(),
             transform: Transform::from_xyz(0.0, 0.0, SNAPSHOT_Z)
                 .with_scale(Vec3::splat(CHARACTER_SCALE)),
             ..default()
         },
-        TextureAtlas { layout, index: 0 },
+        TextureAtlas {
+            layout: default_atlas.layout.clone(),
+            index: 0,
+        },
         Actor {
             id: "local-pending".to_string(),
         },
         ActorVelocity::default(),
         CharacterAnimator::default(),
+        CharacterSpriteId(resolved_sprite_id),
         LocalActor,
     ));
+
+    commands.insert_resource(atlas_handles);
 
     commands.spawn((
         SpriteBundle {
@@ -580,6 +659,7 @@ fn apply_pending_session_reset(
             &mut ActorVelocity,
             &mut CharacterAnimator,
             &mut TextureAtlas,
+            &mut CharacterSpriteId,
         ),
         (With<LocalActor>, Without<LocalBuildGhost>),
     >,
@@ -609,7 +689,7 @@ fn apply_pending_session_reset(
     terrain_state.needs_refresh = true;
     *footstep_state = FootstepState::default();
 
-    if let Ok((mut transform, mut actor, mut velocity, mut animator, mut atlas)) =
+    if let Ok((mut transform, mut actor, mut velocity, mut animator, mut atlas, mut sprite_id)) =
         local_query.get_single_mut()
     {
         transform.translation.x = 0.0;
@@ -620,6 +700,7 @@ fn apply_pending_session_reset(
         animator.frame = 0;
         animator.timer.reset();
         atlas.index = FacingDirection::Down.row_index() * CHARACTER_ANIMATION_FRAMES;
+        sprite_id.0 = DEFAULT_CHARACTER_SPRITE_ID.to_string();
     }
 
     if let Ok((mut visibility, mut transform)) = local_build_ghost_query.get_single_mut() {
@@ -1099,8 +1180,25 @@ fn apply_latest_snapshot(
     current_player_id: Res<CurrentPlayerId>,
     mut terrain_state: ResMut<TerrainRenderState>,
     mut input_history: ResMut<InputHistory>,
-    mut local_query: Query<(&mut Transform, &mut Actor), (With<LocalActor>, Without<RemoteActor>)>,
+    mut local_query: Query<
+        (
+            &mut Transform,
+            &mut Actor,
+            &mut Handle<Image>,
+            &mut TextureAtlas,
+            &mut CharacterSpriteId,
+        ),
+        (With<LocalActor>, Without<RemoteActor>),
+    >,
     remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
+    mut remote_sprite_query: Query<
+        (
+            &mut Handle<Image>,
+            &mut TextureAtlas,
+            &mut CharacterSpriteId,
+        ),
+        With<RemoteActor>,
+    >,
     structure_query: Query<(Entity, &StructureActor)>,
     preview_query: Query<(Entity, &BuildPreviewActor)>,
     projectile_query: Query<(Entity, &ProjectileActor)>,
@@ -1131,8 +1229,19 @@ fn apply_latest_snapshot(
         previews,
         projectiles,
         terrain,
+        character,
         ..
     } = snapshot;
+
+    let character_sprite_by_player: HashMap<String, String> = character
+        .map(|snapshot| {
+            snapshot
+                .players
+                .into_iter()
+                .map(|profile| (profile.player_id, profile.sprite_id))
+                .collect()
+        })
+        .unwrap_or_default();
 
     if let Some(terrain) = terrain {
         if let Ok(seed) = terrain.seed.parse::<u64>() {
@@ -1173,7 +1282,14 @@ fn apply_latest_snapshot(
             .is_some_and(|player_id| player_id == player.id);
 
         if is_local {
-            if let Ok((mut local_transform, mut local_actor)) = local_query.get_single_mut() {
+            if let Ok((
+                mut local_transform,
+                mut local_actor,
+                mut local_texture,
+                mut local_atlas,
+                mut local_sprite_id,
+            )) = local_query.get_single_mut()
+            {
                 local_actor.id = player.id.clone();
                 reconcile_local_transform(
                     &mut local_transform,
@@ -1181,6 +1297,17 @@ fn apply_latest_snapshot(
                     local_ack_seq,
                     &mut input_history,
                     &structure_obstacles,
+                );
+                let desired_sprite_id = character_sprite_by_player
+                    .get(player.id.as_str())
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
+                apply_character_sprite_to_actor(
+                    &mut local_texture,
+                    &mut local_atlas,
+                    &mut local_sprite_id,
+                    desired_sprite_id,
+                    &character_atlas,
                 );
             }
 
@@ -1196,8 +1323,27 @@ fn apply_latest_snapshot(
                 .entity(entity)
                 .insert(RemoteTarget(Vec2::new(player.x, player.y)))
                 .insert(ActorVelocity(Vec2::new(player.vx, player.vy)));
+            if let Ok((mut remote_texture, mut remote_atlas, mut remote_sprite_id)) =
+                remote_sprite_query.get_mut(entity)
+            {
+                let desired_sprite_id = character_sprite_by_player
+                    .get(player.id.as_str())
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
+                apply_character_sprite_to_actor(
+                    &mut remote_texture,
+                    &mut remote_atlas,
+                    &mut remote_sprite_id,
+                    desired_sprite_id,
+                    &character_atlas,
+                );
+            }
         } else {
-            spawn_remote_actor(&mut commands, &player, &character_atlas);
+            let desired_sprite_id = character_sprite_by_player
+                .get(player.id.as_str())
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
+            spawn_remote_actor(&mut commands, &player, desired_sprite_id, &character_atlas);
         }
     }
 
@@ -1570,20 +1716,40 @@ fn sync_terrain_tiles(
     terrain_state.needs_refresh = false;
 }
 
+fn apply_character_sprite_to_actor(
+    texture: &mut Handle<Image>,
+    atlas: &mut TextureAtlas,
+    sprite_component: &mut CharacterSpriteId,
+    desired_sprite_id: &str,
+    character_atlas: &CharacterAtlasHandles,
+) {
+    let (resolved, resolved_sprite_id) = character_atlas.resolve(desired_sprite_id);
+    if sprite_component.0 == resolved_sprite_id {
+        return;
+    }
+
+    *texture = resolved.texture.clone();
+    atlas.layout = resolved.layout.clone();
+    sprite_component.0 = resolved_sprite_id;
+}
+
 fn spawn_remote_actor(
     commands: &mut Commands,
     player: &PlayerState,
+    sprite_id: &str,
     character_atlas: &CharacterAtlasHandles,
 ) {
+    let (atlas_handles, resolved_sprite_id) = character_atlas.resolve(sprite_id);
+
     commands.spawn((
         SpriteBundle {
-            texture: character_atlas.texture.clone(),
+            texture: atlas_handles.texture.clone(),
             transform: Transform::from_xyz(player.x, player.y, SNAPSHOT_Z)
                 .with_scale(Vec3::splat(CHARACTER_SCALE)),
             ..default()
         },
         TextureAtlas {
-            layout: character_atlas.layout.clone(),
+            layout: atlas_handles.layout.clone(),
             index: 0,
         },
         Actor {
@@ -1591,6 +1757,7 @@ fn spawn_remote_actor(
         },
         ActorVelocity(Vec2::new(player.vx, player.vy)),
         CharacterAnimator::default(),
+        CharacterSpriteId(resolved_sprite_id),
         RemoteActor,
         RemoteTarget(Vec2::new(player.x, player.y)),
     ));

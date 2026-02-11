@@ -100,10 +100,16 @@ npm run build
 
 ## Character Sprite Generation (Retro Diffusion)
 
-Generate/update the animated player spritesheet:
+Generate/update one animated player spritesheet:
 
 ```bash
 npm run sprite:generate
+```
+
+Regenerate the full 3-variant selectable character set + manifest:
+
+```bash
+npm run sprite:generate:set
 ```
 
 Pipeline docs and API key location:

@@ -57,3 +57,11 @@ Format per entry:
 - files: worker/src/lib.rs, src/game/character-profiles.ts, src/routes/connect-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: 66812ec
+
+- timestamp: 2026-02-11
+- item: RL-005
+- summary: Added a 3-variant Retro Diffusion character sprite set, wired selector metadata/UI, enforced server-side sprite id allow-listing, and applied per-player sprite selection in WASM runtime rendering.
+- decisions: Standardize on sprite ids (`engineer-default`, `surveyor-cyan`, `machinist-rose`) across web/worker/WASM; preserve fallback safety by normalizing unknown ids to default on client and rejecting unsupported ids on worker writes; ship a preset generator (`generate-character-set.mjs`) that regenerates assets plus `character-sprites.json` manifest.
+- files: public/sprites/character-engineer-default.png, public/sprites/character-engineer-default.png.json, public/sprites/character-surveyor-cyan.png, public/sprites/character-surveyor-cyan.png.json, public/sprites/character-machinist-rose.png, public/sprites/character-machinist-rose.png.json, public/sprites/character-sprites.json, src/game/character-sprites.ts, src/routes/connect-route.tsx, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, worker/src/lib.rs, retro-diffusion/generate-character-set.mjs, retro-diffusion/README.md, README.md, package.json, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- commit: pending

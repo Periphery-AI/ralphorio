@@ -15,14 +15,35 @@ import {
   updateCharacterProfiles,
   type CharacterProfileRecord,
 } from '../game/character-profiles';
+import {
+  CHARACTER_SPRITE_CATALOG,
+  getCharacterSprite,
+  isSupportedCharacterSpriteId,
+  normalizeCharacterSpriteId,
+} from '../game/character-sprites';
 
-const DEFAULT_CHARACTER_SPRITE_ID = 'engineer-default';
 const MAX_CHARACTER_NAME_LEN = 32;
+const SPRITE_SHEET_SIZE_PX = 192;
 
 const CHARACTER_SLOT_CONFIG = [
-  { characterId: 'default', label: 'Slot 01', defaultName: 'Engineer' },
-  { characterId: 'slot-02', label: 'Slot 02', defaultName: 'Surveyor' },
-  { characterId: 'slot-03', label: 'Slot 03', defaultName: 'Machinist' },
+  {
+    characterId: 'default',
+    label: 'Slot 01',
+    defaultName: 'Engineer',
+    defaultSpriteId: 'engineer-default',
+  },
+  {
+    characterId: 'slot-02',
+    label: 'Slot 02',
+    defaultName: 'Surveyor',
+    defaultSpriteId: 'surveyor-cyan',
+  },
+  {
+    characterId: 'slot-03',
+    label: 'Slot 03',
+    defaultName: 'Machinist',
+    defaultSpriteId: 'machinist-rose',
+  },
 ] as const;
 
 type CharacterSlotState = {
@@ -55,7 +76,7 @@ function createDefaultSlots() {
     label: slot.label,
     defaultName: slot.defaultName,
     name: slot.defaultName,
-    spriteId: DEFAULT_CHARACTER_SPRITE_ID,
+    spriteId: slot.defaultSpriteId,
   })) as CharacterSlotState[];
 }
 
@@ -69,7 +90,10 @@ function mergeSlotsFromServer(profiles: CharacterProfileRecord[], activeCharacte
       label: slot.label,
       defaultName: slot.defaultName,
       name: serverProfile?.name ?? slot.defaultName,
-      spriteId: serverProfile?.spriteId ?? DEFAULT_CHARACTER_SPRITE_ID,
+      spriteId:
+        serverProfile && isSupportedCharacterSpriteId(serverProfile.spriteId)
+          ? serverProfile.spriteId
+          : slot.defaultSpriteId,
     };
   });
 
@@ -159,6 +183,15 @@ export function ConnectRoute() {
     );
   };
 
+  const updateSlotSprite = (characterId: string, nextSpriteId: string) => {
+    const normalized = normalizeCharacterSpriteId(nextSpriteId);
+    setSlots((current) =>
+      current.map((slot) =>
+        slot.characterId === characterId ? { ...slot, spriteId: normalized } : slot,
+      ),
+    );
+  };
+
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -172,7 +205,7 @@ export function ConnectRoute() {
     const payloadProfiles = slots.map((slot) => ({
       characterId: slot.characterId,
       name: normalizeCharacterName(slot.name, slot.defaultName),
-      spriteId: slot.spriteId || DEFAULT_CHARACTER_SPRITE_ID,
+      spriteId: normalizeCharacterSpriteId(slot.spriteId),
     }));
 
     const activeExists = payloadProfiles.some((slot) => slot.characterId === activeCharacterId);
@@ -303,12 +336,14 @@ export function ConnectRoute() {
               </div>
 
               <p className="mt-3 text-xs leading-relaxed text-[#9cb3dd]">
-                Select an active character before connecting. Slot names are saved per room and restored on reconnect.
+                Pick an active slot and sprite variant before connecting. Slot names and sprite choices are
+                saved per room and restored on reconnect.
               </p>
 
               <div className="mt-4 grid gap-3">
                 {slots.map((slot) => {
                   const isActive = slot.characterId === activeCharacterId;
+                  const selectedSprite = getCharacterSprite(slot.spriteId);
                   return (
                     <label
                       key={slot.characterId}
@@ -342,6 +377,44 @@ export function ConnectRoute() {
                         maxLength={MAX_CHARACTER_NAME_LEN}
                         placeholder={slot.defaultName}
                       />
+
+                      <div className="mt-3 grid grid-cols-3 gap-2">
+                        {CHARACTER_SPRITE_CATALOG.map((sprite) => {
+                          const isSelected = sprite.id === selectedSprite.id;
+                          return (
+                            <button
+                              key={sprite.id}
+                              type="button"
+                              className={`rounded-lg border px-2 py-2 text-center transition ${
+                                isSelected
+                                  ? 'border-[#67f0c1]/80 bg-[#112538]'
+                                  : 'border-[#2e4165] bg-[#071121] hover:border-[#4f6d9f]'
+                              }`}
+                              onClick={() => {
+                                setActiveCharacterId(slot.characterId);
+                                updateSlotSprite(slot.characterId, sprite.id);
+                              }}
+                            >
+                              <span
+                                className="mx-auto block h-12 w-12 rounded-md border border-white/10 bg-[#01060f] bg-no-repeat"
+                                style={{
+                                  backgroundImage: `url(${sprite.sheetPath})`,
+                                  backgroundSize: `${SPRITE_SHEET_SIZE_PX}px ${SPRITE_SHEET_SIZE_PX}px`,
+                                  backgroundPosition: `-${sprite.previewFrame.x}px -${sprite.previewFrame.y}px`,
+                                  imageRendering: 'pixelated',
+                                }}
+                              />
+                              <span className="mt-1 block text-[10px] font-semibold uppercase tracking-[0.08em] text-[#a4bce6]">
+                                {sprite.label}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <p className="mt-2 text-[11px] leading-relaxed text-[#8ca6d3]">
+                        Sprite: {selectedSprite.label} - {selectedSprite.description}
+                      </p>
                     </label>
                   );
                 })}
