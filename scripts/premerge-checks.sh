@@ -8,4 +8,5 @@ cargo test --manifest-path sim-core/Cargo.toml
 cargo test --manifest-path worker/Cargo.toml
 cargo check --manifest-path worker/Cargo.toml
 cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown
+npm run test:smoke
 npm run build:web

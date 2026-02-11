@@ -6875,6 +6875,66 @@ mod tests {
     }
 
     #[test]
+    fn crafting_outputs_can_pay_structure_build_cost_end_to_end() {
+        let mut inventory = RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS);
+        inventory
+            .add_resource("iron_ore", 6)
+            .expect("seed iron ore");
+        inventory
+            .add_resource("copper_ore", 2)
+            .expect("seed copper ore");
+
+        let mut queue = RuntimeCraftQueueState {
+            pending: vec![
+                RuntimeCraftQueueEntry {
+                    recipe: "smelt_iron_plate".to_string(),
+                    count: 6,
+                },
+                RuntimeCraftQueueEntry {
+                    recipe: "smelt_copper_plate".to_string(),
+                    count: 2,
+                },
+                RuntimeCraftQueueEntry {
+                    recipe: "craft_gear".to_string(),
+                    count: 1,
+                },
+            ],
+            active: None,
+        };
+
+        let mut tick_budget = 64;
+        while !queue.is_empty() {
+            let tick = advance_crafting_queue(&mut inventory, &mut queue);
+            assert!(tick.changed, "crafting queue should make forward progress");
+            tick_budget -= 1;
+            assert!(
+                tick_budget > 0,
+                "crafting queue exceeded expected tick budget"
+            );
+        }
+
+        assert_eq!(resource_total(&inventory, "iron_ore"), 0);
+        assert_eq!(resource_total(&inventory, "copper_ore"), 0);
+        assert_eq!(resource_total(&inventory, "iron_plate"), 4);
+        assert_eq!(resource_total(&inventory, "copper_plate"), 2);
+        assert_eq!(resource_total(&inventory, "gear"), 1);
+
+        assert!(structure_cell_is_available(
+            &RoomRuntimeState::default(),
+            0,
+            0,
+            grid_cell_center(0),
+            grid_cell_center(0),
+        ));
+
+        consume_structure_build_cost(&mut inventory, "beacon")
+            .expect("crafted inventory should pay beacon build cost");
+        assert_eq!(resource_total(&inventory, "iron_plate"), 0);
+        assert_eq!(resource_total(&inventory, "copper_plate"), 0);
+        assert_eq!(resource_total(&inventory, "gear"), 0);
+    }
+
+    #[test]
     fn crafting_recipe_ids_map_to_supported_domain_recipes() {
         for recipe_id in ["smelt_iron_plate", "smelt_copper_plate", "craft_gear"] {
             let recipe = recipe_kind_from_id(recipe_id).expect("recipe should be supported");

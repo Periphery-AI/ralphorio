@@ -9,6 +9,7 @@
     "build": "npm-run-all wasm:build build:web",
     "build:web": "tsc -b && vite build",
     "check:premerge": "scripts/premerge-checks.sh",
+    "test:smoke": "node --experimental-strip-types --test scripts/replication-smoke.test.ts",
     "wasm:build": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --release",
     "wasm:build:dev": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --dev",
     "sprite:generate": "node retro-diffusion/generate-character.mjs",

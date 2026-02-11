@@ -124,7 +124,7 @@
         "Covers inventory/crafting/building critical path",
         "Pre-merge check command remains green"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-110",
