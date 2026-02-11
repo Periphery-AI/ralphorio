@@ -64,3 +64,11 @@ Entry format:
 - files: game-client/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo test --manifest-path worker/Cargo.toml (pass, 26 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RLP2-104
+- summary: Reduced room HUD clutter by replacing the always-on multi-panel overlay with a compact tabbed command deck (inventory/crafting/build/telemetry), adding explicit minimize/show controls, and moving deep telemetry out of the top bar while keeping gameplay-critical information immediately accessible.
+- decisions: Treated this as a focused UI slice on the existing room HUD architecture only (no subsystem rewrite); kept authoritative data surfaces unchanged and prioritized world visibility plus mobile-friendly panel switching over adding new panels.
+- files: src/routes/room-route.tsx, ralph/progress.txt
+- validation: npm run wasm:build:dev (pass); npm run lint (pass); npm run build:web (pass)
+- commit: pending
