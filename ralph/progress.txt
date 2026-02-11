@@ -1,0 +1,20 @@
+# Ralph Loop Progress
+
+Format per entry:
+- timestamp:
+- item:
+- summary:
+- decisions:
+- files:
+- validation:
+- commit:
+
+---
+
+- timestamp: 2026-02-11
+- item: RL-000
+- summary: Bootstrapped Codex Ralph loop harness (HITL + AFK scripts, PRD, prompt, progress tracking).
+- decisions: Use Codex `gpt-5.3-codex` model with YOLO-equivalent bypass mode for autonomous iterations.
+- files: ralph/prd.json, ralph/prompt.md, ralph/progress.txt, scripts/ralph-once.sh, scripts/afk-ralph.sh
+- validation: bash -n scripts/ralph-once.sh scripts/afk-ralph.sh; scripts/ralph-once.sh --dry-run; scripts/afk-ralph.sh 1 --dry-run
+- commit: pending

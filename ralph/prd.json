@@ -1,0 +1,200 @@
+{
+  "project": "Ralph Loop",
+  "goal": "Build a multiplayer Factorio-like foundation on top of the current Bevy + Cloudflare Durable Object stack.",
+  "quality_bar": [
+    "Production-grade structure and naming",
+    "Server-authoritative gameplay with prediction where appropriate",
+    "No spaghetti abstractions",
+    "Every task validated with feedback loops"
+  ],
+  "items": [
+    {
+      "id": "RL-000",
+      "category": "harness",
+      "description": "Ralph Loop Codex harness exists and can run HITL and AFK iterations with progress + PRD tracking.",
+      "steps": [
+        "Run scripts/ralph-once.sh --dry-run and verify prompt/model settings",
+        "Run scripts/afk-ralph.sh 1 --dry-run and verify loop control",
+        "Confirm ralph/prd.json and ralph/progress.txt are present"
+      ],
+      "passes": true
+    },
+    {
+      "id": "RL-001",
+      "category": "foundation",
+      "description": "Create a shared gameplay domain model for resources, recipes, inventory, combat stats, and placeable entities.",
+      "steps": [
+        "Domain types live in a dedicated module/crate with no UI coupling",
+        "Model supports deterministic simulation step inputs/outputs",
+        "Serialization schema versioning is explicit"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-016",
+      "category": "foundation",
+      "description": "High-priority: implement deterministic terrain generation as a core world system.",
+      "steps": [
+        "Terrain generation is deterministic from a room/world seed",
+        "Generated terrain is represented in authoritative server state or reproducible from seed + parameters",
+        "Client render path supports terrain layers/tiles without breaking current movement and build systems",
+        "Terrain data model is compatible with future automation and resource distribution loops"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-002",
+      "category": "networking",
+      "description": "Extend protocol envelopes for inventory, mining, crafting, build placement, enemy combat, and character metadata.",
+      "steps": [
+        "Client and server protocol types remain synchronized",
+        "Unknown/invalid payloads fail safely",
+        "Snapshots include only required deltas or compact state"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-003",
+      "category": "database",
+      "description": "Add SQLite schema for persistent per-user character profiles and selected active character.",
+      "steps": [
+        "Character profiles keyed by user id + character id",
+        "Supports character name + sprite reference",
+        "Migration-safe initialization and backfill behavior documented"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-004",
+      "category": "ui",
+      "description": "Build a polished character selector with multiple character slots and editable names.",
+      "steps": [
+        "Selector appears before room connect flow",
+        "Selection persists and rehydrates from server state",
+        "Visual quality is consistent with existing HUD style"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-005",
+      "category": "art",
+      "description": "Introduce generic selectable character sprite set generated via Retro Diffusion workflow.",
+      "steps": [
+        "At least 3 selectable character variants",
+        "Sprite metadata integrated into runtime selection",
+        "Asset pipeline instructions captured for future regeneration"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-006",
+      "category": "gameplay",
+      "description": "Render player name labels above all player avatars, including local and remote players.",
+      "steps": [
+        "Name labels update from authoritative snapshot data",
+        "Labels follow moving actors smoothly",
+        "Fallback name behavior exists for missing profile names"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-007",
+      "category": "gameplay",
+      "description": "Implement inventory state with stackable items and server-authoritative updates.",
+      "steps": [
+        "Inventory supports add/remove/merge/split operations",
+        "Client receives synchronized state and local UI updates",
+        "Persistence for user inventory survives reconnect"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-008",
+      "category": "gameplay",
+      "description": "Implement world resource nodes and mining actions with animation + timing.",
+      "steps": [
+        "Resource nodes spawn with type and remaining yield",
+        "Mining interaction has visible progress and animation",
+        "Successful mine adds resources to inventory and updates world state"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-009",
+      "category": "gameplay",
+      "description": "Implement crafting recipes and craft queue consuming inventory resources.",
+      "steps": [
+        "Crafting validates recipe requirements server-side",
+        "Queue supports at least single and repeated crafts",
+        "Craft outputs appear in inventory on completion"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-010",
+      "category": "gameplay",
+      "description": "Implement build items as craftable placeables with placement validation and persistence.",
+      "steps": [
+        "Placement checks occupancy/collision and inventory costs",
+        "Placed entities persist in SQLite",
+        "Placed entities replicate to all connected players"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-011",
+      "category": "gameplay",
+      "description": "Implement collectible drops and pickup behavior for mined/combat outcomes.",
+      "steps": [
+        "Drops spawn with TTL and ownership rules",
+        "Pickup interaction updates inventory and despawns drop",
+        "Desync-safe behavior under reconnect scenarios"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-012",
+      "category": "combat",
+      "description": "Implement enemy entities with simple AI behavior and server-authoritative combat loop.",
+      "steps": [
+        "Enemies move/target within deterministic tick loop",
+        "Combat damage and health are server authoritative",
+        "Enemy death emits drops/events to all clients"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-013",
+      "category": "combat",
+      "description": "Implement player combat actions against enemies (basic attack/projectile path).",
+      "steps": [
+        "Attack input is predicted locally where needed",
+        "Server reconciliation resolves authoritative outcomes",
+        "Combat feedback events are visible to all clients"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-014",
+      "category": "ux",
+      "description": "Create initial in-game UI panels for inventory, crafting, and selected build item.",
+      "steps": [
+        "Panels are responsive desktop/mobile",
+        "UI state maps cleanly to authoritative game state",
+        "No overlap/regression with existing top HUD"
+      ],
+      "passes": false
+    },
+    {
+      "id": "RL-015",
+      "category": "quality",
+      "description": "Add tests/smoke checks for core simulation and protocol invariants.",
+      "steps": [
+        "Simulation tests cover movement + mining/crafting primitives",
+        "Protocol validation tests cover malformed payload handling",
+        "Build pipeline checks run clean before each merge"
+      ],
+      "passes": false
+    }
+  ]
+}

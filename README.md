@@ -130,3 +130,40 @@ Deploy:
 ```bash
 npm run deploy
 ```
+
+## Ralph Loop (Codex)
+
+This repo includes an autonomous Ralph harness tailored for Codex.
+
+Files:
+
+- `ralph/prd.json`: structured roadmap + acceptance criteria (`passes` gates)
+- `ralph/prompt.md`: per-iteration operating instructions
+- `ralph/progress.txt`: rolling memory between iterations
+- `scripts/ralph-once.sh`: one HITL iteration
+- `scripts/afk-ralph.sh`: bounded AFK loop
+
+### Run one iteration (HITL)
+
+```bash
+./scripts/ralph-once.sh --iteration 1
+```
+
+### Run an AFK loop
+
+```bash
+./scripts/afk-ralph.sh 10
+```
+
+### Dry run (no model call)
+
+```bash
+./scripts/ralph-once.sh --dry-run
+./scripts/afk-ralph.sh 3 --dry-run
+```
+
+Notes:
+
+- Model defaults to `gpt-5.3-codex` (`RALPH_MODEL` to override).
+- This Codex CLI version does not expose a literal `--yolo` flag, so scripts use the YOLO-equivalent:
+  `--dangerously-bypass-approvals-and-sandbox` (auto-detected fallback logic is built in).
