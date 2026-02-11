@@ -104,3 +104,11 @@ Entry format:
 - files: game-client/src/lib.rs, src/routes/room-route.tsx, ralph/progress.txt
 - validation: npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RLP2-106
+- summary: Closed the remaining combat readability gap by adding authoritative local-player damage/defeat popups in-world, keyed off combat snapshot health deltas so incoming hits are visible at the actor location instead of only in HUD/feed text.
+- decisions: Kept the existing snapshot/event contract and avoided combat protocol rewrites; implemented feedback state as a lightweight client cache reset on session transitions to preserve Bevy system boundaries and avoid introducing non-authoritative cues.
+- files: game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
+- commit: pending

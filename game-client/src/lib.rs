@@ -76,6 +76,7 @@ const ENEMY_HEALTH_BAR_Z: f32 = ENEMY_Z + 0.08;
 const COMBAT_POPUP_Z: f32 = ENEMY_Z + 0.25;
 const COMBAT_POPUP_TTL_SECONDS: f32 = 0.72;
 const COMBAT_POPUP_RISE_SPEED: f32 = 34.0;
+const PLAYER_DAMAGE_POPUP_OFFSET_Y: f32 = 42.0;
 const DROP_PICKUP_INTERACT_RADIUS: f32 = 84.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 const CRAFT_QUEUE_COUNT_PER_PRESS: u32 = 1;
@@ -88,6 +89,8 @@ static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new
 static OUTBOUND_FEATURE_COMMANDS: Lazy<Mutex<Vec<OutboundFeatureCommand>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 static NEXT_PLAYER_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static LAST_LOCAL_COMBAT_HEALTH: Lazy<Mutex<Option<(String, u32)>>> =
+    Lazy::new(|| Mutex::new(None));
 static STARTED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static PENDING_SESSION_RESET: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
@@ -587,6 +590,9 @@ fn clear_protocol_queues() {
     }
     if let Ok(mut queue) = OUTBOUND_FEATURE_COMMANDS.lock() {
         queue.clear();
+    }
+    if let Ok(mut state) = LAST_LOCAL_COMBAT_HEALTH.lock() {
+        *state = None;
     }
 }
 
@@ -1695,6 +1701,7 @@ fn apply_latest_snapshot(
         })
         .collect();
     let local_player_id = current_player_id.0.clone();
+    let mut local_player_world_position: Option<Vec2> = None;
 
     let mut remote_entities: HashMap<String, (Entity, Entity)> = remote_sprite_query
         .iter_mut()
@@ -1714,6 +1721,7 @@ fn apply_latest_snapshot(
         );
 
         if is_local {
+            local_player_world_position = Some(Vec2::new(player.x, player.y));
             if let Ok((
                 mut local_transform,
                 mut local_actor,
@@ -1731,6 +1739,7 @@ fn apply_latest_snapshot(
                     &mut input_history,
                     &structure_obstacles,
                 );
+                local_player_world_position = Some(local_transform.translation.truncate());
                 let desired_sprite_id = character_sprite_by_player
                     .get(player.id.as_str())
                     .map(String::as_str)
@@ -1823,11 +1832,62 @@ fn apply_latest_snapshot(
         commands.entity(*entity).despawn_recursive();
     }
 
-    let (latest_enemies, _combat_players) = if let Some(snapshot) = combat {
+    let (latest_enemies, latest_combat_players) = if let Some(snapshot) = combat {
         (snapshot.enemies, snapshot.players)
     } else {
         (Vec::new(), Vec::new())
     };
+
+    if let Some(local_id) = local_player_id.as_deref() {
+        if let Some(local_combat) = latest_combat_players
+            .iter()
+            .find(|combat_player| combat_player.player_id == local_id)
+        {
+            let previous_health = if let Ok(mut state) = LAST_LOCAL_COMBAT_HEALTH.lock() {
+                match state.as_mut() {
+                    Some((tracked_player_id, tracked_health)) if tracked_player_id == local_id => {
+                        let previous = *tracked_health;
+                        *tracked_health = local_combat.health;
+                        Some(previous)
+                    }
+                    _ => {
+                        *state = Some((local_id.to_string(), local_combat.health));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(previous_health) = previous_health {
+                if previous_health > local_combat.health {
+                    if let Some(popup_position) = local_player_world_position {
+                        let popup_text = if local_combat.health == 0 {
+                            "DOWN".to_string()
+                        } else {
+                            format!("-{}", previous_health - local_combat.health)
+                        };
+                        spawn_combat_popup(
+                            &mut commands,
+                            popup_text,
+                            popup_position.x,
+                            popup_position.y + PLAYER_DAMAGE_POPUP_OFFSET_Y,
+                            Color::srgb_u8(255, 126, 126),
+                        );
+                    }
+                }
+            }
+        } else {
+            if let Ok(mut state) = LAST_LOCAL_COMBAT_HEALTH.lock() {
+                if state
+                    .as_ref()
+                    .is_some_and(|(tracked_player_id, _)| tracked_player_id == local_id)
+                {
+                    *state = None;
+                }
+            }
+        }
+    }
 
     let mut enemy_entities: HashMap<String, (Entity, u32)> = world_object_query
         .iter()

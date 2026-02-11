@@ -91,7 +91,7 @@
         "Combat feed and in-world cues align with authoritative outcomes",
         "No severe desync between local expectation and server result"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-107",
