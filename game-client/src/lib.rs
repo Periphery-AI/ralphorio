@@ -19,6 +19,10 @@ const CHARACTER_FRAME_SIZE: f32 = 48.0;
 const CHARACTER_ANIMATION_FPS: f32 = 12.0;
 const CHARACTER_ANIMATION_FRAMES: usize = 4;
 const CHARACTER_SCALE: f32 = 1.75;
+const MAX_NAME_LABEL_LENGTH: usize = 24;
+const NAME_LABEL_FONT_SIZE: f32 = 13.0;
+const NAME_LABEL_OFFSET_Y: f32 = CHARACTER_FRAME_SIZE * CHARACTER_SCALE * 0.6;
+const NAME_LABEL_Z_OFFSET: f32 = 0.15;
 const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
 const CHARACTER_SPRITE_VARIANTS: [(&str, &str); 3] = [
     ("engineer-default", "sprites/character-engineer-default.png"),
@@ -154,6 +158,8 @@ struct MiningSnapshotState {
 struct CharacterProfileSnapshotState {
     #[serde(rename = "playerId")]
     player_id: String,
+    #[serde(default)]
+    name: String,
     #[serde(rename = "spriteId")]
     sprite_id: String,
 }
@@ -234,6 +240,12 @@ struct RemoteActor;
 
 #[derive(Component)]
 struct CharacterSpriteId(String);
+
+#[derive(Component)]
+struct ActorNameLabelEntity(Entity);
+
+#[derive(Component)]
+struct ActorNameLabel;
 
 #[derive(Component)]
 struct RemoteTarget(Vec2);
@@ -668,26 +680,32 @@ fn setup_world(
 
     let atlas_handles = build_character_atlas_handles(&asset_server, &mut atlas_layouts);
     let (default_atlas, resolved_sprite_id) = atlas_handles.resolve(DEFAULT_CHARACTER_SPRITE_ID);
-
-    commands.spawn((
-        SpriteBundle {
-            texture: default_atlas.texture.clone(),
-            transform: Transform::from_xyz(0.0, 0.0, SNAPSHOT_Z)
-                .with_scale(Vec3::splat(CHARACTER_SCALE)),
-            ..default()
-        },
-        TextureAtlas {
-            layout: default_atlas.layout.clone(),
-            index: 0,
-        },
-        Actor {
-            id: "local-pending".to_string(),
-        },
-        ActorVelocity::default(),
-        CharacterAnimator::default(),
-        CharacterSpriteId(resolved_sprite_id),
-        LocalActor,
-    ));
+    let local_actor = commands
+        .spawn((
+            SpriteBundle {
+                texture: default_atlas.texture.clone(),
+                transform: Transform::from_xyz(0.0, 0.0, SNAPSHOT_Z)
+                    .with_scale(Vec3::splat(CHARACTER_SCALE)),
+                ..default()
+            },
+            TextureAtlas {
+                layout: default_atlas.layout.clone(),
+                index: 0,
+            },
+            Actor {
+                id: "local-pending".to_string(),
+            },
+            ActorVelocity::default(),
+            CharacterAnimator::default(),
+            CharacterSpriteId(resolved_sprite_id),
+            LocalActor,
+        ))
+        .id();
+    let local_name_label = spawn_actor_name_label(&mut commands, "local-pending");
+    commands.entity(local_actor).add_child(local_name_label);
+    commands
+        .entity(local_actor)
+        .insert(ActorNameLabelEntity(local_name_label));
 
     commands.insert_resource(atlas_handles);
 
@@ -724,9 +742,11 @@ fn apply_pending_session_reset(
             &mut CharacterAnimator,
             &mut TextureAtlas,
             &mut CharacterSpriteId,
+            &ActorNameLabelEntity,
         ),
         (With<LocalActor>, Without<LocalBuildGhost>),
     >,
+    mut label_query: Query<&mut Text, With<ActorNameLabel>>,
     mut local_build_ghost_query: Query<
         (&mut Visibility, &mut Transform),
         (With<LocalBuildGhost>, Without<LocalActor>),
@@ -762,8 +782,15 @@ fn apply_pending_session_reset(
     terrain_state.needs_refresh = true;
     *footstep_state = FootstepState::default();
 
-    if let Ok((mut transform, mut actor, mut velocity, mut animator, mut atlas, mut sprite_id)) =
-        local_query.get_single_mut()
+    if let Ok((
+        mut transform,
+        mut actor,
+        mut velocity,
+        mut animator,
+        mut atlas,
+        mut sprite_id,
+        label_entity,
+    )) = local_query.get_single_mut()
     {
         transform.translation.x = 0.0;
         transform.translation.y = 0.0;
@@ -774,6 +801,11 @@ fn apply_pending_session_reset(
         animator.timer.reset();
         atlas.index = FacingDirection::Down.row_index() * CHARACTER_ANIMATION_FRAMES;
         sprite_id.0 = DEFAULT_CHARACTER_SPRITE_ID.to_string();
+        set_actor_name_label_text(
+            label_entity.0,
+            fallback_display_name("local-pending").as_str(),
+            &mut label_query,
+        );
     }
 
     if let Ok((mut visibility, mut transform)) = local_build_ghost_query.get_single_mut() {
@@ -789,7 +821,8 @@ fn apply_pending_session_reset(
 
 fn sync_player_id(
     mut current_player_id: ResMut<CurrentPlayerId>,
-    mut local_actor_query: Query<&mut Actor, With<LocalActor>>,
+    mut local_actor_query: Query<(&mut Actor, &ActorNameLabelEntity), With<LocalActor>>,
+    mut label_query: Query<&mut Text, With<ActorNameLabel>>,
 ) {
     let next_id = match NEXT_PLAYER_ID.lock() {
         Ok(mut pending) => pending.take(),
@@ -799,8 +832,13 @@ fn sync_player_id(
     if let Some(player_id) = next_id {
         current_player_id.0 = Some(player_id.clone());
 
-        if let Ok(mut local_actor) = local_actor_query.get_single_mut() {
+        if let Ok((mut local_actor, label_entity)) = local_actor_query.get_single_mut() {
             local_actor.id = player_id;
+            set_actor_name_label_text(
+                label_entity.0,
+                fallback_display_name(local_actor.id.as_str()).as_str(),
+                &mut label_query,
+            );
         }
     }
 }
@@ -1345,18 +1383,22 @@ fn apply_latest_snapshot(
             &mut Handle<Image>,
             &mut TextureAtlas,
             &mut CharacterSpriteId,
+            &ActorNameLabelEntity,
         ),
         (With<LocalActor>, Without<RemoteActor>),
     >,
-    remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
     mut remote_sprite_query: Query<
         (
+            Entity,
+            &Actor,
+            &ActorNameLabelEntity,
             &mut Handle<Image>,
             &mut TextureAtlas,
             &mut CharacterSpriteId,
         ),
         With<RemoteActor>,
     >,
+    mut name_label_query: Query<&mut Text, With<ActorNameLabel>>,
     structure_query: Query<(Entity, &StructureActor)>,
     mining_node_query: Query<(Entity, &MiningNodeActor)>,
     mining_progress_query: Query<(Entity, &MiningProgressActor)>,
@@ -1394,15 +1436,14 @@ fn apply_latest_snapshot(
         ..
     } = snapshot;
 
-    let character_sprite_by_player: HashMap<String, String> = character
-        .map(|snapshot| {
-            snapshot
-                .players
-                .into_iter()
-                .map(|profile| (profile.player_id, profile.sprite_id))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut character_sprite_by_player = HashMap::new();
+    let mut character_name_by_player = HashMap::new();
+    if let Some(snapshot) = character {
+        for profile in snapshot.players {
+            character_sprite_by_player.insert(profile.player_id.clone(), profile.sprite_id);
+            character_name_by_player.insert(profile.player_id, profile.name);
+        }
+    }
 
     if let Some(terrain) = terrain {
         if let Ok(seed) = terrain.seed.parse::<u64>() {
@@ -1431,9 +1472,9 @@ fn apply_latest_snapshot(
         .collect();
     let local_player_id = current_player_id.0.clone();
 
-    let mut remote_entities: HashMap<String, Entity> = remote_query
-        .iter()
-        .map(|(entity, actor)| (actor.id.clone(), entity))
+    let mut remote_entities: HashMap<String, (Entity, Entity)> = remote_sprite_query
+        .iter_mut()
+        .map(|(entity, actor, label, ..)| (actor.id.clone(), (entity, label.0)))
         .collect();
 
     for player in players.into_iter().filter(|state| state.connected) {
@@ -1441,6 +1482,12 @@ fn apply_latest_snapshot(
             .0
             .as_deref()
             .is_some_and(|player_id| player_id == player.id);
+        let desired_display_name = resolve_actor_display_name(
+            character_name_by_player
+                .get(player.id.as_str())
+                .map(String::as_str),
+            player.id.as_str(),
+        );
 
         if is_local {
             if let Ok((
@@ -1449,6 +1496,7 @@ fn apply_latest_snapshot(
                 mut local_texture,
                 mut local_atlas,
                 mut local_sprite_id,
+                label_entity,
             )) = local_query.get_single_mut()
             {
                 local_actor.id = player.id.clone();
@@ -1470,21 +1518,26 @@ fn apply_latest_snapshot(
                     desired_sprite_id,
                     &character_atlas,
                 );
+                set_actor_name_label_text(
+                    label_entity.0,
+                    desired_display_name.as_str(),
+                    &mut name_label_query,
+                );
             }
 
-            if let Some(entity) = remote_entities.remove(&player.id) {
+            if let Some((entity, _)) = remote_entities.remove(&player.id) {
                 commands.entity(entity).despawn_recursive();
             }
 
             continue;
         }
 
-        if let Some(entity) = remote_entities.remove(&player.id) {
+        if let Some((entity, label_entity)) = remote_entities.remove(&player.id) {
             commands
                 .entity(entity)
                 .insert(RemoteTarget(Vec2::new(player.x, player.y)))
                 .insert(ActorVelocity(Vec2::new(player.vx, player.vy)));
-            if let Ok((mut remote_texture, mut remote_atlas, mut remote_sprite_id)) =
+            if let Ok((_, _, _, mut remote_texture, mut remote_atlas, mut remote_sprite_id)) =
                 remote_sprite_query.get_mut(entity)
             {
                 let desired_sprite_id = character_sprite_by_player
@@ -1499,16 +1552,27 @@ fn apply_latest_snapshot(
                     &character_atlas,
                 );
             }
+            set_actor_name_label_text(
+                label_entity,
+                desired_display_name.as_str(),
+                &mut name_label_query,
+            );
         } else {
             let desired_sprite_id = character_sprite_by_player
                 .get(player.id.as_str())
                 .map(String::as_str)
                 .unwrap_or(DEFAULT_CHARACTER_SPRITE_ID);
-            spawn_remote_actor(&mut commands, &player, desired_sprite_id, &character_atlas);
+            spawn_remote_actor(
+                &mut commands,
+                &player,
+                desired_sprite_id,
+                desired_display_name.as_str(),
+                &character_atlas,
+            );
         }
     }
 
-    for entity in remote_entities.values() {
+    for (entity, _) in remote_entities.values() {
         commands.entity(*entity).despawn_recursive();
     }
 
@@ -2036,34 +2100,112 @@ fn apply_character_sprite_to_actor(
     sprite_component.0 = resolved_sprite_id;
 }
 
+fn fallback_display_name(player_id: &str) -> String {
+    let mut fallback = String::new();
+    for ch in player_id.chars() {
+        if fallback.len() >= MAX_NAME_LABEL_LENGTH {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            fallback.push(ch);
+        }
+    }
+
+    if fallback.is_empty() {
+        "Unknown".to_string()
+    } else {
+        fallback
+    }
+}
+
+fn resolve_actor_display_name(authoritative_name: Option<&str>, player_id: &str) -> String {
+    let Some(name) = authoritative_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return fallback_display_name(player_id);
+    };
+
+    name.chars().take(MAX_NAME_LABEL_LENGTH).collect()
+}
+
+fn spawn_actor_name_label(commands: &mut Commands, label: &str) -> Entity {
+    commands
+        .spawn((
+            Text2dBundle {
+                text: Text::from_section(
+                    label.to_string(),
+                    TextStyle {
+                        font_size: NAME_LABEL_FONT_SIZE,
+                        color: Color::srgb_u8(223, 236, 255),
+                        ..default()
+                    },
+                ),
+                text_anchor: bevy::sprite::Anchor::BottomCenter,
+                transform: Transform::from_xyz(0.0, NAME_LABEL_OFFSET_Y, NAME_LABEL_Z_OFFSET),
+                ..default()
+            },
+            ActorNameLabel,
+        ))
+        .id()
+}
+
+fn set_actor_name_label_text(
+    label_entity: Entity,
+    label_text: &str,
+    label_query: &mut Query<&mut Text, With<ActorNameLabel>>,
+) {
+    let Ok(mut text) = label_query.get_mut(label_entity) else {
+        return;
+    };
+
+    let Some(section) = text.sections.get_mut(0) else {
+        return;
+    };
+
+    if section.value == label_text {
+        return;
+    }
+
+    section.value.clear();
+    section.value.push_str(label_text);
+}
+
 fn spawn_remote_actor(
     commands: &mut Commands,
     player: &PlayerState,
     sprite_id: &str,
+    display_name: &str,
     character_atlas: &CharacterAtlasHandles,
 ) {
     let (atlas_handles, resolved_sprite_id) = character_atlas.resolve(sprite_id);
-
-    commands.spawn((
-        SpriteBundle {
-            texture: atlas_handles.texture.clone(),
-            transform: Transform::from_xyz(player.x, player.y, SNAPSHOT_Z)
-                .with_scale(Vec3::splat(CHARACTER_SCALE)),
-            ..default()
-        },
-        TextureAtlas {
-            layout: atlas_handles.layout.clone(),
-            index: 0,
-        },
-        Actor {
-            id: player.id.clone(),
-        },
-        ActorVelocity(Vec2::new(player.vx, player.vy)),
-        CharacterAnimator::default(),
-        CharacterSpriteId(resolved_sprite_id),
-        RemoteActor,
-        RemoteTarget(Vec2::new(player.x, player.y)),
-    ));
+    let actor_entity = commands
+        .spawn((
+            SpriteBundle {
+                texture: atlas_handles.texture.clone(),
+                transform: Transform::from_xyz(player.x, player.y, SNAPSHOT_Z)
+                    .with_scale(Vec3::splat(CHARACTER_SCALE)),
+                ..default()
+            },
+            TextureAtlas {
+                layout: atlas_handles.layout.clone(),
+                index: 0,
+            },
+            Actor {
+                id: player.id.clone(),
+            },
+            ActorVelocity(Vec2::new(player.vx, player.vy)),
+            CharacterAnimator::default(),
+            CharacterSpriteId(resolved_sprite_id),
+            RemoteActor,
+            RemoteTarget(Vec2::new(player.x, player.y)),
+        ))
+        .id();
+    let name_label = spawn_actor_name_label(commands, display_name);
+    commands.entity(actor_entity).add_child(name_label);
+    commands
+        .entity(actor_entity)
+        .insert(ActorNameLabelEntity(name_label));
 }
 
 fn structure_color(kind: &str) -> Color {

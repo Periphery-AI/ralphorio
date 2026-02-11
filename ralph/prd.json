@@ -95,7 +95,7 @@
         "Labels follow moving actors smoothly",
         "Fallback name behavior exists for missing profile names"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-007",

@@ -81,3 +81,11 @@ Format per entry:
 - files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (5 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-006
+- summary: Implemented authoritative in-world player name labels for local and remote avatars with text nameplates that follow actor transforms and update from character snapshot data.
+- decisions: Use actor-child `Text2dBundle` labels so nameplates inherit movement interpolation without separate screen-space tracking; source names from `features.character.players[*].name` with deterministic fallback to sanitized player id when missing/blank; enable Bevy text/default font features in the WASM client to keep labels self-contained in the existing render path.
+- files: game-client/Cargo.toml, game-client/Cargo.lock, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path game-client/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- commit: pending
