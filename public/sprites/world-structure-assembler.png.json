@@ -1,0 +1,12 @@
+{
+  "id": "structure-assembler",
+  "category": "structure",
+  "kind": "assembler",
+  "prompt": "top-down retro pixel art assembler factory machine, clean silhouette, transparent background, centered single sprite",
+  "seed": 4403127,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

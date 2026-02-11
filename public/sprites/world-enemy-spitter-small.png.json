@@ -1,0 +1,12 @@
+{
+  "id": "enemy-spitter-small",
+  "category": "enemy",
+  "kind": "spitter_small",
+  "prompt": "top-down retro pixel art small alien spitter enemy, readable ranged silhouette, transparent background, centered single sprite",
+  "seed": 3701423,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

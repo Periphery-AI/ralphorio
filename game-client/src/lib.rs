@@ -30,6 +30,56 @@ const CHARACTER_SPRITE_VARIANTS: [(&str, &str); 3] = [
     ("surveyor-cyan", "sprites/character-surveyor-cyan.png"),
     ("machinist-rose", "sprites/character-machinist-rose.png"),
 ];
+const DEFAULT_STRUCTURE_SPRITE_KIND: &str = "beacon";
+const DEFAULT_ENEMY_SPRITE_KIND: &str = "biter_small";
+const DEFAULT_RESOURCE_SPRITE_KIND: &str = "iron_ore";
+const STRUCTURE_SPRITE_VARIANTS: [(&str, &str, &str); 3] = [
+    (
+        "structure-beacon",
+        "beacon",
+        "sprites/world-structure-beacon.png",
+    ),
+    (
+        "structure-miner",
+        "miner",
+        "sprites/world-structure-miner.png",
+    ),
+    (
+        "structure-assembler",
+        "assembler",
+        "sprites/world-structure-assembler.png",
+    ),
+];
+const ENEMY_SPRITE_VARIANTS: [(&str, &str, &str); 3] = [
+    (
+        "enemy-biter-small",
+        "biter_small",
+        "sprites/world-enemy-biter-small.png",
+    ),
+    (
+        "enemy-biter-medium",
+        "biter_medium",
+        "sprites/world-enemy-biter-medium.png",
+    ),
+    (
+        "enemy-spitter-small",
+        "spitter_small",
+        "sprites/world-enemy-spitter-small.png",
+    ),
+];
+const RESOURCE_SPRITE_VARIANTS: [(&str, &str, &str); 3] = [
+    (
+        "resource-iron-ore",
+        "iron_ore",
+        "sprites/world-resource-iron-ore.png",
+    ),
+    (
+        "resource-copper-ore",
+        "copper_ore",
+        "sprites/world-resource-copper-ore.png",
+    ),
+    ("resource-coal", "coal", "sprites/world-resource-coal.png"),
+];
 const FOOTSTEP_TRIGGER_SPEED: f32 = 18.0;
 const FOOTSTEP_INTERVAL_SECONDS: f32 = 0.30;
 const FOOTSTEP_BASE_VOLUME: f32 = 0.52;
@@ -473,6 +523,7 @@ struct CharacterAtlasHandle {
 struct CharacterAtlasHandles {
     default_sprite_id: String,
     by_sprite_id: HashMap<String, CharacterAtlasHandle>,
+    world_sprites: WorldSpriteHandles,
 }
 
 impl CharacterAtlasHandles {
@@ -495,6 +546,39 @@ impl CharacterAtlasHandles {
 struct SfxAudioHandles {
     footstep_clips: Vec<Handle<AudioSource>>,
     placement_clip: Handle<AudioSource>,
+}
+
+#[derive(Clone)]
+struct WorldSpriteHandles {
+    default_structure: Handle<Image>,
+    default_enemy: Handle<Image>,
+    default_resource: Handle<Image>,
+    structure_by_kind: HashMap<String, Handle<Image>>,
+    enemy_by_kind: HashMap<String, Handle<Image>>,
+    resource_by_kind: HashMap<String, Handle<Image>>,
+}
+
+impl WorldSpriteHandles {
+    fn structure(&self, kind: &str) -> Handle<Image> {
+        self.structure_by_kind
+            .get(kind)
+            .cloned()
+            .unwrap_or_else(|| self.default_structure.clone())
+    }
+
+    fn enemy(&self, kind: &str) -> Handle<Image> {
+        self.enemy_by_kind
+            .get(kind)
+            .cloned()
+            .unwrap_or_else(|| self.default_enemy.clone())
+    }
+
+    fn resource(&self, kind: &str) -> Handle<Image> {
+        self.resource_by_kind
+            .get(kind)
+            .cloned()
+            .unwrap_or_else(|| self.default_resource.clone())
+    }
 }
 
 #[derive(Resource)]
@@ -787,6 +871,40 @@ fn build_character_atlas_handles(
     CharacterAtlasHandles {
         default_sprite_id: DEFAULT_CHARACTER_SPRITE_ID.to_string(),
         by_sprite_id,
+        world_sprites: build_world_sprite_handles(asset_server),
+    }
+}
+
+fn build_world_sprite_handles(asset_server: &AssetServer) -> WorldSpriteHandles {
+    let mut structure_by_kind = HashMap::new();
+    for (_, kind, path) in STRUCTURE_SPRITE_VARIANTS {
+        structure_by_kind.insert(kind.to_string(), asset_server.load(path));
+    }
+    let mut enemy_by_kind = HashMap::new();
+    for (_, kind, path) in ENEMY_SPRITE_VARIANTS {
+        enemy_by_kind.insert(kind.to_string(), asset_server.load(path));
+    }
+    let mut resource_by_kind = HashMap::new();
+    for (_, kind, path) in RESOURCE_SPRITE_VARIANTS {
+        resource_by_kind.insert(kind.to_string(), asset_server.load(path));
+    }
+
+    WorldSpriteHandles {
+        default_structure: structure_by_kind
+            .get(DEFAULT_STRUCTURE_SPRITE_KIND)
+            .expect("default structure sprite missing")
+            .clone(),
+        default_enemy: enemy_by_kind
+            .get(DEFAULT_ENEMY_SPRITE_KIND)
+            .expect("default enemy sprite missing")
+            .clone(),
+        default_resource: resource_by_kind
+            .get(DEFAULT_RESOURCE_SPRITE_KIND)
+            .expect("default resource sprite missing")
+            .clone(),
+        structure_by_kind,
+        enemy_by_kind,
+        resource_by_kind,
     }
 }
 
@@ -834,10 +952,12 @@ fn setup_world(
         .entity(local_actor)
         .insert(ActorNameLabelEntity(local_name_label));
 
+    let local_build_ghost_texture = atlas_handles.world_sprites.structure("beacon");
     commands.insert_resource(atlas_handles);
 
     commands.spawn((
         SpriteBundle {
+            texture: local_build_ghost_texture,
             sprite: Sprite {
                 color: structure_preview_color("beacon", true, true),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
@@ -1043,12 +1163,23 @@ fn snap_world_to_build_grid(world: Vec2) -> (IVec2, Vec2) {
 }
 
 fn set_local_build_ghost_visible(
-    ghost_query: &mut Query<(&mut Transform, &mut Visibility, &mut Sprite), With<LocalBuildGhost>>,
+    world_sprites: &WorldSpriteHandles,
+    ghost_query: &mut Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut Sprite,
+            &mut Handle<Image>,
+        ),
+        With<LocalBuildGhost>,
+    >,
     visible: bool,
     position: Vec2,
     kind: &str,
 ) {
-    if let Ok((mut transform, mut visibility, mut sprite)) = ghost_query.get_single_mut() {
+    if let Ok((mut transform, mut visibility, mut sprite, mut texture)) =
+        ghost_query.get_single_mut()
+    {
         transform.translation.x = position.x;
         transform.translation.y = position.y;
         *visibility = if visible {
@@ -1056,6 +1187,7 @@ fn set_local_build_ghost_visible(
         } else {
             Visibility::Hidden
         };
+        *texture = world_sprites.structure(kind);
         sprite.color = structure_preview_color(kind, true, true);
     }
 }
@@ -1079,15 +1211,30 @@ fn handle_build_placement_controls(
     input: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     sfx_handles: Res<SfxAudioHandles>,
+    character_atlas: Res<CharacterAtlasHandles>,
     mut placement: ResMut<BuildPlacementState>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
-    mut ghost_query: Query<(&mut Transform, &mut Visibility, &mut Sprite), With<LocalBuildGhost>>,
+    mut ghost_query: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut Sprite,
+            &mut Handle<Image>,
+        ),
+        With<LocalBuildGhost>,
+    >,
 ) {
     if input.just_pressed(KeyCode::KeyQ) {
         if placement.active {
             disable_build_mode(&mut placement);
-            set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+            set_local_build_ghost_visible(
+                &character_atlas.world_sprites,
+                &mut ghost_query,
+                false,
+                Vec2::ZERO,
+                placement.kind,
+            );
             return;
         }
 
@@ -1098,34 +1245,76 @@ fn handle_build_placement_controls(
 
     if input.just_pressed(KeyCode::Escape) && placement.active {
         disable_build_mode(&mut placement);
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     }
 
     if !placement.active {
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     }
 
     let Ok(window) = window_query.get_single() else {
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     };
     let Some(cursor_pos) = window.cursor_position() else {
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     };
     let Ok((camera, camera_transform)) = camera_query.get_single() else {
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     };
     let Some(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor_pos) else {
-        set_local_build_ghost_visible(&mut ghost_query, false, Vec2::ZERO, placement.kind);
+        set_local_build_ghost_visible(
+            &character_atlas.world_sprites,
+            &mut ghost_query,
+            false,
+            Vec2::ZERO,
+            placement.kind,
+        );
         return;
     };
 
     let (cell, snapped) = snap_world_to_build_grid(world_pos);
-    set_local_build_ghost_visible(&mut ghost_query, true, snapped, placement.kind);
+    set_local_build_ghost_visible(
+        &character_atlas.world_sprites,
+        &mut ghost_query,
+        true,
+        snapped,
+        placement.kind,
+    );
 
     placement.send_cooldown += time.delta_seconds();
     let cell_changed = placement.last_sent_cell != Some(cell);
@@ -1818,13 +2007,22 @@ fn apply_latest_snapshot(
 
     for structure in structures {
         if let Some(entity) = structure_entities.remove(&structure.id) {
-            commands.entity(entity).insert(Transform::from_xyz(
-                structure.x,
-                structure.y,
-                STRUCTURE_Z,
+            commands.entity(entity).insert((
+                Transform::from_xyz(structure.x, structure.y, STRUCTURE_Z),
+                character_atlas
+                    .world_sprites
+                    .structure(structure.kind.as_str()),
+                Sprite {
+                    color: structure_color(structure.kind.as_str()),
+                    custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
+                    ..default()
+                },
+                StructureActor {
+                    id: structure.id.clone(),
+                },
             ));
         } else {
-            spawn_structure_actor(&mut commands, &structure);
+            spawn_structure_actor(&mut commands, &structure, &character_atlas.world_sprites);
         }
     }
 
@@ -1891,7 +2089,9 @@ fn apply_latest_snapshot(
 
     let mut enemy_entities: HashMap<String, (Entity, u32)> = world_object_query
         .iter()
-        .filter_map(|(entity, _, enemy, _)| enemy.map(|enemy| (enemy.id.clone(), (entity, enemy.health))))
+        .filter_map(|(entity, _, enemy, _)| {
+            enemy.map(|enemy| (enemy.id.clone(), (entity, enemy.health)))
+        })
         .collect();
     let mut enemy_health_bar_entities: HashMap<String, Entity> = world_object_query
         .iter()
@@ -1926,6 +2126,7 @@ fn apply_latest_snapshot(
             }
             commands.entity(entity).insert((
                 Transform::from_xyz(enemy.x, enemy.y, ENEMY_Z),
+                character_atlas.world_sprites.enemy(enemy.kind.as_str()),
                 Sprite {
                     color: enemy_color(
                         enemy.kind.as_str(),
@@ -1942,7 +2143,12 @@ fn apply_latest_snapshot(
                 },
             ));
         } else {
-            spawn_enemy_actor(&mut commands, &enemy, targets_local_player);
+            spawn_enemy_actor(
+                &mut commands,
+                &enemy,
+                targets_local_player,
+                &character_atlas.world_sprites,
+            );
         }
 
         if let Some(bar_entity) = enemy_health_bar_entities.remove(enemy.id.as_str()) {
@@ -2015,6 +2221,7 @@ fn apply_latest_snapshot(
         if let Some(entity) = mining_node_entities.remove(node.id.as_str()) {
             commands.entity(entity).insert((
                 Transform::from_xyz(node.x, node.y, MINING_NODE_Z),
+                character_atlas.world_sprites.resource(node.kind.as_str()),
                 MiningNodeActor {
                     id: node.id.clone(),
                     kind: node.kind,
@@ -2027,6 +2234,7 @@ fn apply_latest_snapshot(
                 &mut commands,
                 &node,
                 active_node_ids.contains(node.id.as_str()),
+                &character_atlas.world_sprites,
             );
         }
     }
@@ -2114,6 +2322,9 @@ fn apply_latest_snapshot(
         if let Some(entity) = preview_entities.remove(&preview.player_id) {
             commands.entity(entity).insert((
                 Transform::from_xyz(preview.x, preview.y, BUILD_PREVIEW_Z),
+                character_atlas
+                    .world_sprites
+                    .structure(preview.kind.as_str()),
                 Sprite {
                     color: structure_preview_color(preview.kind.as_str(), false, preview.can_place),
                     custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
@@ -2121,7 +2332,7 @@ fn apply_latest_snapshot(
                 },
             ));
         } else {
-            spawn_build_preview_actor(&mut commands, &preview);
+            spawn_build_preview_actor(&mut commands, &preview, &character_atlas.world_sprites);
         }
     }
 
@@ -2749,9 +2960,14 @@ fn drop_size(amount: u32) -> f32 {
     DROP_BASE_SIZE + normalized * 7.0
 }
 
-fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
+fn spawn_structure_actor(
+    commands: &mut Commands,
+    structure: &StructureState,
+    world_sprites: &WorldSpriteHandles,
+) {
     commands.spawn((
         SpriteBundle {
+            texture: world_sprites.structure(structure.kind.as_str()),
             sprite: Sprite {
                 color: structure_color(structure.kind.as_str()),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
@@ -2770,9 +2986,11 @@ fn spawn_enemy_actor(
     commands: &mut Commands,
     enemy: &EnemySnapshotState,
     targets_local_player: bool,
+    world_sprites: &WorldSpriteHandles,
 ) {
     commands.spawn((
         SpriteBundle {
+            texture: world_sprites.enemy(enemy.kind.as_str()),
             sprite: Sprite {
                 color: enemy_color(
                     enemy.kind.as_str(),
@@ -2845,9 +3063,15 @@ fn spawn_combat_popup(commands: &mut Commands, text: String, x: f32, y: f32, col
     ));
 }
 
-fn spawn_mining_node_actor(commands: &mut Commands, node: &MiningNodeSnapshotState, active: bool) {
+fn spawn_mining_node_actor(
+    commands: &mut Commands,
+    node: &MiningNodeSnapshotState,
+    active: bool,
+    world_sprites: &WorldSpriteHandles,
+) {
     commands.spawn((
         SpriteBundle {
+            texture: world_sprites.resource(node.kind.as_str()),
             sprite: Sprite {
                 color: mining_node_base_color(node.kind.as_str()),
                 custom_size: Some(Vec2::splat(mining_node_size(node.remaining))),
@@ -2911,9 +3135,14 @@ fn spawn_drop_actor(commands: &mut Commands, drop: &DropSnapshotState) {
     ));
 }
 
-fn spawn_build_preview_actor(commands: &mut Commands, preview: &BuildPreviewState) {
+fn spawn_build_preview_actor(
+    commands: &mut Commands,
+    preview: &BuildPreviewState,
+    world_sprites: &WorldSpriteHandles,
+) {
     commands.spawn((
         SpriteBundle {
+            texture: world_sprites.structure(preview.kind.as_str()),
             sprite: Sprite {
                 color: structure_preview_color(preview.kind.as_str(), false, preview.can_place),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),

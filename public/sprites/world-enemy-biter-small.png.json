@@ -1,0 +1,12 @@
+{
+  "id": "enemy-biter-small",
+  "category": "enemy",
+  "kind": "biter_small",
+  "prompt": "top-down retro pixel art alien biter creature, readable silhouette, transparent background, centered single sprite",
+  "seed": 3701402,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

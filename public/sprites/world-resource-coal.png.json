@@ -1,0 +1,12 @@
+{
+  "id": "resource-coal",
+  "category": "resource",
+  "kind": "coal",
+  "prompt": "top-down retro pixel art coal rock cluster, readable mining node silhouette, transparent background, centered single sprite",
+  "seed": 2702421,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

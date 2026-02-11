@@ -1,0 +1,12 @@
+{
+  "id": "structure-miner",
+  "category": "structure",
+  "kind": "miner",
+  "prompt": "top-down retro pixel art mining drill building, clean silhouette, transparent background, centered single sprite",
+  "seed": 4403113,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

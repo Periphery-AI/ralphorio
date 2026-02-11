@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "defaults": {
+    "enemy": "enemy-biter-small",
+    "resource": "resource-iron-ore",
+    "structure": "structure-beacon"
+  },
+  "sprites": [
+    {
+      "id": "enemy-biter-small",
+      "category": "enemy",
+      "kind": "biter_small",
+      "label": "Biter Small",
+      "description": "Small melee biter silhouette with warm carapace tones.",
+      "texturePath": "/sprites/world-enemy-biter-small.png",
+      "metadataPath": "/sprites/world-enemy-biter-small.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "enemy-biter-medium",
+      "category": "enemy",
+      "kind": "biter_medium",
+      "label": "Biter Medium",
+      "description": "Heavier biter profile with broader body and darker shell accents.",
+      "texturePath": "/sprites/world-enemy-biter-medium.png",
+      "metadataPath": "/sprites/world-enemy-biter-medium.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "enemy-spitter-small",
+      "category": "enemy",
+      "kind": "spitter_small",
+      "label": "Spitter Small",
+      "description": "Small ranged spitter with a distinct acid-sack profile.",
+      "texturePath": "/sprites/world-enemy-spitter-small.png",
+      "metadataPath": "/sprites/world-enemy-spitter-small.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "resource-iron-ore",
+      "category": "resource",
+      "kind": "iron_ore",
+      "label": "Iron Ore Node",
+      "description": "Chunky cool-gray ore cluster for early mining loops.",
+      "texturePath": "/sprites/world-resource-iron-ore.png",
+      "metadataPath": "/sprites/world-resource-iron-ore.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "resource-copper-ore",
+      "category": "resource",
+      "kind": "copper_ore",
+      "label": "Copper Ore Node",
+      "description": "Warm orange-brown ore cluster with strong contrast edges.",
+      "texturePath": "/sprites/world-resource-copper-ore.png",
+      "metadataPath": "/sprites/world-resource-copper-ore.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "resource-coal",
+      "category": "resource",
+      "kind": "coal",
+      "label": "Coal Node",
+      "description": "Dark carbon-rich cluster with matte highlights for readability.",
+      "texturePath": "/sprites/world-resource-coal.png",
+      "metadataPath": "/sprites/world-resource-coal.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "structure-beacon",
+      "category": "structure",
+      "kind": "beacon",
+      "label": "Beacon",
+      "description": "Starter beacon with bright signal core and compact base.",
+      "texturePath": "/sprites/world-structure-beacon.png",
+      "metadataPath": "/sprites/world-structure-beacon.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "structure-miner",
+      "category": "structure",
+      "kind": "miner",
+      "label": "Miner",
+      "description": "Compact mechanical drill body for resource extraction.",
+      "texturePath": "/sprites/world-structure-miner.png",
+      "metadataPath": "/sprites/world-structure-miner.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    },
+    {
+      "id": "structure-assembler",
+      "category": "structure",
+      "kind": "assembler",
+      "label": "Assembler",
+      "description": "Boxy crafting station with visible front-facing machine details.",
+      "texturePath": "/sprites/world-structure-assembler.png",
+      "metadataPath": "/sprites/world-structure-assembler.png.json",
+      "width": 64,
+      "height": 64,
+      "source": "retro-diffusion"
+    }
+  ]
+}

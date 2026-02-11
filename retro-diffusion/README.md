@@ -1,6 +1,6 @@
-# Retro Diffusion Character Pipeline
+# Retro Diffusion Asset Pipeline
 
-This folder contains the workflow to generate a top-down animated character spritesheet for the Bevy client.
+This folder contains workflows to generate character and world sprites for the Bevy client.
 
 ## API key
 
@@ -98,3 +98,34 @@ The curated multiplayer character set is consumed by:
 
 When adding/replacing variants, keep sprite ids and paths consistent across those files and
 regenerate `public/sprites/character-sprites.json`.
+
+## Generate world entity sprites (enemies/resources/buildings)
+
+Use the curated world set generator:
+
+```bash
+node retro-diffusion/generate-world-set.mjs
+```
+
+This regenerates:
+
+- `public/sprites/world-enemy-*.png`
+- `public/sprites/world-resource-*.png`
+- `public/sprites/world-structure-*.png`
+- each `*.png.json` metadata file
+- `public/sprites/world-sprites.json` manifest
+
+Generate one asset only:
+
+```bash
+node retro-diffusion/generate-world-set.mjs --only enemy-biter-small
+```
+
+Check total credit cost for the full world set without writing files:
+
+```bash
+node retro-diffusion/generate-world-set.mjs --check-cost
+```
+
+Stable ids are defined in `generate-world-set.mjs` and mirrored into the manifest.
+Keep ids/kinds stable so client render mapping remains deterministic.

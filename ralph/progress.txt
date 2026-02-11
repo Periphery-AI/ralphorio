@@ -127,4 +127,12 @@ Entry format:
 - decisions: Built directly on the existing resume-token + exponential reconnect implementation and kept worker authority/protocol contracts unchanged; lifecycle hardening was isolated to `src` transport/orchestration code (`RoomSocket` + room unauthenticated entry UX) instead of rewriting routing or server systems.
 - files: src/game/network-client.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: npm run lint (pass); npm run wasm:build:dev (pass); npm run build:web (pass)
+- commit: 1416300
+
+- timestamp: 2026-02-11
+- item: RLP2-107
+- summary: Added a Retro Diffusion world-asset pipeline and shipped generated enemy/resource/building sprites into the live Bevy render path so authoritative structures, mining nodes, enemies, and build previews now use coherent texture art instead of flat-color placeholders.
+- decisions: Kept existing server-authoritative simulation/combat/build logic unchanged and limited the slice to render assets + pipeline; embedded world sprite handle lookups into the existing `CharacterAtlasHandles` resource to avoid a Bevy system-parameter-limit rewrite while preserving module boundaries.
+- files: game-client/src/lib.rs, retro-diffusion/generate-world-set.mjs, retro-diffusion/README.md, package.json, public/sprites/world-sprites.json, public/sprites/world-enemy-*.png, public/sprites/world-enemy-*.png.json, public/sprites/world-resource-*.png, public/sprites/world-resource-*.png.json, public/sprites/world-structure-*.png, public/sprites/world-structure-*.png.json, ralph/prd.json, ralph/progress.txt
+- validation: node retro-diffusion/generate-world-set.mjs --check-cost (pass); node retro-diffusion/generate-world-set.mjs (pass, 9 assets + manifest); npm run wasm:build:dev (pass); npm run lint (pass); npm run build:web (pass)
 - commit: pending

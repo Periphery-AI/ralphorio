@@ -1,0 +1,12 @@
+{
+  "id": "resource-copper-ore",
+  "category": "resource",
+  "kind": "copper_ore",
+  "prompt": "top-down retro pixel art copper ore rock cluster, readable mining node silhouette, transparent background, centered single sprite",
+  "seed": 2702414,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

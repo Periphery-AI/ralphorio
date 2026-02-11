@@ -1,0 +1,12 @@
+{
+  "id": "enemy-biter-medium",
+  "category": "enemy",
+  "kind": "biter_medium",
+  "prompt": "top-down retro pixel art medium alien biter, heavier silhouette, transparent background, centered single sprite",
+  "seed": 3701411,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}

@@ -1,0 +1,12 @@
+{
+  "id": "resource-iron-ore",
+  "category": "resource",
+  "kind": "iron_ore",
+  "prompt": "top-down retro pixel art iron ore rock cluster, readable mining node silhouette, transparent background, centered single sprite",
+  "seed": 2702402,
+  "width": 64,
+  "height": 64,
+  "model": "rd_fast",
+  "remainingCredits": 0,
+  "creditCost": 1
+}
