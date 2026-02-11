@@ -117,7 +117,7 @@
         "Mining interaction has visible progress and animation",
         "Successful mine adds resources to inventory and updates world state"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-009",

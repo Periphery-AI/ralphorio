@@ -270,5 +270,6 @@ export type RenderSnapshotPayload = {
   previews: BuildPreview[];
   projectiles: ProjectileState[];
   terrain: TerrainSnapshot | null;
+  mining: MiningSnapshot | null;
   character: CharacterSnapshot | null;
 };

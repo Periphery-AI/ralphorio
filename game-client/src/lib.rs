@@ -9,7 +9,7 @@ use sim_core::{
     TerrainBaseKind, TerrainResourceKind, PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
     TERRAIN_GENERATOR_VERSION, TERRAIN_TILE_SIZE,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
@@ -55,6 +55,12 @@ const PROJECTILE_Z: f32 = 5.0;
 const FLOOR_Z: f32 = 0.0;
 const TERRAIN_RESOURCE_OVERLAY_Z: f32 = 0.15;
 const BUILD_PREVIEW_Z: f32 = 3.6;
+const MINING_NODE_Z: f32 = 2.7;
+const MINING_PROGRESS_Z: f32 = 2.95;
+const MINING_NODE_BASE_SIZE: f32 = 13.0;
+const MINING_PROGRESS_BAR_WIDTH: f32 = 24.0;
+const MINING_PROGRESS_BAR_HEIGHT: f32 = 4.0;
+const MINING_INTERACT_RADIUS: f32 = 20.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -116,6 +122,35 @@ struct TerrainSnapshotState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct MiningNodeSnapshotState {
+    id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    remaining: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MiningProgressSnapshotState {
+    #[serde(rename = "playerId")]
+    player_id: String,
+    #[serde(rename = "nodeId")]
+    node_id: String,
+    #[serde(rename = "startedAt")]
+    started_at: i64,
+    #[serde(rename = "completesAt")]
+    completes_at: i64,
+    progress: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MiningSnapshotState {
+    nodes: Vec<MiningNodeSnapshotState>,
+    active: Vec<MiningProgressSnapshotState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CharacterProfileSnapshotState {
     #[serde(rename = "playerId")]
     player_id: String,
@@ -147,6 +182,8 @@ struct SnapshotPayload {
     projectiles: Vec<ProjectileState>,
     #[serde(default)]
     terrain: Option<TerrainSnapshotState>,
+    #[serde(default)]
+    mining: Option<MiningSnapshotState>,
     #[serde(default)]
     character: Option<CharacterSnapshotState>,
 }
@@ -216,6 +253,21 @@ struct TerrainTileActor {
 struct TerrainResourceOverlayActor {
     grid_x: i32,
     grid_y: i32,
+}
+
+#[derive(Component)]
+struct MiningNodeActor {
+    id: String,
+    kind: String,
+    remaining: u32,
+    active: bool,
+}
+
+#[derive(Component)]
+struct MiningProgressActor {
+    player_id: String,
+    node_id: String,
+    progress: f32,
 }
 
 #[derive(Component)]
@@ -375,6 +427,11 @@ impl Default for BuildPlacementState {
     }
 }
 
+#[derive(Resource, Default)]
+struct MiningInteractionState {
+    active_node_id: Option<String>,
+}
+
 #[derive(Resource)]
 struct TerrainRenderState {
     seed: u64,
@@ -450,6 +507,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .insert_resource(NextInputSeq::default())
         .insert_resource(InputHistory::default())
         .insert_resource(BuildPlacementState::default())
+        .insert_resource(MiningInteractionState::default())
         .insert_resource(TerrainRenderState::default())
         .insert_resource(FootstepState::default())
         .add_plugins(
@@ -475,7 +533,11 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         )
         .add_systems(
             Update,
-            emit_projectile_fire_command.after(handle_build_placement_controls),
+            handle_mining_controls.after(handle_build_placement_controls),
+        )
+        .add_systems(
+            Update,
+            emit_projectile_fire_command.after(handle_mining_controls),
         )
         .add_systems(
             Update,
@@ -490,6 +552,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             Update,
             animate_character_sprites.after(smooth_remote_motion),
         )
+        .add_systems(Update, animate_mining_effects.after(apply_latest_snapshot))
         .add_systems(Update, follow_camera.after(animate_character_sprites));
     app.add_systems(Update, sync_terrain_tiles.after(apply_latest_snapshot));
 
@@ -650,6 +713,7 @@ fn apply_pending_session_reset(
     mut next_input_seq: ResMut<NextInputSeq>,
     mut input_history: ResMut<InputHistory>,
     mut placement: ResMut<BuildPlacementState>,
+    mut mining_interaction: ResMut<MiningInteractionState>,
     mut terrain_state: ResMut<TerrainRenderState>,
     mut footstep_state: ResMut<FootstepState>,
     mut local_query: Query<
@@ -667,12 +731,20 @@ fn apply_pending_session_reset(
         (&mut Visibility, &mut Transform),
         (With<LocalBuildGhost>, Without<LocalActor>),
     >,
-    remote_query: Query<Entity, With<RemoteActor>>,
-    structure_query: Query<Entity, With<StructureActor>>,
-    preview_query: Query<Entity, With<BuildPreviewActor>>,
-    projectile_query: Query<Entity, With<ProjectileActor>>,
-    predicted_projectile_query: Query<Entity, With<PredictedProjectileActor>>,
-    terrain_query: Query<Entity, Or<(With<TerrainTileActor>, With<TerrainResourceOverlayActor>)>>,
+    resettable_query: Query<
+        Entity,
+        Or<(
+            With<RemoteActor>,
+            With<StructureActor>,
+            With<MiningNodeActor>,
+            With<MiningProgressActor>,
+            With<BuildPreviewActor>,
+            With<ProjectileActor>,
+            With<PredictedProjectileActor>,
+            With<TerrainTileActor>,
+            With<TerrainResourceOverlayActor>,
+        )>,
+    >,
 ) {
     if !take_pending_session_reset() {
         return;
@@ -685,6 +757,7 @@ fn apply_pending_session_reset(
     next_input_seq.0 = 1;
     input_history.0.clear();
     *placement = BuildPlacementState::default();
+    *mining_interaction = MiningInteractionState::default();
     terrain_state.last_center_cell = None;
     terrain_state.needs_refresh = true;
     *footstep_state = FootstepState::default();
@@ -709,22 +782,7 @@ fn apply_pending_session_reset(
         transform.translation.y = 0.0;
     }
 
-    for entity in &remote_query {
-        commands.entity(entity).despawn_recursive();
-    }
-    for entity in &structure_query {
-        commands.entity(entity).despawn_recursive();
-    }
-    for entity in &preview_query {
-        commands.entity(entity).despawn_recursive();
-    }
-    for entity in &projectile_query {
-        commands.entity(entity).despawn_recursive();
-    }
-    for entity in &predicted_projectile_query {
-        commands.entity(entity).despawn_recursive();
-    }
-    for entity in &terrain_query {
+    for entity in &resettable_query {
         commands.entity(entity).despawn_recursive();
     }
 }
@@ -935,6 +993,105 @@ fn handle_build_placement_controls(
                 "clientBuildId": format!("build_{}", Uuid::new_v4()),
             }),
         );
+    }
+}
+
+fn handle_mining_controls(
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    placement: Res<BuildPlacementState>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    node_query: Query<(&MiningNodeActor, &Transform)>,
+    mut mining_interaction: ResMut<MiningInteractionState>,
+) {
+    let cancel_active = |node_id: &str| {
+        queue_feature_command(
+            "mining",
+            "cancel",
+            json!({
+                "nodeId": node_id,
+            }),
+        );
+    };
+
+    if placement.active {
+        if let Some(active_node_id) = mining_interaction.active_node_id.take() {
+            cancel_active(active_node_id.as_str());
+        }
+        return;
+    }
+
+    let hovered_node_id = if let Ok(window) = window_query.get_single() {
+        if let Some(cursor_pos) = window.cursor_position() {
+            if let Ok((camera, camera_transform)) = camera_query.get_single() {
+                if let Some(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor_pos) {
+                    let mut hovered: Option<(String, f32)> = None;
+                    for (node, transform) in &node_query {
+                        if node.remaining == 0 {
+                            continue;
+                        }
+                        let distance_sq =
+                            world_pos.distance_squared(transform.translation.truncate());
+                        if distance_sq > MINING_INTERACT_RADIUS * MINING_INTERACT_RADIUS {
+                            continue;
+                        }
+
+                        match hovered {
+                            Some((_, best_distance_sq)) if distance_sq >= best_distance_sq => {}
+                            _ => {
+                                hovered = Some((node.id.clone(), distance_sq));
+                            }
+                        }
+                    }
+                    hovered.map(|(node_id, _)| node_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if mouse_buttons.just_released(MouseButton::Left) {
+        if let Some(active_node_id) = mining_interaction.active_node_id.take() {
+            cancel_active(active_node_id.as_str());
+        }
+        return;
+    }
+
+    if !mouse_buttons.pressed(MouseButton::Left) {
+        return;
+    }
+
+    match hovered_node_id {
+        Some(hovered_node_id) => {
+            if mining_interaction.active_node_id.as_deref() == Some(hovered_node_id.as_str()) {
+                return;
+            }
+
+            if let Some(active_node_id) = mining_interaction.active_node_id.take() {
+                cancel_active(active_node_id.as_str());
+            }
+
+            queue_feature_command(
+                "mining",
+                "start",
+                json!({
+                    "nodeId": hovered_node_id,
+                }),
+            );
+            mining_interaction.active_node_id = Some(hovered_node_id);
+        }
+        None => {
+            if let Some(active_node_id) = mining_interaction.active_node_id.take() {
+                cancel_active(active_node_id.as_str());
+            }
+        }
     }
 }
 
@@ -1178,6 +1335,7 @@ fn apply_latest_snapshot(
     mut commands: Commands,
     character_atlas: Res<CharacterAtlasHandles>,
     current_player_id: Res<CurrentPlayerId>,
+    mut mining_interaction: ResMut<MiningInteractionState>,
     mut terrain_state: ResMut<TerrainRenderState>,
     mut input_history: ResMut<InputHistory>,
     mut local_query: Query<
@@ -1200,6 +1358,8 @@ fn apply_latest_snapshot(
         With<RemoteActor>,
     >,
     structure_query: Query<(Entity, &StructureActor)>,
+    mining_node_query: Query<(Entity, &MiningNodeActor)>,
+    mining_progress_query: Query<(Entity, &MiningProgressActor)>,
     preview_query: Query<(Entity, &BuildPreviewActor)>,
     projectile_query: Query<(Entity, &ProjectileActor)>,
     predicted_projectile_query: Query<(Entity, &PredictedProjectileActor)>,
@@ -1229,6 +1389,7 @@ fn apply_latest_snapshot(
         previews,
         projectiles,
         terrain,
+        mining,
         character,
         ..
     } = snapshot;
@@ -1369,6 +1530,99 @@ fn apply_latest_snapshot(
     }
 
     for entity in structure_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
+    let (mining_nodes, mining_active) = if let Some(mining_snapshot) = mining {
+        (mining_snapshot.nodes, mining_snapshot.active)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut active_node_ids: HashSet<String> = mining_active
+        .iter()
+        .map(|progress| progress.node_id.clone())
+        .collect();
+    let local_active_mining = local_player_id.as_deref().and_then(|player_id| {
+        mining_active
+            .iter()
+            .find(|progress| progress.player_id == player_id)
+    });
+    mining_interaction.active_node_id =
+        local_active_mining.map(|progress| progress.node_id.clone());
+
+    let mut mining_node_entities: HashMap<String, Entity> = mining_node_query
+        .iter()
+        .map(|(entity, node)| (node.id.clone(), entity))
+        .collect();
+    let mut mining_node_lookup = HashMap::new();
+    for node in mining_nodes {
+        if node.remaining == 0 {
+            active_node_ids.remove(node.id.as_str());
+            if let Some(entity) = mining_node_entities.remove(node.id.as_str()) {
+                commands.entity(entity).despawn_recursive();
+            }
+            continue;
+        }
+
+        mining_node_lookup.insert(node.id.clone(), node.clone());
+        if let Some(entity) = mining_node_entities.remove(node.id.as_str()) {
+            commands.entity(entity).insert((
+                Transform::from_xyz(node.x, node.y, MINING_NODE_Z),
+                MiningNodeActor {
+                    id: node.id.clone(),
+                    kind: node.kind,
+                    remaining: node.remaining,
+                    active: active_node_ids.contains(node.id.as_str()),
+                },
+            ));
+        } else {
+            spawn_mining_node_actor(
+                &mut commands,
+                &node,
+                active_node_ids.contains(node.id.as_str()),
+            );
+        }
+    }
+
+    for entity in mining_node_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
+    let mut mining_progress_entities: HashMap<String, Entity> = mining_progress_query
+        .iter()
+        .map(|(entity, progress)| (progress.player_id.clone(), entity))
+        .collect();
+    for progress in mining_active {
+        let Some(node) = mining_node_lookup.get(progress.node_id.as_str()) else {
+            if let Some(entity) = mining_progress_entities.remove(progress.player_id.as_str()) {
+                commands.entity(entity).despawn_recursive();
+            }
+            continue;
+        };
+
+        let normalized_progress = progress.progress.clamp(0.0, 1.0);
+        if let Some(entity) = mining_progress_entities.remove(progress.player_id.as_str()) {
+            commands.entity(entity).insert((
+                Transform::from_xyz(node.x, node.y + MINING_NODE_BASE_SIZE, MINING_PROGRESS_Z),
+                MiningProgressActor {
+                    player_id: progress.player_id,
+                    node_id: progress.node_id,
+                    progress: normalized_progress,
+                },
+            ));
+        } else {
+            spawn_mining_progress_actor(
+                &mut commands,
+                node.x,
+                node.y + MINING_NODE_BASE_SIZE,
+                normalized_progress,
+                progress.player_id,
+                progress.node_id,
+            );
+        }
+    }
+
+    for entity in mining_progress_entities.values() {
         commands.entity(*entity).despawn_recursive();
     }
 
@@ -1538,6 +1792,55 @@ fn animate_character_sprites(
         }
 
         atlas.index = animator.facing.row_index() * CHARACTER_ANIMATION_FRAMES + animator.frame;
+    }
+}
+
+fn animate_mining_effects(
+    time: Res<Time>,
+    current_player_id: Res<CurrentPlayerId>,
+    mut node_query: Query<(&MiningNodeActor, &mut Sprite)>,
+    mut progress_query: Query<(&MiningProgressActor, &mut Sprite, &mut Transform)>,
+) {
+    let t = time.elapsed_seconds();
+    let pulse = ((t * 8.5).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+
+    for (node, mut sprite) in &mut node_query {
+        let base = mining_node_base_color(node.kind.as_str()).to_srgba();
+        let richness = (node.remaining as f32 / 1200.0).clamp(0.22, 1.0);
+        let active_boost = if node.active {
+            0.08 + pulse * 0.12
+        } else {
+            0.0
+        };
+        let alpha = if node.active { 0.92 } else { 0.78 };
+        let scale = if node.active { 1.0 + pulse * 0.15 } else { 1.0 };
+
+        sprite.color = Color::srgba(
+            (base.red * (0.82 + richness * 0.28) + active_boost).clamp(0.0, 1.0),
+            (base.green * (0.82 + richness * 0.28) + active_boost).clamp(0.0, 1.0),
+            (base.blue * (0.82 + richness * 0.28) + active_boost).clamp(0.0, 1.0),
+            alpha,
+        );
+        sprite.custom_size = Some(Vec2::splat(mining_node_size(node.remaining) * scale));
+    }
+
+    for (progress, mut sprite, mut transform) in &mut progress_query {
+        let node_phase = (progress.node_id.len() as f32 % 9.0) * 0.33;
+        let local_pulse = (((t + node_phase) * 11.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        let width = (MINING_PROGRESS_BAR_WIDTH * progress.progress.clamp(0.0, 1.0)).max(1.0);
+        let is_local = current_player_id
+            .0
+            .as_deref()
+            .is_some_and(|player_id| player_id == progress.player_id);
+
+        sprite.custom_size = Some(Vec2::new(width, MINING_PROGRESS_BAR_HEIGHT));
+        sprite.color = if is_local {
+            Color::srgba(0.45, 0.96, 0.74, 0.62 + local_pulse * 0.34)
+        } else {
+            Color::srgba(0.99, 0.81, 0.49, 0.46 + local_pulse * 0.28)
+        };
+        transform.translation.z =
+            MINING_PROGRESS_Z + if is_local { 0.06 * local_pulse } else { 0.0 };
     }
 }
 
@@ -1778,6 +2081,20 @@ fn structure_preview_color(kind: &str, is_local: bool) -> Color {
     Color::srgba(base.red, base.green, base.blue, alpha)
 }
 
+fn mining_node_base_color(kind: &str) -> Color {
+    match kind {
+        "iron_ore" => Color::srgb_u8(133, 163, 188),
+        "copper_ore" => Color::srgb_u8(194, 116, 71),
+        "coal" => Color::srgb_u8(72, 76, 84),
+        _ => Color::srgb_u8(183, 192, 207),
+    }
+}
+
+fn mining_node_size(remaining: u32) -> f32 {
+    let richness = (remaining as f32 / 1200.0).clamp(0.18, 1.0);
+    MINING_NODE_BASE_SIZE + richness * 7.5
+}
+
 fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
     commands.spawn((
         SpriteBundle {
@@ -1791,6 +2108,55 @@ fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
         },
         StructureActor {
             id: structure.id.clone(),
+        },
+    ));
+}
+
+fn spawn_mining_node_actor(commands: &mut Commands, node: &MiningNodeSnapshotState, active: bool) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: mining_node_base_color(node.kind.as_str()),
+                custom_size: Some(Vec2::splat(mining_node_size(node.remaining))),
+                ..default()
+            },
+            transform: Transform::from_xyz(node.x, node.y, MINING_NODE_Z),
+            ..default()
+        },
+        MiningNodeActor {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            remaining: node.remaining,
+            active,
+        },
+    ));
+}
+
+fn spawn_mining_progress_actor(
+    commands: &mut Commands,
+    x: f32,
+    y: f32,
+    progress: f32,
+    player_id: String,
+    node_id: String,
+) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: Color::srgba(0.49, 0.9, 0.73, 0.82),
+                custom_size: Some(Vec2::new(
+                    (MINING_PROGRESS_BAR_WIDTH * progress.clamp(0.0, 1.0)).max(1.0),
+                    MINING_PROGRESS_BAR_HEIGHT,
+                )),
+                ..default()
+            },
+            transform: Transform::from_xyz(x, y, MINING_PROGRESS_Z),
+            ..default()
+        },
+        MiningProgressActor {
+            player_id,
+            node_id,
+            progress: progress.clamp(0.0, 1.0),
         },
     ));
 }

@@ -119,6 +119,8 @@ export function RoomRoute() {
   const [projectileCount, setProjectileCount] = useState(0);
   const [inventoryStackCount, setInventoryStackCount] = useState(0);
   const [inventoryItemCount, setInventoryItemCount] = useState(0);
+  const [miningNodeCount, setMiningNodeCount] = useState(0);
+  const [miningActiveCount, setMiningActiveCount] = useState(0);
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [devInput, setDevInput] = useState('');
   const [devLog, setDevLog] = useState<string[]>([]);
@@ -216,6 +218,7 @@ export function RoomRoute() {
             const build = snapshot.features.build;
             const projectile = snapshot.features.projectile;
             const inventory = snapshot.features.inventory;
+            const mining = snapshot.features.mining;
 
             if (movement) {
               localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
@@ -244,6 +247,11 @@ export function RoomRoute() {
                   localInventory.stacks.reduce((total, stack) => total + stack.amount, 0),
                 );
               }
+            }
+
+            if (mining) {
+              setMiningNodeCount(mining.nodeCount);
+              setMiningActiveCount(mining.activeCount);
             }
           },
           onAck: (seq) => {
@@ -426,7 +434,8 @@ export function RoomRoute() {
 
         <div className="flex items-center gap-2 text-xs sm:gap-3">
           <span className="hud-pill">Q = Build</span>
-          <span className="hud-pill">Click = Place</span>
+          <span className="hud-pill">Hold Click = Mine</span>
+          <span className="hud-pill">Click = Place (Build Mode)</span>
           <span className="hud-pill">Space = Shoot</span>
           <MetricPill label="Tick" value={serverTick} />
           <MetricPill label="Sim" value={`${simRateHz}Hz`} />
@@ -437,6 +446,8 @@ export function RoomRoute() {
           <MetricPill label="Online" value={activePlayers} />
           <MetricPill label="Inv" value={inventoryItemCount} />
           <MetricPill label="Stacks" value={inventoryStackCount} />
+          <MetricPill label="Nodes" value={miningNodeCount} />
+          <MetricPill label="Mining" value={miningActiveCount} />
           <MetricPill label="Structures" value={structureCount} />
           <MetricPill label="Projectiles" value={projectileCount} />
           <span className="hidden rounded-md border border-white/15 bg-[#101b31] px-3 py-1.5 text-[#cfddf9] md:inline-flex">

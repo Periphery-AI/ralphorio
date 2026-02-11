@@ -229,6 +229,7 @@ export class ReplicationPipeline {
     const structures = copyStructures(latest.features.build?.structures ?? []);
     const previews = copyPreviews(latest.features.build?.previews ?? []);
     const terrain = latest.features.terrain ?? null;
+    const mining = latest.features.mining ?? null;
     const character = latest.features.character ?? null;
 
     return {
@@ -241,6 +242,7 @@ export class ReplicationPipeline {
       previews,
       projectiles,
       terrain,
+      mining,
       character,
     };
   }

@@ -5,8 +5,9 @@ use serde_json::{json, Map as JsonMap, Value};
 use sim_core::domain::{DEFAULT_INVENTORY_MAX_SLOTS, GAMEPLAY_SCHEMA_VERSION};
 use sim_core::{
     deterministic_seed_from_room_code, movement_step_with_obstacles, projectile_step,
-    InputState as CoreInputState, StructureObstacle, PLAYER_COLLIDER_RADIUS,
-    STRUCTURE_COLLIDER_HALF_EXTENT, TERRAIN_GENERATOR_VERSION, TERRAIN_TILE_SIZE,
+    sample_terrain, InputState as CoreInputState, StructureObstacle, TerrainResourceKind,
+    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT, TERRAIN_GENERATOR_VERSION,
+    TERRAIN_TILE_SIZE,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -40,6 +41,13 @@ const RESUME_TOKEN_TTL_MS: i64 = 86_400_000;
 const PREVIEW_COMMAND_MIN_INTERVAL_MS: i64 = 40;
 const PLACE_COMMAND_MIN_INTERVAL_MS: i64 = 120;
 const PROJECTILE_FIRE_MIN_INTERVAL_MS: i64 = 33;
+const MINING_DURATION_MS: i64 = 900;
+const MINING_YIELD_PER_ACTION: u32 = 6;
+const MINING_INTERACTION_RANGE: f32 = 74.0;
+const MINING_NODE_SCAN_RADIUS_TILES: i32 = 14;
+const MAX_MINING_NODES: usize = 4096;
+const MAX_MINING_NODES_PER_SNAPSHOT: usize = 384;
+const MAX_MINING_ACTIVE_PER_SNAPSHOT: usize = 256;
 
 const MAX_STRUCTURES: usize = 1024;
 const MAX_PROJECTILES: usize = 4096;
@@ -58,6 +66,7 @@ const SUPPORTED_RESOURCE_IDS: [&str; 7] = [
     "copper_plate",
     "gear",
 ];
+const SUPPORTED_MINING_NODE_KINDS: [&str; 3] = ["iron_ore", "copper_ore", "coal"];
 const DEFAULT_CHARACTER_PROFILE_ID: &str = "default";
 const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
@@ -321,6 +330,19 @@ struct InventoryStackRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct MiningNodeRow {
+    node_id: String,
+    kind: String,
+    x: f64,
+    y: f64,
+    grid_x: i64,
+    grid_y: i64,
+    remaining: i64,
+    max_yield: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct RuntimeHydratedPlayerRow {
     player_id: String,
     x: f64,
@@ -397,6 +419,27 @@ struct RuntimeInventoryStackState {
 struct RuntimeInventoryState {
     max_slots: u8,
     slots: Vec<Option<RuntimeInventoryStackState>>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeMiningNodeState {
+    node_id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    grid_x: i32,
+    grid_y: i32,
+    remaining: u32,
+    max_yield: u32,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeMiningProgressState {
+    player_id: String,
+    node_id: String,
+    started_at: i64,
+    completes_at: i64,
 }
 
 impl RuntimeInventoryState {
@@ -631,6 +674,8 @@ struct RoomRuntimeState {
     previews: HashMap<String, RuntimePreviewState>,
     projectiles: HashMap<String, RuntimeProjectileState>,
     inventories: HashMap<String, RuntimeInventoryState>,
+    mining_nodes: HashMap<String, RuntimeMiningNodeState>,
+    mining_active: HashMap<String, RuntimeMiningProgressState>,
 }
 
 fn now_ms() -> i64 {
@@ -715,6 +760,39 @@ fn is_supported_resource_id(resource_id: &str) -> bool {
     SUPPORTED_RESOURCE_IDS
         .iter()
         .any(|supported| supported == &resource_id)
+}
+
+fn is_supported_mining_node_kind(kind: &str) -> bool {
+    SUPPORTED_MINING_NODE_KINDS
+        .iter()
+        .any(|supported| supported == &kind)
+}
+
+fn terrain_resource_to_inventory_id(resource: TerrainResourceKind) -> &'static str {
+    match resource {
+        TerrainResourceKind::IronOre => "iron_ore",
+        TerrainResourceKind::CopperOre => "copper_ore",
+        TerrainResourceKind::Coal => "coal",
+    }
+}
+
+fn mining_node_id_for_grid(grid_x: i32, grid_y: i32) -> String {
+    format!("node:{grid_x}:{grid_y}")
+}
+
+fn terrain_grid_axis(world_axis: f32) -> i32 {
+    (world_axis / TERRAIN_TILE_SIZE as f32).floor() as i32
+}
+
+fn player_within_mining_range(player_x: f32, player_y: f32, node: &RuntimeMiningNodeState) -> bool {
+    let dx = player_x - node.x;
+    let dy = player_y - node.y;
+    dx * dx + dy * dy <= MINING_INTERACTION_RANGE * MINING_INTERACTION_RANGE
+}
+
+fn mining_progress_ratio(progress: &RuntimeMiningProgressState, now: i64) -> f32 {
+    let duration_ms = (progress.completes_at - progress.started_at).max(1) as f32;
+    ((now - progress.started_at) as f32 / duration_ms).clamp(0.0, 1.0)
 }
 
 fn default_character_name_for_player(player_id: &str) -> String {
@@ -975,6 +1053,7 @@ pub struct RoomDurableObject {
     dirty_build: Cell<bool>,
     dirty_projectiles: Cell<bool>,
     dirty_inventory: Cell<bool>,
+    dirty_mining: Cell<bool>,
     terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
 }
@@ -1052,12 +1131,26 @@ impl RoomDurableObject {
             )?
             .to_array()?;
 
+        let mining_rows: Vec<MiningNodeRow> = sql
+            .exec(
+                "
+                SELECT node_id, kind, x, y, grid_x, grid_y, remaining, max_yield, updated_at
+                FROM mining_nodes
+                ORDER BY updated_at DESC
+                LIMIT ?
+                ",
+                Some(vec![(MAX_MINING_NODES as i64).into()]),
+            )?
+            .to_array()?;
+
         let mut runtime = self.runtime.borrow_mut();
         runtime.players.clear();
         runtime.structures.clear();
         runtime.previews.clear();
         runtime.projectiles.clear();
         runtime.inventories.clear();
+        runtime.mining_nodes.clear();
+        runtime.mining_active.clear();
 
         for row in player_rows {
             runtime.players.insert(
@@ -1128,6 +1221,45 @@ impl RoomDurableObject {
                 resource: row.resource,
                 amount,
             });
+        }
+
+        for row in mining_rows {
+            if !is_valid_protocol_identifier(row.node_id.as_str())
+                || !is_supported_mining_node_kind(row.kind.as_str())
+                || row.remaining < 0
+                || row.max_yield <= 0
+                || row.remaining > row.max_yield
+            {
+                continue;
+            }
+
+            let Ok(grid_x) = i32::try_from(row.grid_x) else {
+                continue;
+            };
+            let Ok(grid_y) = i32::try_from(row.grid_y) else {
+                continue;
+            };
+            let Ok(remaining) = u32::try_from(row.remaining) else {
+                continue;
+            };
+            let Ok(max_yield) = u32::try_from(row.max_yield) else {
+                continue;
+            };
+
+            runtime.mining_nodes.insert(
+                row.node_id.clone(),
+                RuntimeMiningNodeState {
+                    node_id: row.node_id,
+                    kind: row.kind,
+                    x: row.x as f32,
+                    y: row.y as f32,
+                    grid_x,
+                    grid_y,
+                    remaining,
+                    max_yield,
+                    updated_at: row.updated_at,
+                },
+            );
         }
 
         drop(runtime);
@@ -1262,6 +1394,126 @@ impl RoomDurableObject {
         }
 
         Ok(())
+    }
+
+    fn persist_mining_node(&self, node: &RuntimeMiningNodeState) -> Result<()> {
+        self.sql().exec(
+            "
+            INSERT INTO mining_nodes (node_id, kind, x, y, grid_x, grid_y, remaining, max_yield, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+              kind = excluded.kind,
+              x = excluded.x,
+              y = excluded.y,
+              grid_x = excluded.grid_x,
+              grid_y = excluded.grid_y,
+              remaining = excluded.remaining,
+              max_yield = excluded.max_yield,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                node.node_id.as_str().into(),
+                node.kind.as_str().into(),
+                (node.x as f64).into(),
+                (node.y as f64).into(),
+                (node.grid_x as i64).into(),
+                (node.grid_y as i64).into(),
+                (node.remaining as i64).into(),
+                (node.max_yield as i64).into(),
+                node.updated_at.into(),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn materialize_mining_nodes_for_connected_players(&self) -> Result<bool> {
+        let connected_players = self.connected_player_ids();
+        if connected_players.is_empty() {
+            return Ok(false);
+        }
+
+        let player_centers: Vec<(i32, i32)> = {
+            let runtime = self.runtime.borrow();
+            connected_players
+                .iter()
+                .filter_map(|player_id| runtime.players.get(player_id))
+                .filter(|player| player.connected)
+                .map(|player| (terrain_grid_axis(player.x), terrain_grid_axis(player.y)))
+                .collect()
+        };
+
+        if player_centers.is_empty() {
+            return Ok(false);
+        }
+
+        let seed = self.terrain_seed.get();
+        let now = now_ms();
+        let mut discovered: Vec<RuntimeMiningNodeState> = Vec::new();
+        let mut discovered_ids = HashSet::new();
+
+        {
+            let runtime = self.runtime.borrow();
+            for (center_x, center_y) in player_centers.iter().copied() {
+                for grid_x in (center_x - MINING_NODE_SCAN_RADIUS_TILES)
+                    ..=(center_x + MINING_NODE_SCAN_RADIUS_TILES)
+                {
+                    for grid_y in (center_y - MINING_NODE_SCAN_RADIUS_TILES)
+                        ..=(center_y + MINING_NODE_SCAN_RADIUS_TILES)
+                    {
+                        let node_id = mining_node_id_for_grid(grid_x, grid_y);
+                        if runtime.mining_nodes.contains_key(node_id.as_str())
+                            || discovered_ids.contains(node_id.as_str())
+                        {
+                            continue;
+                        }
+
+                        let sample = sample_terrain(seed, grid_x, grid_y);
+                        let Some(resource) = sample.resource else {
+                            continue;
+                        };
+
+                        let kind = terrain_resource_to_inventory_id(resource).to_string();
+                        if !is_supported_mining_node_kind(kind.as_str()) {
+                            continue;
+                        }
+
+                        let max_yield = sample.resource_richness.max(1) as u32;
+                        discovered_ids.insert(node_id.clone());
+                        discovered.push(RuntimeMiningNodeState {
+                            node_id,
+                            kind,
+                            x: (grid_x as f32) * TERRAIN_TILE_SIZE as f32,
+                            y: (grid_y as f32) * TERRAIN_TILE_SIZE as f32,
+                            grid_x,
+                            grid_y,
+                            remaining: max_yield,
+                            max_yield,
+                            updated_at: now,
+                        });
+                    }
+                }
+            }
+        }
+
+        if discovered.is_empty() {
+            return Ok(false);
+        }
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            for node in discovered.iter() {
+                runtime
+                    .mining_nodes
+                    .entry(node.node_id.clone())
+                    .or_insert_with(|| node.clone());
+            }
+        }
+
+        for node in discovered.iter() {
+            self.persist_mining_node(node)?;
+        }
+
+        Ok(true)
     }
 
     fn checkpoint_runtime_if_due(&self) -> Result<()> {
@@ -1791,6 +2043,28 @@ impl RoomDurableObject {
 
         sql.exec(
             "
+            CREATE TABLE IF NOT EXISTS mining_nodes (
+              node_id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              x REAL NOT NULL,
+              y REAL NOT NULL,
+              grid_x INTEGER NOT NULL,
+              grid_y INTEGER NOT NULL,
+              remaining INTEGER NOT NULL,
+              max_yield INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_mining_nodes_grid ON mining_nodes(grid_x, grid_y)",
+            None,
+        )?;
+
+        sql.exec(
+            "
             CREATE TABLE IF NOT EXISTS build_structures (
               structure_id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
@@ -1909,6 +2183,17 @@ impl RoomDurableObject {
         sql.exec(
             "DELETE FROM player_inventory_stacks WHERE slot < 0 OR slot >= ? OR amount <= 0",
             Some(vec![(DEFAULT_INVENTORY_MAX_SLOTS as i64).into()]),
+        )?;
+
+        sql.exec(
+            "
+            DELETE FROM mining_nodes
+            WHERE remaining < 0
+               OR max_yield <= 0
+               OR remaining > max_yield
+               OR kind NOT IN ('iron_ore', 'copper_ore', 'coal')
+            ",
+            None,
         )?;
 
         self.backfill_character_profiles_from_presence()?;
@@ -2152,6 +2437,7 @@ impl RoomDurableObject {
 
         self.ensure_default_character_profile(player_id)?;
         self.ensure_runtime_inventory_for_player(player_id);
+        let mining_discovered = self.materialize_mining_nodes_for_connected_players()?;
 
         {
             let mut runtime = self.runtime.borrow_mut();
@@ -2180,6 +2466,9 @@ impl RoomDurableObject {
         self.snapshot_dirty.set(true);
         self.dirty_presence.set(true);
         self.dirty_inventory.set(true);
+        if mining_discovered {
+            self.dirty_mining.set(true);
+        }
         Ok(())
     }
 
@@ -2199,6 +2488,7 @@ impl RoomDurableObject {
                 player.last_seen = now;
             }
             runtime.previews.remove(player_id);
+            runtime.mining_active.remove(player_id);
         }
 
         self.checkpoint_runtime_players_to_db()?;
@@ -2208,6 +2498,7 @@ impl RoomDurableObject {
         self.dirty_presence.set(true);
         self.dirty_build.set(true);
         self.dirty_inventory.set(true);
+        self.dirty_mining.set(true);
         Ok(())
     }
 
@@ -2673,10 +2964,53 @@ impl RoomDurableObject {
                 if !is_valid_protocol_identifier(start_payload.node_id.as_str()) {
                     return Err(Error::RustError("invalid mining node id".into()));
                 }
+                self.materialize_mining_nodes_for_connected_players()?;
 
-                Err(Error::RustError(
-                    "mining commands are not implemented".into(),
-                ))
+                let changed = {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let (player_x, player_y) = {
+                        let player = runtime
+                            .players
+                            .entry(player_id.to_string())
+                            .or_insert_with(|| Self::default_runtime_player(now));
+                        player.last_seen = now;
+                        (player.x, player.y)
+                    };
+
+                    let node = runtime
+                        .mining_nodes
+                        .get(start_payload.node_id.as_str())
+                        .cloned()
+                        .ok_or_else(|| Error::RustError("mining node not found".into()))?;
+                    if node.remaining == 0 {
+                        return Err(Error::RustError("mining node is depleted".into()));
+                    }
+                    if !player_within_mining_range(player_x, player_y, &node) {
+                        return Err(Error::RustError("mining node out of range".into()));
+                    }
+
+                    let changed = match runtime.mining_active.get(player_id) {
+                        Some(existing) => existing.node_id != node.node_id,
+                        None => true,
+                    };
+                    runtime.mining_active.insert(
+                        player_id.to_string(),
+                        RuntimeMiningProgressState {
+                            player_id: player_id.to_string(),
+                            node_id: node.node_id,
+                            started_at: now,
+                            completes_at: now + MINING_DURATION_MS,
+                        },
+                    );
+                    changed
+                };
+
+                if changed {
+                    self.dirty_mining.set(true);
+                    self.snapshot_dirty.set(true);
+                }
+
+                Ok(changed)
             }
             "cancel" => {
                 let payload =
@@ -2689,10 +3023,29 @@ impl RoomDurableObject {
                         return Err(Error::RustError("invalid mining node id".into()));
                     }
                 }
+                let removed = {
+                    let mut runtime = self.runtime.borrow_mut();
+                    if let Some(existing) = runtime.mining_active.get(player_id) {
+                        if let Some(node_id) = cancel_payload.node_id.as_deref() {
+                            if existing.node_id != node_id {
+                                false
+                            } else {
+                                runtime.mining_active.remove(player_id).is_some()
+                            }
+                        } else {
+                            runtime.mining_active.remove(player_id).is_some()
+                        }
+                    } else {
+                        false
+                    }
+                };
 
-                Err(Error::RustError(
-                    "mining commands are not implemented".into(),
-                ))
+                if removed {
+                    self.dirty_mining.set(true);
+                    self.snapshot_dirty.set(true);
+                }
+
+                Ok(removed)
             }
             _ => Err(Error::RustError("invalid mining action".into())),
         }
@@ -2882,11 +3235,16 @@ impl RoomDurableObject {
             let connected_players = self.connected_player_ids();
             let movement_changed = self.tick_movement(&connected_players)?;
             let projectile_changed = self.tick_projectiles()?;
+            let mining_changed = self.tick_mining()?;
 
-            if movement_changed || projectile_changed {
+            if movement_changed || projectile_changed || mining_changed {
                 self.snapshot_dirty.set(true);
                 if projectile_changed {
                     self.dirty_projectiles.set(true);
+                }
+                if mining_changed {
+                    self.dirty_mining.set(true);
+                    self.dirty_inventory.set(true);
                 }
             }
 
@@ -2897,6 +3255,7 @@ impl RoomDurableObject {
                 self.dirty_build.set(false);
                 self.dirty_projectiles.set(false);
                 self.dirty_inventory.set(false);
+                self.dirty_mining.set(false);
             }
 
             self.checkpoint_runtime_if_due()?;
@@ -3009,11 +3368,138 @@ impl RoomDurableObject {
         Ok(changed)
     }
 
+    fn tick_mining(&self) -> Result<bool> {
+        let now = now_ms();
+        let mut changed = false;
+        let mut inventory_players_to_persist = HashSet::new();
+        let mut nodes_to_persist: Vec<RuntimeMiningNodeState> = Vec::new();
+        let mut depleted_node_ids: HashSet<String> = HashSet::new();
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            if runtime.mining_active.is_empty() {
+                return Ok(false);
+            }
+
+            let mining_players: Vec<String> = runtime.mining_active.keys().cloned().collect();
+            for active_player_id in mining_players {
+                let Some(progress) = runtime
+                    .mining_active
+                    .get(active_player_id.as_str())
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                let Some(player) = runtime.players.get(active_player_id.as_str()) else {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                };
+                if !player.connected {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                }
+
+                let Some(current_node) =
+                    runtime.mining_nodes.get(progress.node_id.as_str()).cloned()
+                else {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                };
+
+                if current_node.remaining == 0
+                    || !player_within_mining_range(player.x, player.y, &current_node)
+                {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                }
+
+                if now < progress.completes_at {
+                    continue;
+                }
+
+                let mined_amount = current_node.remaining.min(MINING_YIELD_PER_ACTION);
+                if mined_amount == 0 {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                }
+
+                let inventory = runtime
+                    .inventories
+                    .entry(active_player_id.clone())
+                    .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                inventory.normalize();
+                if inventory
+                    .add_resource(current_node.kind.as_str(), mined_amount)
+                    .is_err()
+                {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                }
+                inventory_players_to_persist.insert(active_player_id.clone());
+
+                let Some(node) = runtime.mining_nodes.get_mut(progress.node_id.as_str()) else {
+                    runtime.mining_active.remove(active_player_id.as_str());
+                    changed = true;
+                    continue;
+                };
+                node.remaining = node.remaining.saturating_sub(mined_amount);
+                node.updated_at = now;
+                nodes_to_persist.push(node.clone());
+                changed = true;
+                let node_id = node.node_id.clone();
+                let node_remaining = node.remaining;
+                let _ = node;
+
+                if node_remaining == 0 {
+                    depleted_node_ids.insert(node_id);
+                    runtime.mining_active.remove(active_player_id.as_str());
+                } else {
+                    runtime.mining_active.insert(
+                        active_player_id.clone(),
+                        RuntimeMiningProgressState {
+                            player_id: active_player_id.clone(),
+                            node_id,
+                            started_at: now,
+                            completes_at: now + MINING_DURATION_MS,
+                        },
+                    );
+                }
+            }
+
+            if !depleted_node_ids.is_empty() {
+                let removed_before = runtime.mining_active.len();
+                runtime
+                    .mining_active
+                    .retain(|_, progress| !depleted_node_ids.contains(progress.node_id.as_str()));
+                if runtime.mining_active.len() != removed_before {
+                    changed = true;
+                }
+            }
+        }
+
+        for player_id in inventory_players_to_persist.iter() {
+            self.persist_inventory_for_player(player_id.as_str())?;
+        }
+        for node in nodes_to_persist.iter() {
+            self.persist_mining_node(node)?;
+        }
+
+        Ok(changed)
+    }
+
     fn snapshot_payload(&self, full: bool) -> Result<Value> {
         let connected_players = self.connected_player_ids();
         let connected_set: HashSet<&str> = connected_players.iter().map(String::as_str).collect();
         let online = connected_players.clone();
         let now = now_ms();
+        let mining_discovered = self.materialize_mining_nodes_for_connected_players()?;
 
         self.prune_stale_build_previews()?;
         let runtime = self.runtime.borrow();
@@ -3143,11 +3629,74 @@ impl RoomDurableObject {
             }));
         }
 
+        let mut visible_mining_nodes: Vec<&RuntimeMiningNodeState> = runtime
+            .mining_nodes
+            .values()
+            .filter(|node| node.remaining > 0)
+            .filter(|node| {
+                connected_players.iter().any(|player_id| {
+                    runtime.players.get(player_id).is_some_and(|player| {
+                        (terrain_grid_axis(player.x) - node.grid_x).abs()
+                            <= MINING_NODE_SCAN_RADIUS_TILES + 2
+                            && (terrain_grid_axis(player.y) - node.grid_y).abs()
+                                <= MINING_NODE_SCAN_RADIUS_TILES + 2
+                    })
+                })
+            })
+            .collect();
+        visible_mining_nodes.sort_by_key(|node| std::cmp::Reverse(node.updated_at));
+        let visible_mining_node_count = visible_mining_nodes.len();
+        if visible_mining_nodes.len() > MAX_MINING_NODES_PER_SNAPSHOT {
+            visible_mining_nodes.truncate(MAX_MINING_NODES_PER_SNAPSHOT);
+        }
+
+        let mining_nodes: Vec<Value> = visible_mining_nodes
+            .iter()
+            .map(|node| {
+                json!({
+                    "id": node.node_id,
+                    "kind": node.kind,
+                    "x": node.x,
+                    "y": node.y,
+                    "remaining": node.remaining,
+                })
+            })
+            .collect();
+
+        let mut mining_active_rows: Vec<&RuntimeMiningProgressState> = runtime
+            .mining_active
+            .values()
+            .filter(|progress| connected_set.contains(progress.player_id.as_str()))
+            .collect();
+        mining_active_rows.sort_by_key(|progress| std::cmp::Reverse(progress.started_at));
+        let mining_active_count = mining_active_rows.len();
+        if mining_active_rows.len() > MAX_MINING_ACTIVE_PER_SNAPSHOT {
+            mining_active_rows.truncate(MAX_MINING_ACTIVE_PER_SNAPSHOT);
+        }
+
+        let mining_active: Vec<Value> = mining_active_rows
+            .iter()
+            .filter_map(|progress| {
+                let node = runtime.mining_nodes.get(progress.node_id.as_str())?;
+                if node.remaining == 0 {
+                    return None;
+                }
+                Some(json!({
+                    "playerId": progress.player_id,
+                    "nodeId": progress.node_id,
+                    "startedAt": progress.started_at,
+                    "completesAt": progress.completes_at,
+                    "progress": mining_progress_ratio(progress, now),
+                }))
+            })
+            .collect();
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
         let include_inventory = full || self.dirty_inventory.get();
-        let include_mining = full;
+        let include_mining =
+            full || self.dirty_mining.get() || mining_discovered || !mining_active.is_empty();
         let include_crafting = full;
         let include_combat = full;
         let include_character = full || self.dirty_presence.get();
@@ -3221,10 +3770,10 @@ impl RoomDurableObject {
                 "mining".to_string(),
                 json!({
                     "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
-                    "nodes": [],
-                    "nodeCount": 0,
-                    "active": [],
-                    "activeCount": 0,
+                    "nodes": mining_nodes,
+                    "nodeCount": visible_mining_node_count,
+                    "active": mining_active,
+                    "activeCount": mining_active_count,
                 }),
             );
         }
@@ -3440,6 +3989,7 @@ impl DurableObject for RoomDurableObject {
             dirty_build: Cell::new(false),
             dirty_projectiles: Cell::new(false),
             dirty_inventory: Cell::new(false),
+            dirty_mining: Cell::new(false),
             terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
         };
@@ -3578,6 +4128,7 @@ impl DurableObject for RoomDurableObject {
                     self.dirty_build.set(false);
                     self.dirty_projectiles.set(false);
                     self.dirty_inventory.set(false);
+                    self.dirty_mining.set(false);
                 }
             }
             Err(error) => {
@@ -3694,5 +4245,26 @@ mod tests {
             .move_stack(0, 1, Some(4))
             .expect_err("partial swap should fail");
         assert!(format!("{error}").contains("different resource"));
+    }
+
+    #[test]
+    fn mining_node_identifier_uses_protocol_safe_shape() {
+        let node_id = mining_node_id_for_grid(-12, 48);
+        assert_eq!(node_id, "node:-12:48");
+        assert!(is_valid_protocol_identifier(node_id.as_str()));
+    }
+
+    #[test]
+    fn mining_progress_ratio_clamps_to_valid_range() {
+        let progress = RuntimeMiningProgressState {
+            player_id: "p1".to_string(),
+            node_id: "node:0:0".to_string(),
+            started_at: 1_000,
+            completes_at: 2_000,
+        };
+
+        assert_eq!(mining_progress_ratio(&progress, 0), 0.0);
+        assert!((mining_progress_ratio(&progress, 1_500) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(mining_progress_ratio(&progress, 3_000), 1.0);
     }
 }

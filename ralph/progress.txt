@@ -73,3 +73,11 @@ Format per entry:
 - files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (3 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-008
+- summary: Implemented server-authoritative mining with deterministic resource-node materialization, timed mining progress, persistent node depletion, inventory rewards, and client-side mining visuals/interaction.
+- decisions: Materialize mining nodes deterministically from terrain seed around connected players and persist node state (`remaining`/`max_yield`) in SQLite to prevent depleted-node respawns; drive mining as a server tick loop with start/cancel commands and fixed action windows (`900ms`, `yield=6`) while cancelling out-of-range/full-inventory miners safely; render mining nodes + animated progress bars in WASM and bind left-click hold mining outside build mode.
+- files: worker/src/lib.rs, game-client/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo fmt --manifest-path game-client/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (5 passed); cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build:web
+- commit: pending
