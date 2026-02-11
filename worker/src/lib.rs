@@ -61,7 +61,8 @@ const ENEMY_PROJECTILE_HIT_RADIUS: f32 = 20.0;
 const ENEMY_MOVE_SPEED: f32 = 86.0;
 const ENEMY_ATTACK_COOLDOWN_TICKS: u64 = 24;
 const ENEMY_SPAWN_MODULUS: u64 = 997;
-const ENEMY_SPAWN_THRESHOLD: u64 = 11;
+const ENEMY_SPAWN_THRESHOLD: u64 = 7;
+const ENEMY_SPAWN_GRACE_MS: i64 = 75_000;
 const ENEMY_SPAWN_SALT: u64 = 0x6d13_ef42_2dd9_1f7a;
 const ENEMY_KIND_BITER: &str = "biter";
 const ENEMY_MAX_HEALTH: u16 = 64;
@@ -108,7 +109,8 @@ const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
 const MAX_CHARACTER_PROFILE_SLOTS: usize = 8;
 
-const BUILD_COST_BEACON: [(&str, u32); 2] = [("iron_plate", 2), ("copper_plate", 1)];
+const BUILD_COST_BEACON: [(&str, u32); 3] =
+    [("iron_plate", 4), ("copper_plate", 2), ("gear", 1)];
 const BUILD_COST_MINER: [(&str, u32); 2] = [("iron_plate", 3), ("gear", 2)];
 const BUILD_COST_ASSEMBLER: [(&str, u32); 2] = [("iron_plate", 9), ("gear", 5)];
 
@@ -429,6 +431,7 @@ struct RuntimePlayerState {
     input: InputState,
     last_input_seq: u32,
     connected: bool,
+    connected_at: i64,
     last_seen: i64,
     last_preview_cmd_at: i64,
     last_place_cmd_at: i64,
@@ -1313,6 +1316,10 @@ fn enemy_within_despawn_range(player: &RuntimePlayerState, enemy: &RuntimeEnemyS
             <= ENEMY_DESPAWN_RADIUS_TILES
 }
 
+fn player_is_combat_ready(player: &RuntimePlayerState, now: i64) -> bool {
+    player.connected && now.saturating_sub(player.connected_at) >= ENEMY_SPAWN_GRACE_MS
+}
+
 fn enemy_within_aggro_range(player: &RuntimePlayerState, enemy: &RuntimeEnemyState) -> bool {
     let dx = player.x - enemy.x;
     let dy = player.y - enemy.y;
@@ -1728,6 +1735,7 @@ impl RoomDurableObject {
             },
             last_input_seq: 0,
             connected: false,
+            connected_at: now,
             last_seen: now,
             last_preview_cmd_at: 0,
             last_place_cmd_at: 0,
@@ -1835,6 +1843,7 @@ impl RoomDurableObject {
                     },
                     last_input_seq: row.last_input_seq.max(0) as u32,
                     connected: row.connected != 0,
+                    connected_at: row.last_seen.max(0),
                     last_seen: row.last_seen.max(0),
                     last_preview_cmd_at: 0,
                     last_place_cmd_at: 0,
@@ -2371,12 +2380,13 @@ impl RoomDurableObject {
             return Ok(false);
         }
 
+        let now = now_ms();
         let player_positions: Vec<(f32, f32)> = {
             let runtime = self.runtime.borrow();
             connected_players
                 .iter()
                 .filter_map(|player_id| runtime.players.get(player_id))
-                .filter(|player| player.connected)
+                .filter(|player| player_is_combat_ready(player, now))
                 .map(|player| (player.x, player.y))
                 .collect()
         };
@@ -2390,7 +2400,6 @@ impl RoomDurableObject {
             .collect();
 
         let seed = self.terrain_seed.get();
-        let now = now_ms();
         let mut discovered: Vec<RuntimeEnemyState> = Vec::new();
         let mut discovered_ids = HashSet::new();
         let mut reached_capacity = false;
@@ -3454,6 +3463,7 @@ impl RoomDurableObject {
             };
             player.vx = 0.0;
             player.vy = 0.0;
+            player.connected_at = now;
             player.connected = true;
             player.last_seen = now;
         }
@@ -4624,6 +4634,9 @@ impl RoomDurableObject {
             player.y = step.y;
             player.vx = step.vx;
             player.vy = step.vy;
+            if !player.connected {
+                player.connected_at = now;
+            }
             player.connected = true;
             player.last_seen = now;
         }
@@ -4704,11 +4717,28 @@ impl RoomDurableObject {
                 return Ok(result);
             }
 
+            let combat_ready_player_ids: Vec<String> = connected_player_ids
+                .iter()
+                .filter(|player_id| {
+                    runtime
+                        .players
+                        .get(player_id.as_str())
+                        .is_some_and(|player| player_is_combat_ready(player, now))
+                })
+                .cloned()
+                .collect();
+            if combat_ready_player_ids.is_empty() {
+                if !runtime.enemies.is_empty() {
+                    runtime.enemies.clear();
+                    result.changed = true;
+                }
+            }
+
             let stale_enemy_ids: Vec<String> = runtime
                 .enemies
                 .values()
                 .filter(|enemy| {
-                    !connected_player_ids.iter().any(|player_id| {
+                    !combat_ready_player_ids.iter().any(|player_id| {
                         runtime
                             .players
                             .get(player_id.as_str())
@@ -4805,7 +4835,7 @@ impl RoomDurableObject {
                 }
 
                 let mut target_player: Option<(String, f32, f32, f32)> = None;
-                for player_id in connected_player_ids.iter() {
+                for player_id in combat_ready_player_ids.iter() {
                     let Some(player) = runtime.players.get(player_id.as_str()) else {
                         continue;
                     };
@@ -5757,6 +5787,9 @@ impl RoomDurableObject {
                     .players
                     .entry(player_id.clone())
                     .or_insert_with(|| Self::default_runtime_player(now));
+                if !player.connected {
+                    player.connected_at = now;
+                }
                 player.connected = true;
                 player.last_seen = now;
                 runtime
@@ -6236,13 +6269,13 @@ mod tests {
         inventory.add_resource("gear", 7).expect("seed gear");
 
         consume_structure_build_cost(&mut inventory, "beacon").expect("consume beacon cost");
-        assert_eq!(resource_total(&inventory, "iron_plate"), 14);
-        assert_eq!(resource_total(&inventory, "copper_plate"), 1);
-        assert_eq!(resource_total(&inventory, "gear"), 7);
+        assert_eq!(resource_total(&inventory, "iron_plate"), 12);
+        assert_eq!(resource_total(&inventory, "copper_plate"), 0);
+        assert_eq!(resource_total(&inventory, "gear"), 6);
 
         consume_structure_build_cost(&mut inventory, "assembler").expect("consume assembler cost");
-        assert_eq!(resource_total(&inventory, "iron_plate"), 5);
-        assert_eq!(resource_total(&inventory, "gear"), 2);
+        assert_eq!(resource_total(&inventory, "iron_plate"), 3);
+        assert_eq!(resource_total(&inventory, "gear"), 1);
     }
 
     #[test]
@@ -6405,6 +6438,7 @@ mod tests {
             },
             last_input_seq: 0,
             connected: true,
+            connected_at: 0,
             last_seen: 0,
             last_preview_cmd_at: 0,
             last_place_cmd_at: 0,
@@ -6578,6 +6612,28 @@ mod tests {
         if sample_a.is_some() && changed_sample.is_some() {
             assert_ne!(sample_a, changed_sample);
         }
+    }
+
+    #[test]
+    fn combat_ready_gate_requires_elapsed_grace_window() {
+        let mut player = RoomDurableObject::default_runtime_player(1_000);
+        player.connected = true;
+        player.connected_at = 1_000;
+
+        assert!(!player_is_combat_ready(
+            &player,
+            1_000 + ENEMY_SPAWN_GRACE_MS - 1
+        ));
+        assert!(player_is_combat_ready(
+            &player,
+            1_000 + ENEMY_SPAWN_GRACE_MS
+        ));
+
+        player.connected = false;
+        assert!(!player_is_combat_ready(
+            &player,
+            1_000 + ENEMY_SPAWN_GRACE_MS + 500
+        ));
     }
 
     #[test]
