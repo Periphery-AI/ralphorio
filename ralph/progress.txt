@@ -24,4 +24,4 @@ Format per entry:
 - decisions: Persist per-room `terrain_seed` in DO `room_meta`; expose terrain config via `features.terrain` every snapshot; centralize deterministic terrain sampling (`sample_terrain`) in `sim-core` for server/client parity and future resource loops.
 - files: sim-core/src/lib.rs, worker/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo test --manifest-path sim-core/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
-- commit: pending
+- commit: b8765e1
