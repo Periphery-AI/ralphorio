@@ -1004,6 +1004,37 @@ fn now_seconds() -> i64 {
     now_ms() / 1000
 }
 
+fn structure_cell_is_available(
+    runtime: &RoomRuntimeState,
+    grid_x: i64,
+    grid_y: i64,
+    center_x: f64,
+    center_y: f64,
+) -> bool {
+    if runtime
+        .structures
+        .values()
+        .any(|structure| structure.grid_x == grid_x && structure.grid_y == grid_y)
+    {
+        return false;
+    }
+
+    let blocked = STRUCTURE_COLLIDER_HALF_EXTENT + PLAYER_COLLIDER_RADIUS;
+    for player in runtime.players.values() {
+        if !player.connected {
+            continue;
+        }
+
+        if (player.x as f64 - center_x).abs() < blocked as f64
+            && (player.y as f64 - center_y).abs() < blocked as f64
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn decode_payload<T>(
     payload: Option<Value>,
     missing_error: &'static str,
@@ -3524,38 +3555,6 @@ impl RoomDurableObject {
         Ok(())
     }
 
-    fn can_place_structure_at_cell(
-        &self,
-        grid_x: i64,
-        grid_y: i64,
-        center_x: f64,
-        center_y: f64,
-    ) -> Result<bool> {
-        let runtime = self.runtime.borrow();
-        if runtime
-            .structures
-            .values()
-            .any(|structure| structure.grid_x == grid_x && structure.grid_y == grid_y)
-        {
-            return Ok(false);
-        }
-
-        let blocked = STRUCTURE_COLLIDER_HALF_EXTENT + PLAYER_COLLIDER_RADIUS;
-        for player in runtime.players.values() {
-            if !player.connected {
-                continue;
-            }
-
-            if (player.x as f64 - center_x).abs() < blocked as f64
-                && (player.y as f64 - center_y).abs() < blocked as f64
-            {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
     fn evaluate_structure_placement(
         &self,
         player_id: &str,
@@ -3566,7 +3565,8 @@ impl RoomDurableObject {
         center_y: f64,
         consume_inventory: bool,
     ) -> Result<Option<String>> {
-        if !self.can_place_structure_at_cell(grid_x, grid_y, center_x, center_y)? {
+        if !structure_cell_is_available(&self.runtime.borrow(), grid_x, grid_y, center_x, center_y)
+        {
             return Ok(Some("build cell is blocked".to_string()));
         }
 
@@ -6256,6 +6256,70 @@ mod tests {
         assert!(format!("{error}").contains("insufficient inventory resources"));
         assert_eq!(resource_total(&inventory, "iron_plate"), 9);
         assert_eq!(resource_total(&inventory, "gear"), 4);
+    }
+
+    #[test]
+    fn structure_cell_availability_blocks_existing_structure_cell() {
+        let mut runtime = RoomRuntimeState::default();
+        runtime.structures.insert(
+            "structure:test".to_string(),
+            RuntimeStructureState {
+                structure_id: "structure:test".to_string(),
+                owner_id: "owner".to_string(),
+                kind: "beacon".to_string(),
+                x: grid_cell_center(4) as f32,
+                y: grid_cell_center(-2) as f32,
+                grid_x: 4,
+                grid_y: -2,
+                chunk_x: chunk_coord_for_grid(4),
+                chunk_y: chunk_coord_for_grid(-2),
+                created_at: 0,
+            },
+        );
+
+        assert!(!structure_cell_is_available(
+            &runtime,
+            4,
+            -2,
+            grid_cell_center(4),
+            grid_cell_center(-2),
+        ));
+    }
+
+    #[test]
+    fn structure_cell_availability_blocks_connected_player_overlap() {
+        let mut runtime = RoomRuntimeState::default();
+        let mut player = RoomDurableObject::default_runtime_player(0);
+        player.connected = true;
+        player.x = grid_cell_center(1) as f32;
+        player.y = grid_cell_center(3) as f32;
+        runtime.players.insert("player:local".to_string(), player);
+
+        assert!(!structure_cell_is_available(
+            &runtime,
+            1,
+            3,
+            grid_cell_center(1),
+            grid_cell_center(3),
+        ));
+    }
+
+    #[test]
+    fn structure_cell_availability_ignores_disconnected_players() {
+        let mut runtime = RoomRuntimeState::default();
+        let mut player = RoomDurableObject::default_runtime_player(0);
+        player.connected = false;
+        player.x = grid_cell_center(2) as f32;
+        player.y = grid_cell_center(2) as f32;
+        runtime.players.insert("player:afk".to_string(), player);
+
+        assert!(structure_cell_is_available(
+            &runtime,
+            2,
+            2,
+            grid_cell_center(2),
+            grid_cell_center(2),
+        ));
     }
 
     #[test]

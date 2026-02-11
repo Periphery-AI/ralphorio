@@ -47,7 +47,7 @@
         "Placed building appears for all clients",
         "Placement failures provide clear reason in UI/log"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-103",

@@ -47,4 +47,12 @@ Entry format:
 - decisions: Kept existing authoritative placement/persistence flow and structure replication intact; added a single shared worker validation path (`evaluate_structure_placement`) so preview validity and actual placement rejection reasons stay aligned.
 - files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/routes/room-route.tsx, game-client/src/lib.rs, ralph/progress.txt
 - validation: cargo test (worker) (pass); cargo test (sim-core) (pass); npm run wasm:build:dev (pass); npm run build:web (pass)
+- commit: d8adabf
+
+- timestamp: 2026-02-11
+- item: RLP2-102
+- summary: Hardened placement consistency by extracting shared structure-cell availability checks and adding focused worker regression tests for blocked/allowed placement cells, then validated full worker + web build loops and closed the PRD item.
+- decisions: Kept existing authoritative placement command and replication architecture; only refactored collision gating into a pure helper (`structure_cell_is_available`) to improve testability without rewriting build/inventory systems.
+- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo test --manifest-path worker/Cargo.toml (pass, 26 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending
