@@ -69,6 +69,8 @@ const ENEMY_ARMOR: u16 = 1;
 const PLAYER_COMBAT_MAX_HEALTH: u16 = 100;
 const PLAYER_COMBAT_ATTACK_POWER: u16 = 18;
 const PLAYER_COMBAT_ARMOR: u16 = 1;
+const COMBAT_ATTACK_RANGE: f32 = 640.0;
+const COMBAT_ATTACK_PROJECTILE_SPEED: f32 = 760.0;
 const PROJECTILE_BASE_DAMAGE: u16 = 12;
 const MAX_ENEMIES: usize = 1024;
 const MAX_ENEMIES_PER_SNAPSHOT: usize = 320;
@@ -283,6 +285,7 @@ struct CraftCancelPayload {
 struct CombatAttackPayload {
     target_id: String,
     attack_id: Option<String>,
+    client_projectile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1173,6 +1176,47 @@ fn enemy_within_aggro_range(player: &RuntimePlayerState, enemy: &RuntimeEnemySta
     let dx = player.x - enemy.x;
     let dy = player.y - enemy.y;
     dx * dx + dy * dy <= ENEMY_AGGRO_RANGE * ENEMY_AGGRO_RANGE
+}
+
+fn clamp_projectile_velocity(vx: f32, vy: f32) -> (f32, f32) {
+    let speed = (vx * vx + vy * vy).sqrt();
+    if speed <= PROJECTILE_MAX_SPEED as f32 || speed <= f32::EPSILON {
+        return (vx, vy);
+    }
+
+    let scale = PROJECTILE_MAX_SPEED as f32 / speed;
+    (vx * scale, vy * scale)
+}
+
+fn player_within_combat_attack_range(
+    player_x: f32,
+    player_y: f32,
+    target_x: f32,
+    target_y: f32,
+) -> bool {
+    let dx = target_x - player_x;
+    let dy = target_y - player_y;
+    dx * dx + dy * dy <= COMBAT_ATTACK_RANGE * COMBAT_ATTACK_RANGE
+}
+
+fn projectile_velocity_towards_target(
+    source_x: f32,
+    source_y: f32,
+    target_x: f32,
+    target_y: f32,
+    speed: f32,
+) -> Option<(f32, f32)> {
+    let dx = target_x - source_x;
+    let dy = target_y - source_y;
+    let distance_sq = dx * dx + dy * dy;
+    if distance_sq <= f32::EPSILON {
+        return None;
+    }
+
+    let distance = distance_sq.sqrt();
+    let normalized_x = dx / distance;
+    let normalized_y = dy / distance;
+    Some((normalized_x * speed, normalized_y * speed))
 }
 
 fn resolve_damage(current_health: u16, armor: u16, incoming: u16) -> (u16, u16, bool) {
@@ -3592,34 +3636,17 @@ impl RoomDurableObject {
         }
     }
 
-    fn handle_projectile_fire(&self, player_id: &str, payload: Option<Value>) -> Result<bool> {
-        let payload =
-            payload.ok_or_else(|| Error::RustError("missing projectile payload".into()))?;
-        let mut fire: ProjectileFirePayload = serde_json::from_value(payload)
-            .map_err(|_| Error::RustError("invalid projectile payload".into()))?;
-        let now = now_ms();
-
-        {
-            let mut runtime = self.runtime.borrow_mut();
-            let player = runtime
-                .players
-                .entry(player_id.to_string())
-                .or_insert_with(|| Self::default_runtime_player(now));
-
-            if now - player.last_projectile_fire_at < PROJECTILE_FIRE_MIN_INTERVAL_MS {
-                return Ok(false);
-            }
-            player.last_projectile_fire_at = now;
-            player.last_seen = now;
-        }
-
-        let speed = (fire.vx * fire.vx + fire.vy * fire.vy).sqrt();
-        if speed > PROJECTILE_MAX_SPEED && speed > 0.0 {
-            let scale = PROJECTILE_MAX_SPEED / speed;
-            fire.vx *= scale;
-            fire.vy *= scale;
-        }
-
+    fn spawn_projectile(
+        &self,
+        owner_id: &str,
+        x: f32,
+        y: f32,
+        vx: f32,
+        vy: f32,
+        client_projectile_id: Option<String>,
+        now: i64,
+    ) -> String {
+        let (vx, vy) = clamp_projectile_velocity(vx, vy);
         let projectile_id = format!("proj_{}_{}", now, js_sys::Math::random());
         let expires_at = now + PROJECTILE_TTL_MS;
         let updated_at = now;
@@ -3627,14 +3654,14 @@ impl RoomDurableObject {
         self.runtime.borrow_mut().projectiles.insert(
             projectile_id.clone(),
             RuntimeProjectileState {
-                projectile_id,
-                owner_id: player_id.to_string(),
-                x: fire.x as f32,
-                y: fire.y as f32,
-                vx: fire.vx as f32,
-                vy: fire.vy as f32,
+                projectile_id: projectile_id.clone(),
+                owner_id: owner_id.to_string(),
+                x,
+                y,
+                vx,
+                vy,
                 expires_at,
-                client_projectile_id: fire.client_projectile_id,
+                client_projectile_id,
                 updated_at,
             },
         );
@@ -3661,6 +3688,51 @@ impl RoomDurableObject {
 
         self.snapshot_dirty.set(true);
         self.dirty_projectiles.set(true);
+        projectile_id
+    }
+
+    fn handle_projectile_fire(&self, player_id: &str, payload: Option<Value>) -> Result<bool> {
+        let payload =
+            payload.ok_or_else(|| Error::RustError("missing projectile payload".into()))?;
+        let fire: ProjectileFirePayload = serde_json::from_value(payload)
+            .map_err(|_| Error::RustError("invalid projectile payload".into()))?;
+        if !fire.x.is_finite()
+            || !fire.y.is_finite()
+            || !fire.vx.is_finite()
+            || !fire.vy.is_finite()
+        {
+            return Err(Error::RustError("invalid projectile payload".into()));
+        }
+        if let Some(client_projectile_id) = fire.client_projectile_id.as_deref() {
+            if !is_valid_protocol_identifier(client_projectile_id) {
+                return Err(Error::RustError("invalid projectile client id".into()));
+            }
+        }
+
+        let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+
+            if now - player.last_projectile_fire_at < PROJECTILE_FIRE_MIN_INTERVAL_MS {
+                return Ok(false);
+            }
+            player.last_projectile_fire_at = now;
+            player.last_seen = now;
+        }
+
+        self.spawn_projectile(
+            player_id,
+            fire.x as f32,
+            fire.y as f32,
+            fire.vx as f32,
+            fire.vy as f32,
+            fire.client_projectile_id,
+            now,
+        );
         Ok(true)
     }
 
@@ -4153,10 +4225,73 @@ impl RoomDurableObject {
                         return Err(Error::RustError("invalid combat attack id".into()));
                     }
                 }
+                if let Some(client_projectile_id) = attack_payload.client_projectile_id.as_deref() {
+                    if !is_valid_protocol_identifier(client_projectile_id) {
+                        return Err(Error::RustError("invalid combat projectile id".into()));
+                    }
+                }
 
-                Err(Error::RustError(
-                    "combat commands are not implemented".into(),
-                ))
+                let (origin_x, origin_y, velocity_x, velocity_y) = {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let enemy_snapshot = runtime
+                        .enemies
+                        .get(attack_payload.target_id.as_str())
+                        .filter(|enemy| enemy.health > 0)
+                        .cloned();
+                    let Some(enemy_snapshot) = enemy_snapshot else {
+                        return Ok(false);
+                    };
+
+                    let Some(player) = runtime.players.get_mut(player_id) else {
+                        return Ok(false);
+                    };
+                    if now - player.last_projectile_fire_at < PROJECTILE_FIRE_MIN_INTERVAL_MS {
+                        return Ok(false);
+                    }
+
+                    if !player_within_combat_attack_range(
+                        player.x,
+                        player.y,
+                        enemy_snapshot.x,
+                        enemy_snapshot.y,
+                    ) {
+                        return Ok(false);
+                    }
+
+                    let Some((velocity_x, velocity_y)) = projectile_velocity_towards_target(
+                        player.x,
+                        player.y,
+                        enemy_snapshot.x,
+                        enemy_snapshot.y,
+                        COMBAT_ATTACK_PROJECTILE_SPEED,
+                    ) else {
+                        return Ok(false);
+                    };
+
+                    player.last_projectile_fire_at = now;
+                    player.last_seen = now;
+                    (player.x, player.y, velocity_x, velocity_y)
+                };
+
+                let projectile_id = self.spawn_projectile(
+                    player_id,
+                    origin_x,
+                    origin_y,
+                    velocity_x,
+                    velocity_y,
+                    attack_payload.client_projectile_id,
+                    now,
+                );
+                self.broadcast_combat_event(
+                    "player_attacked",
+                    json!({
+                        "attackerPlayerId": player_id,
+                        "targetEnemyId": attack_payload.target_id,
+                        "attackId": attack_payload.attack_id,
+                        "projectileId": projectile_id,
+                    }),
+                );
+                Ok(true)
             }
             _ => Err(Error::RustError("invalid combat action".into())),
         }
@@ -6139,5 +6274,45 @@ mod tests {
         assert_eq!(applied_3, 4);
         assert_eq!(remaining_3, 0);
         assert!(defeated_3);
+    }
+
+    #[test]
+    fn projectile_velocity_clamp_enforces_max_speed() {
+        let (vx, vy) = clamp_projectile_velocity(3_000.0, 4_000.0);
+        let speed = (vx * vx + vy * vy).sqrt();
+        assert!(speed <= PROJECTILE_MAX_SPEED as f32 + 0.001);
+
+        let (small_vx, small_vy) = clamp_projectile_velocity(150.0, -90.0);
+        assert!((small_vx - 150.0).abs() < f32::EPSILON);
+        assert!((small_vy + 90.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn combat_attack_range_gate_uses_distance() {
+        assert!(player_within_combat_attack_range(
+            0.0,
+            0.0,
+            COMBAT_ATTACK_RANGE - 1.0,
+            0.0
+        ));
+        assert!(!player_within_combat_attack_range(
+            0.0,
+            0.0,
+            COMBAT_ATTACK_RANGE + 1.0,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn projectile_velocity_towards_target_normalizes_direction() {
+        let (vx, vy) = projectile_velocity_towards_target(10.0, 20.0, 13.0, 24.0, 200.0)
+            .expect("velocity should be generated");
+        assert!((vx - 120.0).abs() < 0.001);
+        assert!((vy - 160.0).abs() < 0.001);
+
+        assert!(
+            projectile_velocity_towards_target(4.0, 4.0, 4.0, 4.0, 200.0).is_none(),
+            "zero-distance targeting should not generate velocity"
+        );
     }
 }

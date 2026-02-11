@@ -137,3 +137,11 @@ Format per entry:
 - files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (16 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: feat(rl-011): finalize authoritative drop visibility guarantees
+
+- timestamp: 2026-02-11
+- item: RL-013
+- summary: Completed player attack command handling for authoritative combat by implementing `combat.attack` projectile spawning against server-known enemy targets, plus in-room combat event feed visibility for connected clients.
+- decisions: Keep server-authoritative targeting by resolving enemy positions/range checks in the worker (`COMBAT_ATTACK_RANGE`) and ignoring invalid/out-of-range targets safely; reuse projectile replication path for reconciliation by emitting authoritative projectiles from `combat.attack` with optional client projectile ids; expose combat feedback through room UI by consuming `combat` event envelopes (`player_attacked`, damage/defeat events) instead of leaving the event channel inert.
+- files: worker/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (19 passed); npm run build:web
+- commit: pending

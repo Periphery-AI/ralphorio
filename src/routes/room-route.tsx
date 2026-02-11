@@ -84,6 +84,72 @@ function localPlayerPosition(players: PlayerState[], playerId: string) {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function stringField(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === 'string' ? value : null;
+}
+
+function numberField(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function formatCombatEvent(action: string, payload: unknown, localPlayerId: string) {
+  const details = isRecord(payload) ? payload : {};
+  const markLocal = (playerId: string | null) =>
+    playerId && playerId === localPlayerId ? `${playerId} (you)` : playerId;
+
+  switch (action) {
+    case 'player_attacked': {
+      const attacker = markLocal(stringField(details, 'attackerPlayerId'));
+      const enemyId = stringField(details, 'targetEnemyId');
+      if (attacker && enemyId) {
+        return `${attacker} attacked ${enemyId}`;
+      }
+      return 'attack fired';
+    }
+    case 'enemy_damaged': {
+      const attacker = markLocal(stringField(details, 'attackerPlayerId'));
+      const enemyId = stringField(details, 'enemyId');
+      const remaining = numberField(details, 'remainingHealth');
+      if (attacker && enemyId && remaining !== null) {
+        return `${attacker} hit ${enemyId} (${remaining} hp)`;
+      }
+      return 'enemy damaged';
+    }
+    case 'enemy_defeated': {
+      const enemyKind = stringField(details, 'enemyKind') ?? 'enemy';
+      const byPlayerId = markLocal(stringField(details, 'byPlayerId'));
+      if (byPlayerId) {
+        return `${enemyKind} defeated by ${byPlayerId}`;
+      }
+      return `${enemyKind} defeated`;
+    }
+    case 'player_damaged': {
+      const playerId = markLocal(stringField(details, 'playerId'));
+      const damage = numberField(details, 'damage');
+      const remaining = numberField(details, 'remainingHealth');
+      if (playerId && damage !== null && remaining !== null) {
+        return `${playerId} took ${damage} damage (${remaining} hp)`;
+      }
+      return 'player damaged';
+    }
+    case 'player_defeated': {
+      const playerId = markLocal(stringField(details, 'playerId'));
+      if (playerId) {
+        return `${playerId} was defeated`;
+      }
+      return 'player defeated';
+    }
+    default:
+      return `combat.${action}`;
+  }
+}
+
 function MetricPill({ label, value }: { label: string; value: string | number }) {
   return (
     <span className="hud-pill hud-metric">
@@ -125,6 +191,7 @@ export function RoomRoute() {
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [devInput, setDevInput] = useState('');
   const [devLog, setDevLog] = useState<string[]>([]);
+  const [combatFeed, setCombatFeed] = useState<string[]>([]);
   const [interpDelayMs, setInterpDelayMs] = useState(DEFAULT_INTERP_DELAY_MS);
 
   const socketRef = useRef<RoomSocket | null>(null);
@@ -137,6 +204,10 @@ export function RoomRoute() {
 
   const pushDevLog = (line: string) => {
     setDevLog((existing) => [...existing.slice(-11), line]);
+  };
+
+  const pushCombatFeed = (line: string) => {
+    setCombatFeed((existing) => [...existing.slice(-7), line]);
   };
 
   useEffect(() => {
@@ -162,6 +233,7 @@ export function RoomRoute() {
 
     authoritativePlayerIdRef.current = clientPlayerId;
     replicationRef.current = new ReplicationPipeline(interpDelayRef.current);
+    setCombatFeed([]);
 
     let inputPump: number | null = null;
     let renderPump: number | null = null;
@@ -263,8 +335,12 @@ export function RoomRoute() {
           onAck: (seq) => {
             setLastAckSeq((prev) => Math.max(prev, seq));
           },
-          onEvent: () => {
-            // Event channels are available for feature-specific UI hooks.
+          onEvent: (feature, action, payload) => {
+            if (feature !== 'combat') {
+              return;
+            }
+
+            pushCombatFeed(formatCombatEvent(action, payload, authoritativePlayerIdRef.current));
           },
           onPong: (latency) => {
             setLatencyMs(Math.round(latency));
@@ -470,6 +546,16 @@ export function RoomRoute() {
       <div className="min-h-0 p-2 md:p-3">
         <div className="relative h-full w-full overflow-hidden rounded-2xl border border-white/10 bg-[#060c16] shadow-[0_20px_80px_rgba(9,14,24,0.6)]">
           <div ref={canvasHostRef} className="absolute inset-0" />
+          {combatFeed.length > 0 ? (
+            <div className="absolute left-3 top-3 z-20 max-w-sm rounded-lg border border-[#37527f] bg-[#081325]/86 px-3 py-2 backdrop-blur">
+              <p className="mb-1 text-[10px] uppercase tracking-[0.14em] text-[#93b4ee]">Combat Feed</p>
+              <div className="space-y-1 text-xs text-[#d8e6ff]">
+                {combatFeed.map((line, index) => (
+                  <p key={`${line}-${index}`}>{line}</p>
+                ))}
+              </div>
+            </div>
+          ) : null}
           {showDevConsole ? (
             <div className="absolute inset-x-3 bottom-3 z-20 rounded-xl border border-[#6de7c0]/60 bg-[#071520]/88 p-3 backdrop-blur">
               <div className="mb-2 flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-[#b8ffe8]">

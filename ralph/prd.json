@@ -172,7 +172,7 @@
         "Server reconciliation resolves authoritative outcomes",
         "Combat feedback events are visible to all clients"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-014",
