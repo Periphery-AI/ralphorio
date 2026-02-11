@@ -10,6 +10,7 @@
     "build:web": "tsc -b && vite build",
     "wasm:build": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --release",
     "wasm:build:dev": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --dev",
+    "sprite:generate": "node retro-diffusion/generate-character.mjs",
     "worker:dev": "npm run worker:dev:raw",
     "worker:dev:raw": "wrangler dev --config worker/wrangler.toml",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",

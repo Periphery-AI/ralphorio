@@ -98,6 +98,18 @@ npm run worker:dev
 npm run build
 ```
 
+## Character Sprite Generation (Retro Diffusion)
+
+Generate/update the animated player spritesheet:
+
+```bash
+npm run sprite:generate
+```
+
+Pipeline docs and API key location:
+
+- `retro-diffusion/README.md`
+
 ## Deploy
 
 `worker/wrangler.toml` is configured for:

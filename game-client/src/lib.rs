@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::render::texture::ImagePlugin;
 use bevy::window::WindowResolution;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,10 @@ use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
 const TILE_SIZE: f32 = 32.0;
-const PLAYER_SIZE: f32 = 22.0;
+const CHARACTER_FRAME_SIZE: f32 = 48.0;
+const CHARACTER_ANIMATION_FPS: f32 = 12.0;
+const CHARACTER_ANIMATION_FRAMES: usize = 4;
+const CHARACTER_SCALE: f32 = 1.75;
 const STRUCTURE_SIZE: f32 = 18.0;
 const PROJECTILE_SIZE: f32 = 8.0;
 const MAP_LIMIT: f32 = 5000.0;
@@ -26,6 +30,7 @@ const MAX_OUTBOUND_FEATURE_COMMANDS: usize = 128;
 const REMOTE_LERP_RATE: f32 = 18.0;
 const PROJECTILE_RECONCILE_BLEND_RATE: f32 = 10.0;
 const PROJECTILE_RECONCILE_HARD_SNAP_DISTANCE: f32 = 140.0;
+const CHARACTER_DIRECTION_EPSILON: f32 = 0.001;
 const SNAPSHOT_Z: f32 = 4.0;
 const STRUCTURE_Z: f32 = 3.0;
 const PROJECTILE_Z: f32 = 5.0;
@@ -123,6 +128,9 @@ struct Actor {
     id: String,
 }
 
+#[derive(Component, Default)]
+struct ActorVelocity(Vec2);
+
 #[derive(Component)]
 struct LocalActor;
 
@@ -157,6 +165,49 @@ struct PredictedProjectileLifetime(f32);
 struct PredictedProjectileTarget {
     has_target: bool,
     position: Vec2,
+}
+
+#[derive(Clone, Copy)]
+enum FacingDirection {
+    Down,
+    Left,
+    Right,
+    Up,
+}
+
+impl FacingDirection {
+    fn row_index(self) -> usize {
+        match self {
+            // This sheet's row order is: up(back), right, down(front), left.
+            FacingDirection::Up => 0,
+            FacingDirection::Right => 1,
+            FacingDirection::Down => 2,
+            FacingDirection::Left => 3,
+        }
+    }
+}
+
+#[derive(Component)]
+struct CharacterAnimator {
+    facing: FacingDirection,
+    frame: usize,
+    timer: Timer,
+}
+
+impl Default for CharacterAnimator {
+    fn default() -> Self {
+        Self {
+            facing: FacingDirection::Down,
+            frame: 0,
+            timer: Timer::from_seconds(1.0 / CHARACTER_ANIMATION_FPS, TimerMode::Repeating),
+        }
+    }
+}
+
+#[derive(Resource, Clone)]
+struct CharacterAtlasHandles {
+    texture: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
 }
 
 #[derive(Resource, Default)]
@@ -204,10 +255,18 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .insert_resource(SimAccumulator::default())
         .insert_resource(NextInputSeq::default())
         .insert_resource(InputHistory::default())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(primary_window),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: "/".to_string(),
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(primary_window),
+                    ..default()
+                })
+                .set(ImagePlugin::default_nearest()),
+        )
         .add_systems(Startup, setup_world)
         .add_systems(
             Update,
@@ -218,6 +277,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
                 simulate_predicted_projectiles,
                 apply_latest_snapshot,
                 smooth_remote_motion,
+                animate_character_sprites,
                 follow_camera,
             )
                 .chain(),
@@ -281,7 +341,11 @@ pub fn drain_feature_commands() -> String {
     serde_json::to_string(&drained).unwrap_or_else(|_| "[]".to_string())
 }
 
-fn setup_world(mut commands: Commands) {
+fn setup_world(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
     commands.spawn(Camera2dBundle::default());
 
     for x in -25..=25 {
@@ -304,19 +368,33 @@ fn setup_world(mut commands: Commands) {
         }
     }
 
+    let texture = asset_server.load("sprites/factorio-character-sheet.png");
+    let layout = atlas_layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(CHARACTER_FRAME_SIZE as u32),
+        CHARACTER_ANIMATION_FRAMES as u32,
+        4,
+        None,
+        None,
+    ));
+
+    commands.insert_resource(CharacterAtlasHandles {
+        texture: texture.clone(),
+        layout: layout.clone(),
+    });
+
     commands.spawn((
         SpriteBundle {
-            sprite: Sprite {
-                color: Color::srgb_u8(34, 211, 238),
-                custom_size: Some(Vec2::splat(PLAYER_SIZE)),
-                ..default()
-            },
-            transform: Transform::from_xyz(0.0, 0.0, SNAPSHOT_Z),
+            texture,
+            transform: Transform::from_xyz(0.0, 0.0, SNAPSHOT_Z)
+                .with_scale(Vec3::splat(CHARACTER_SCALE)),
             ..default()
         },
+        TextureAtlas { layout, index: 0 },
         Actor {
             id: "local-pending".to_string(),
         },
+        ActorVelocity::default(),
+        CharacterAnimator::default(),
         LocalActor,
     ));
 }
@@ -403,9 +481,9 @@ fn simulate_local_player(
     mut accumulator: ResMut<SimAccumulator>,
     mut next_input_seq: ResMut<NextInputSeq>,
     mut input_history: ResMut<InputHistory>,
-    mut local_transform_query: Query<&mut Transform, With<LocalActor>>,
+    mut local_transform_query: Query<(&mut Transform, &mut ActorVelocity), With<LocalActor>>,
 ) {
-    let Ok(mut transform) = local_transform_query.get_single_mut() else {
+    let Ok((mut transform, mut velocity)) = local_transform_query.get_single_mut() else {
         return;
     };
 
@@ -427,6 +505,7 @@ fn simulate_local_player(
         );
         transform.translation.x = step.x;
         transform.translation.y = step.y;
+        velocity.0 = Vec2::new(step.vx, step.vy);
 
         let seq = next_input_seq.0;
         next_input_seq.0 = next_input_seq.0.saturating_add(1);
@@ -563,6 +642,7 @@ fn simulate_predicted_projectiles(
 
 fn apply_latest_snapshot(
     mut commands: Commands,
+    character_atlas: Res<CharacterAtlasHandles>,
     current_player_id: Res<CurrentPlayerId>,
     mut input_history: ResMut<InputHistory>,
     mut local_query: Query<(&mut Transform, &mut Actor), (With<LocalActor>, Without<RemoteActor>)>,
@@ -621,9 +701,10 @@ fn apply_latest_snapshot(
         if let Some(entity) = remote_entities.remove(&player.id) {
             commands
                 .entity(entity)
-                .insert(RemoteTarget(Vec2::new(player.x, player.y)));
+                .insert(RemoteTarget(Vec2::new(player.x, player.y)))
+                .insert(ActorVelocity(Vec2::new(player.vx, player.vy)));
         } else {
-            spawn_remote_actor(&mut commands, &player);
+            spawn_remote_actor(&mut commands, &player, &character_atlas);
         }
     }
 
@@ -751,6 +832,46 @@ fn smooth_remote_motion(
     }
 }
 
+fn facing_from_velocity(velocity: Vec2, fallback: FacingDirection) -> FacingDirection {
+    if velocity.length_squared() < CHARACTER_DIRECTION_EPSILON {
+        return fallback;
+    }
+
+    if velocity.y.abs() > velocity.x.abs() {
+        if velocity.y >= 0.0 {
+            FacingDirection::Up
+        } else {
+            FacingDirection::Down
+        }
+    } else if velocity.x >= 0.0 {
+        FacingDirection::Right
+    } else {
+        FacingDirection::Left
+    }
+}
+
+fn animate_character_sprites(
+    time: Res<Time>,
+    mut query: Query<(&ActorVelocity, &mut CharacterAnimator, &mut TextureAtlas), With<Actor>>,
+) {
+    for (velocity, mut animator, mut atlas) in &mut query {
+        animator.facing = facing_from_velocity(velocity.0, animator.facing);
+        let is_moving = velocity.0.length_squared() > CHARACTER_DIRECTION_EPSILON;
+
+        if is_moving {
+            animator.timer.tick(time.delta());
+            if animator.timer.just_finished() {
+                animator.frame = (animator.frame + 1) % CHARACTER_ANIMATION_FRAMES;
+            }
+        } else {
+            animator.frame = 0;
+            animator.timer.reset();
+        }
+
+        atlas.index = animator.facing.row_index() * CHARACTER_ANIMATION_FRAMES + animator.frame;
+    }
+}
+
 fn follow_camera(
     local_transform_query: Query<&Transform, (With<LocalActor>, Without<Camera2d>)>,
     mut camera_query: Query<&mut Transform, (With<Camera2d>, Without<LocalActor>)>,
@@ -766,20 +887,27 @@ fn follow_camera(
     camera_transform.translation.y = local_transform.translation.y;
 }
 
-fn spawn_remote_actor(commands: &mut Commands, player: &PlayerState) {
+fn spawn_remote_actor(
+    commands: &mut Commands,
+    player: &PlayerState,
+    character_atlas: &CharacterAtlasHandles,
+) {
     commands.spawn((
         SpriteBundle {
-            sprite: Sprite {
-                color: Color::srgb_u8(245, 158, 11),
-                custom_size: Some(Vec2::splat(PLAYER_SIZE)),
-                ..default()
-            },
-            transform: Transform::from_xyz(player.x, player.y, SNAPSHOT_Z),
+            texture: character_atlas.texture.clone(),
+            transform: Transform::from_xyz(player.x, player.y, SNAPSHOT_Z)
+                .with_scale(Vec3::splat(CHARACTER_SCALE)),
             ..default()
+        },
+        TextureAtlas {
+            layout: character_atlas.layout.clone(),
+            index: 0,
         },
         Actor {
             id: player.id.clone(),
         },
+        ActorVelocity(Vec2::new(player.vx, player.vy)),
+        CharacterAnimator::default(),
         RemoteActor,
         RemoteTarget(Vec2::new(player.x, player.y)),
     ));
