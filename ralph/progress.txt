@@ -129,3 +129,11 @@ Format per entry:
 - files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (15 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RL-011
+- summary: Completed collectible drop acceptance by locking recipient-scoped visibility semantics in tests and promoting RL-011 to pass after validating combat/mining drop lifecycle behavior.
+- decisions: Extract drop visibility gating into `drop_visible_to_recipient` so per-recipient and broadcast semantics are explicit/testable; treat RL-011 acceptance as met because drops already enforce TTL/owner grace, pickup mutates inventory + despawns durably, and reconnect desync is covered by persisted drops plus always-emitted `drops` snapshots.
+- files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (16 passed); cargo check --manifest-path worker/Cargo.toml; npm run build:web
+- commit: feat(rl-011): finalize authoritative drop visibility guarantees

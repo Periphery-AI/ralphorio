@@ -1199,6 +1199,25 @@ fn player_within_drop_visibility_range(
             <= MINING_NODE_SCAN_RADIUS_TILES + 4
 }
 
+fn drop_visible_to_recipient(
+    drop: &RuntimeDropState,
+    recipient_player_id: Option<&str>,
+    players: &HashMap<String, RuntimePlayerState>,
+    connected_players: &[String],
+) -> bool {
+    if let Some(player_id) = recipient_player_id {
+        return players.get(player_id).is_some_and(|player| {
+            player.connected && player_within_drop_visibility_range(player, drop)
+        });
+    }
+
+    connected_players.iter().any(|player_id| {
+        players.get(player_id.as_str()).is_some_and(|player| {
+            player.connected && player_within_drop_visibility_range(player, drop)
+        })
+    })
+}
+
 fn drop_pickup_allowed_for_player(drop: &RuntimeDropState, player_id: &str, now: i64) -> bool {
     match drop.owner_player_id.as_deref() {
         None => true,
@@ -5097,25 +5116,17 @@ impl RoomDurableObject {
             })
             .collect();
 
-        let observer_player = recipient_player_id
-            .and_then(|player_id| runtime.players.get(player_id))
-            .filter(|player| player.connected);
-
         let mut visible_drop_rows: Vec<&RuntimeDropState> = runtime
             .drops
             .values()
             .filter(|drop| drop.expires_at > now)
             .filter(|drop| {
-                if let Some(player) = observer_player {
-                    player_within_drop_visibility_range(player, drop)
-                } else {
-                    connected_players.iter().any(|player_id| {
-                        runtime
-                            .players
-                            .get(player_id)
-                            .is_some_and(|player| player_within_drop_visibility_range(player, drop))
-                    })
-                }
+                drop_visible_to_recipient(
+                    drop,
+                    recipient_player_id,
+                    &runtime.players,
+                    &connected_players,
+                )
             })
             .collect();
         visible_drop_rows.sort_by_key(|drop| std::cmp::Reverse(drop.updated_at));
@@ -5970,6 +5981,64 @@ mod tests {
             updated_at: 0,
         };
         assert!(!player_within_drop_visibility_range(&player, &hidden_drop));
+    }
+
+    #[test]
+    fn drop_visibility_scope_respects_snapshot_recipient() {
+        let mut local_player = RoomDurableObject::default_runtime_player(0);
+        local_player.connected = true;
+        local_player.x = 0.0;
+        local_player.y = 0.0;
+
+        let mut remote_player = RoomDurableObject::default_runtime_player(0);
+        remote_player.connected = true;
+        remote_player.x = ((MINING_NODE_SCAN_RADIUS_TILES + 7) * TERRAIN_TILE_SIZE as i32) as f32;
+        remote_player.y = 0.0;
+
+        let mut players = HashMap::new();
+        players.insert("local".to_string(), local_player);
+        players.insert("remote".to_string(), remote_player);
+
+        let drop = RuntimeDropState {
+            drop_id: "drop:test".to_string(),
+            resource: "gear".to_string(),
+            amount: 1,
+            x: 0.0,
+            y: 0.0,
+            owner_player_id: Some("local".to_string()),
+            owner_expires_at: 5_000,
+            expires_at: 30_000,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let all_connected = vec!["local".to_string(), "remote".to_string()];
+        assert!(drop_visible_to_recipient(
+            &drop,
+            Some("local"),
+            &players,
+            &all_connected
+        ));
+        assert!(!drop_visible_to_recipient(
+            &drop,
+            Some("remote"),
+            &players,
+            &all_connected
+        ));
+        assert!(drop_visible_to_recipient(
+            &drop,
+            None,
+            &players,
+            &all_connected
+        ));
+
+        let remote_only_connected = vec!["remote".to_string()];
+        assert!(!drop_visible_to_recipient(
+            &drop,
+            None,
+            &players,
+            &remote_only_connected
+        ));
     }
 
     #[test]
