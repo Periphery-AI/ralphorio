@@ -144,4 +144,4 @@ Format per entry:
 - decisions: Keep server-authoritative targeting by resolving enemy positions/range checks in the worker (`COMBAT_ATTACK_RANGE`) and ignoring invalid/out-of-range targets safely; reuse projectile replication path for reconciliation by emitting authoritative projectiles from `combat.attack` with optional client projectile ids; expose combat feedback through room UI by consuming `combat` event envelopes (`player_attacked`, damage/defeat events) instead of leaving the event channel inert.
 - files: worker/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo test --manifest-path worker/Cargo.toml (19 passed); npm run build:web
-- commit: pending
+- commit: ae1155d
