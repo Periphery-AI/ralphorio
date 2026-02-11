@@ -273,4 +273,47 @@ mod tests {
         assert_eq!(result.x, -40.0);
         assert_eq!(result.vx, 0.0);
     }
+
+    #[test]
+    fn deterministic_movement_sequence_matches() {
+        let inputs = [
+            InputState {
+                up: true,
+                down: false,
+                left: false,
+                right: true,
+            },
+            InputState {
+                up: true,
+                down: false,
+                left: false,
+                right: false,
+            },
+            InputState {
+                up: false,
+                down: false,
+                left: true,
+                right: false,
+            },
+            InputState {
+                up: false,
+                down: true,
+                left: false,
+                right: false,
+            },
+        ];
+
+        let mut a = (0.0f32, 0.0f32);
+        let mut b = (0.0f32, 0.0f32);
+        for step_index in 0..120 {
+            let input = inputs[step_index % inputs.len()];
+            let step_a = movement_step(a.0, a.1, input, 1.0 / 60.0, 220.0, 5000.0);
+            let step_b = movement_step(b.0, b.1, input, 1.0 / 60.0, 220.0, 5000.0);
+            a = (step_a.x, step_a.y);
+            b = (step_b.x, step_b.y);
+        }
+
+        assert!((a.0 - b.0).abs() < 0.0001);
+        assert!((a.1 - b.1).abs() < 0.0001);
+    }
 }

@@ -78,6 +78,7 @@ export type WelcomePayload = {
   playerId: string;
   simRateHz: number;
   snapshotRateHz: number;
+  resumeToken?: string;
 };
 
 export type ServerEnvelope = {

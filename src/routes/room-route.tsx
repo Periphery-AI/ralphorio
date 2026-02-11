@@ -9,6 +9,10 @@ import type { PlayerState, RoomSnapshot } from '../game/types';
 const CANVAS_ID = 'bevy-game-canvas';
 const DEFAULT_INTERP_DELAY_MS = 110;
 
+function resumeTokenStorageKey(roomCode: string, playerId: string) {
+  return `ralph-resume:${roomCode}:${playerId}`;
+}
+
 function displayNameForUser(userName: string | null, firstName: string | null, userId: string) {
   if (userName) {
     return userName;
@@ -97,60 +101,76 @@ export function RoomRoute() {
       await bootGame(CANVAS_ID);
       await setPlayerId(clientPlayerId);
       const clerkToken = await getToken();
+      const storedResumeToken = window.localStorage.getItem(
+        resumeTokenStorageKey(roomCode, clientPlayerId),
+      );
 
       if (disposed) {
         return;
       }
 
-      const socket = new RoomSocket(roomCode, clientPlayerId, {
-        onStatus: (status) => {
-          setConnectionStatus(status);
-        },
-        onWelcome: (payload) => {
-          setServerPlayerId(payload.playerId);
-          setSimRateHz(payload.simRateHz);
-          setSnapshotRateHz(payload.snapshotRateHz);
-          setConnectionStatus(`Connected to ${payload.roomCode}`);
-          void setPlayerId(payload.playerId);
-        },
-        onSnapshot: (snapshot: RoomSnapshot) => {
-          replicationRef.current.ingestSnapshot(snapshot);
+      const socket = new RoomSocket(
+        roomCode,
+        clientPlayerId,
+        {
+          onStatus: (status) => {
+            setConnectionStatus(status);
+          },
+          onWelcome: (payload) => {
+            setServerPlayerId(payload.playerId);
+            setSimRateHz(payload.simRateHz);
+            setSnapshotRateHz(payload.snapshotRateHz);
+            setConnectionStatus(`Connected to ${payload.roomCode}`);
+            void setPlayerId(payload.playerId);
 
-          setServerTick(snapshot.serverTick);
-          setSimRateHz(snapshot.simRateHz);
-          setSnapshotRateHz(snapshot.snapshotRateHz);
+            if (payload.resumeToken) {
+              window.localStorage.setItem(
+                resumeTokenStorageKey(roomCode, clientPlayerId),
+                payload.resumeToken,
+              );
+            }
+          },
+          onSnapshot: (snapshot: RoomSnapshot) => {
+            replicationRef.current.ingestSnapshot(snapshot);
 
-          const presence = snapshot.features.presence;
-          if (presence) {
-            setActivePlayers(presence.onlineCount);
-          }
+            setServerTick(snapshot.serverTick);
+            setSimRateHz(snapshot.simRateHz);
+            setSnapshotRateHz(snapshot.snapshotRateHz);
 
-          const movement = snapshot.features.movement;
-          const build = snapshot.features.build;
-          const projectile = snapshot.features.projectile;
+            const presence = snapshot.features.presence;
+            if (presence) {
+              setActivePlayers(presence.onlineCount);
+            }
 
-          if (movement) {
-            localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
-          }
+            const movement = snapshot.features.movement;
+            const build = snapshot.features.build;
+            const projectile = snapshot.features.projectile;
 
-          if (build) {
-            setStructureCount(build.structureCount);
-          }
+            if (movement) {
+              localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
+            }
 
-          if (projectile) {
-            setProjectileCount(projectile.projectileCount);
-          }
+            if (build) {
+              setStructureCount(build.structureCount);
+            }
+
+            if (projectile) {
+              setProjectileCount(projectile.projectileCount);
+            }
+          },
+          onAck: (seq) => {
+            setLastAckSeq((prev) => Math.max(prev, seq));
+          },
+          onEvent: () => {
+            // Event channels are available for feature-specific UI hooks.
+          },
+          onPong: (latency) => {
+            setLatencyMs(Math.round(latency));
+          },
         },
-        onAck: (seq) => {
-          setLastAckSeq((prev) => Math.max(prev, seq));
-        },
-        onEvent: () => {
-          // Event channels are available for feature-specific UI hooks.
-        },
-        onPong: (latency) => {
-          setLatencyMs(Math.round(latency));
-        },
-      }, clerkToken ?? null);
+        clerkToken ?? null,
+        storedResumeToken,
+      );
 
       await socket.connect();
       socketRef.current = socket;

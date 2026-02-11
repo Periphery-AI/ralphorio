@@ -4,8 +4,8 @@ This project uses a server-authoritative Cloudflare Durable Object implemented i
 
 ## Goals
 
-- Server-authoritative room state with SQLite persistence
-- Fixed-step simulation (`60Hz`) + snapshot stream (`20Hz`)
+- Server-authoritative room state with SQLite durability and in-memory hot loop
+- Fixed-step simulation (`30Hz`) + snapshot stream (`10Hz`)
 - Client prediction + server reconciliation for local movement
 - Interpolated remote rendering for smooth visuals
 - Stable protocol and extensible feature surface for future systems
@@ -33,8 +33,9 @@ All websocket messages are envelope-based.
 ### Server -> Client
 
 - `welcome`: room metadata + rates
+- `welcome.resumeToken`: resumable session token for reconnect/restart recovery
 - `ack`: command sequencing ack
-- `snapshot`: authoritative room state
+- `snapshot`: authoritative room state (`mode = full|delta`)
 - `pong`: ping response for latency
 - `error`: protocol/auth/validation failures
 - `event`: reserved for feature event channels
@@ -49,17 +50,38 @@ File: `worker/src/lib.rs`
   - static assets via `ASSETS`
 - One room code maps to one `RoomDurableObject`
 - SQLite schema initialized inside the DO
+- Runtime state is in-memory (`RoomRuntimeState`):
+  - players/input
+  - structures
+  - build previews
+  - projectiles
 - Tick loop uses accumulator + bounded catch-up steps
-- Movement and projectile integration call `sim-core`
-- Snapshot payload includes:
+- Hot simulation and snapshot assembly avoid per-tick SQL reads
+- Player state checkpoints flush to SQLite every `~1000ms` and on connect/disconnect
+- On DO startup/hydration, runtime state is rebuilt from SQLite checkpoints
+- Movement/projectile integration call `sim-core`
+- Snapshot payload supports full/delta feature channels:
   - `features.presence`
   - `features.movement`
   - `features.build`
   - `features.projectile`
 
+### Durable vs Ephemeral Data
+
+- **Durable (SQLite):**
+  - room metadata
+  - structures
+  - player checkpoints (position, velocity, input, presence)
+  - resumable session tokens
+- **Ephemeral (in-memory):**
+  - build previews
+  - active projectiles
+  - high-frequency simulation state
+
 ## Identity / Auth
 
 - Client sends `playerId` and Clerk session token (`token`) in websocket query params.
+- Client also sends optional `resumeToken` to recover a previous room session quickly.
 - DO validates token claims and session status using `CLERK_SECRET_KEY`.
 - If no secret is configured, DO falls back to permissive `playerId` mode for local/dev workflows.
 
@@ -72,6 +94,7 @@ File: `src/game/network-client.ts`
 - Protocol envelope encode/decode
 - Sequenced commands and ping loop
 - Movement input batch send (`movement.input_batch`)
+- Resume token transport (`resumeToken` query param)
 
 ### Replication
 
@@ -80,6 +103,7 @@ File: `src/game/netcode/replication.ts`
 - Buffers snapshots and tracks clock offset
 - Uses interpolation delay (~110ms)
 - Keeps local player authoritative correction via `localAckSeq`
+- Merges delta snapshots with previous feature state to keep render continuity
 
 ### Room orchestration
 

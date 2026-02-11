@@ -7,7 +7,7 @@ use sim_core::{
     PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use worker::durable::{DurableObject, State, WebSocketIncomingMessage};
 use worker::*;
 
@@ -16,8 +16,8 @@ const PLAYER_ID_RE_MIN: usize = 3;
 const PLAYER_ID_RE_MAX: usize = 120;
 const ROOM_RE_MAX: usize = 24;
 
-const SIM_RATE_HZ: u32 = 60;
-const SNAPSHOT_RATE_HZ: u32 = 20;
+const SIM_RATE_HZ: u32 = 30;
+const SNAPSHOT_RATE_HZ: u32 = 10;
 const SIM_DT_SECONDS: f32 = 1.0 / SIM_RATE_HZ as f32;
 const SIM_DT_MS: f64 = 1000.0 / SIM_RATE_HZ as f64;
 const SNAPSHOT_INTERVAL_TICKS: u64 = (SIM_RATE_HZ / SNAPSHOT_RATE_HZ) as u64;
@@ -30,7 +30,14 @@ const PROJECTILE_TTL_MS: i64 = 1800;
 const PROJECTILE_MAX_SPEED: f64 = 900.0;
 
 const BUILD_GRID_SIZE: f64 = 32.0;
+const BUILD_CHUNK_CELLS: i64 = 32;
 const BUILD_PREVIEW_STALE_MS: i64 = 15000;
+const STATE_CHECKPOINT_INTERVAL_MS: i64 = 1000;
+const RESUME_TOKEN_TTL_MS: i64 = 86_400_000;
+
+const PREVIEW_COMMAND_MIN_INTERVAL_MS: i64 = 40;
+const PLACE_COMMAND_MIN_INTERVAL_MS: i64 = 120;
+const PROJECTILE_FIRE_MIN_INTERVAL_MS: i64 = 33;
 
 const MAX_STRUCTURES: usize = 1024;
 const MAX_PROJECTILES: usize = 4096;
@@ -138,84 +145,102 @@ struct ClerkSessionResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct PresenceRow {
-    player_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MovementStateRow {
-    player_id: String,
-    x: f64,
-    y: f64,
-    vx: f64,
-    vy: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MovementInputRow {
-    up: i64,
-    down: i64,
-    left: i64,
-    right: i64,
-    last_input_seq: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MovementInputRowWithPlayerId {
-    player_id: String,
-    last_input_seq: i64,
-}
-
-#[derive(Debug, Deserialize)]
 struct BuildRow {
     structure_id: String,
     owner_id: String,
     kind: String,
     x: f64,
     y: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct BuildGridOccupiedRow {
-    count: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct BuildPreviewRow {
-    player_id: String,
-    kind: String,
-    x: f64,
-    y: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct StructureObstacleRow {
-    kind: String,
-    x: f64,
-    y: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct PlayerPositionRow {
-    x: f64,
-    y: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectileRow {
-    projectile_id: String,
-    owner_id: String,
-    x: f64,
-    y: f64,
-    vx: f64,
-    vy: f64,
-    expires_at: i64,
-    client_projectile_id: Option<String>,
+    grid_x: Option<i64>,
+    grid_y: Option<i64>,
+    created_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RoomCodeRow {
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionTokenRow {
+    token: String,
+    player_id: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeHydratedPlayerRow {
+    player_id: String,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    up: i64,
+    down: i64,
+    left: i64,
+    right: i64,
+    last_input_seq: i64,
+    connected: i64,
+    last_seen: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePlayerState {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    input: InputState,
+    last_input_seq: u32,
+    connected: bool,
+    last_seen: i64,
+    last_preview_cmd_at: i64,
+    last_place_cmd_at: i64,
+    last_projectile_fire_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStructureState {
+    structure_id: String,
+    owner_id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    grid_x: i64,
+    grid_y: i64,
+    chunk_x: i64,
+    chunk_y: i64,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePreviewState {
+    player_id: String,
+    kind: String,
+    x: f32,
+    y: f32,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeProjectileState {
+    projectile_id: String,
+    owner_id: String,
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    expires_at: i64,
+    client_projectile_id: Option<String>,
+    updated_at: i64,
+}
+
+#[derive(Debug, Default)]
+struct RoomRuntimeState {
+    players: HashMap<String, RuntimePlayerState>,
+    structures: HashMap<String, RuntimeStructureState>,
+    previews: HashMap<String, RuntimePreviewState>,
+    projectiles: HashMap<String, RuntimeProjectileState>,
 }
 
 fn now_ms() -> i64 {
@@ -403,6 +428,14 @@ fn grid_cell_center(grid_axis: i64) -> f64 {
     grid_axis as f64 * BUILD_GRID_SIZE
 }
 
+fn chunk_coord_for_grid(grid_axis: i64) -> i64 {
+    if grid_axis >= 0 {
+        grid_axis / BUILD_CHUNK_CELLS
+    } else {
+        ((grid_axis + 1) / BUILD_CHUNK_CELLS) - 1
+    }
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
@@ -446,7 +479,12 @@ pub struct RoomDurableObject {
     tick: Cell<u64>,
     last_loop_ms: Cell<f64>,
     accumulator_ms: Cell<f64>,
+    last_checkpoint_ms: Cell<i64>,
     snapshot_dirty: Cell<bool>,
+    dirty_presence: Cell<bool>,
+    dirty_build: Cell<bool>,
+    dirty_projectiles: Cell<bool>,
+    runtime: RefCell<RoomRuntimeState>,
 }
 
 impl RoomDurableObject {
@@ -454,11 +492,257 @@ impl RoomDurableObject {
         self.state.storage().sql()
     }
 
+    fn default_runtime_player(now: i64) -> RuntimePlayerState {
+        RuntimePlayerState {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            input: InputState {
+                up: false,
+                down: false,
+                left: false,
+                right: false,
+            },
+            last_input_seq: 0,
+            connected: false,
+            last_seen: now,
+            last_preview_cmd_at: 0,
+            last_place_cmd_at: 0,
+            last_projectile_fire_at: 0,
+        }
+    }
+
+    fn hydrate_runtime_from_db(&self) -> Result<()> {
+        let sql = self.sql();
+        let now = now_ms();
+
+        let player_rows: Vec<RuntimeHydratedPlayerRow> = sql
+            .exec(
+                "
+                SELECT s.player_id, s.x, s.y, s.vx, s.vy,
+                       COALESCE(i.up, 0) AS up,
+                       COALESCE(i.down, 0) AS down,
+                       COALESCE(i.left, 0) AS left,
+                       COALESCE(i.right, 0) AS right,
+                       COALESCE(i.last_input_seq, 0) AS last_input_seq,
+                       COALESCE(p.connected, 0) AS connected,
+                       COALESCE(p.last_seen, 0) AS last_seen
+                FROM movement_state s
+                LEFT JOIN movement_input_state i ON i.player_id = s.player_id
+                LEFT JOIN presence_players p ON p.player_id = s.player_id
+                ORDER BY s.player_id ASC
+                ",
+                None,
+            )?
+            .to_array()?;
+
+        let structure_rows: Vec<BuildRow> = sql
+            .exec(
+                "
+                SELECT structure_id, owner_id, kind, x, y, grid_x, grid_y, created_at
+                FROM build_structures
+                ORDER BY created_at ASC
+                LIMIT ?
+                ",
+                Some(vec![(MAX_STRUCTURES as i64).into()]),
+            )?
+            .to_array()?;
+
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.players.clear();
+        runtime.structures.clear();
+        runtime.previews.clear();
+        runtime.projectiles.clear();
+
+        for row in player_rows {
+            runtime.players.insert(
+                row.player_id.clone(),
+                RuntimePlayerState {
+                    x: row.x as f32,
+                    y: row.y as f32,
+                    vx: row.vx as f32,
+                    vy: row.vy as f32,
+                    input: InputState {
+                        up: row.up != 0,
+                        down: row.down != 0,
+                        left: row.left != 0,
+                        right: row.right != 0,
+                    },
+                    last_input_seq: row.last_input_seq.max(0) as u32,
+                    connected: row.connected != 0,
+                    last_seen: row.last_seen.max(0),
+                    last_preview_cmd_at: 0,
+                    last_place_cmd_at: 0,
+                    last_projectile_fire_at: 0,
+                },
+            );
+        }
+
+        for row in structure_rows {
+            let grid_x = row.grid_x.unwrap_or_else(|| snap_axis_to_grid(row.x));
+            let grid_y = row.grid_y.unwrap_or_else(|| snap_axis_to_grid(row.y));
+            runtime.structures.insert(
+                row.structure_id.clone(),
+                RuntimeStructureState {
+                    structure_id: row.structure_id,
+                    owner_id: row.owner_id,
+                    kind: row.kind,
+                    x: grid_cell_center(grid_x) as f32,
+                    y: grid_cell_center(grid_y) as f32,
+                    grid_x,
+                    grid_y,
+                    chunk_x: chunk_coord_for_grid(grid_x),
+                    chunk_y: chunk_coord_for_grid(grid_y),
+                    created_at: row.created_at.unwrap_or(now),
+                },
+            );
+        }
+
+        drop(runtime);
+
+        // Preview/projectile state is ephemeral and should not survive process hibernation.
+        sql.exec("DELETE FROM build_previews", None)?;
+        sql.exec("DELETE FROM projectile_state", None)?;
+        Ok(())
+    }
+
+    fn checkpoint_runtime_players_to_db(&self) -> Result<()> {
+        let sql = self.sql();
+        let runtime = self.runtime.borrow();
+
+        for (player_id, player) in runtime.players.iter() {
+            sql.exec(
+                "
+                INSERT INTO movement_state (player_id, x, y, vx, vy, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(player_id) DO UPDATE SET
+                  x = excluded.x,
+                  y = excluded.y,
+                  vx = excluded.vx,
+                  vy = excluded.vy,
+                  updated_at = excluded.updated_at
+                ",
+                Some(vec![
+                    player_id.as_str().into(),
+                    (player.x as f64).into(),
+                    (player.y as f64).into(),
+                    (player.vx as f64).into(),
+                    (player.vy as f64).into(),
+                    player.last_seen.into(),
+                ]),
+            )?;
+
+            sql.exec(
+                "
+                INSERT INTO movement_input_state (player_id, up, down, left, right, last_input_seq, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(player_id) DO UPDATE SET
+                  up = excluded.up,
+                  down = excluded.down,
+                  left = excluded.left,
+                  right = excluded.right,
+                  last_input_seq = excluded.last_input_seq,
+                  updated_at = excluded.updated_at
+                ",
+                Some(vec![
+                    player_id.as_str().into(),
+                    (player.input.up as i64).into(),
+                    (player.input.down as i64).into(),
+                    (player.input.left as i64).into(),
+                    (player.input.right as i64).into(),
+                    (player.last_input_seq as i64).into(),
+                    player.last_seen.into(),
+                ]),
+            )?;
+
+            sql.exec(
+                "
+                INSERT INTO presence_players (player_id, connected, last_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(player_id) DO UPDATE SET
+                  connected = excluded.connected,
+                  last_seen = excluded.last_seen
+                ",
+                Some(vec![
+                    player_id.as_str().into(),
+                    (player.connected as i64).into(),
+                    player.last_seen.into(),
+                ]),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn checkpoint_runtime_if_due(&self) -> Result<()> {
+        let now = now_ms();
+        if now - self.last_checkpoint_ms.get() < STATE_CHECKPOINT_INTERVAL_MS {
+            return Ok(());
+        }
+
+        self.checkpoint_runtime_players_to_db()?;
+        self.last_checkpoint_ms.set(now);
+        Ok(())
+    }
+
+    fn persist_structure_insert(&self, structure: &RuntimeStructureState) -> Result<()> {
+        self.sql().exec(
+            "
+            INSERT INTO build_structures (structure_id, owner_id, kind, x, y, grid_x, grid_y, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(structure_id) DO UPDATE SET
+              owner_id = excluded.owner_id,
+              kind = excluded.kind,
+              x = excluded.x,
+              y = excluded.y,
+              grid_x = excluded.grid_x,
+              grid_y = excluded.grid_y
+            ",
+            Some(vec![
+                structure.structure_id.as_str().into(),
+                structure.owner_id.as_str().into(),
+                structure.kind.as_str().into(),
+                (structure.x as f64).into(),
+                (structure.y as f64).into(),
+                structure.grid_x.into(),
+                structure.grid_y.into(),
+                structure.created_at.into(),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn persist_structure_delete(&self, structure_id: &str) -> Result<()> {
+        self.sql().exec(
+            "DELETE FROM build_structures WHERE structure_id = ?",
+            Some(vec![structure_id.into()]),
+        )?;
+        Ok(())
+    }
+
     fn initialize_schema(&self) -> Result<()> {
         let sql = self.sql();
 
         sql.exec(
             "CREATE TABLE IF NOT EXISTS room_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            None,
+        )?;
+
+        sql.exec(
+            "
+            CREATE TABLE IF NOT EXISTS session_tokens (
+              token TEXT PRIMARY KEY,
+              player_id TEXT NOT NULL,
+              expires_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_session_tokens_player ON session_tokens(player_id)",
             None,
         )?;
 
@@ -614,6 +898,11 @@ impl RoomDurableObject {
             Some(vec![(now_ms() - BUILD_PREVIEW_STALE_MS).into()]),
         )?;
 
+        sql.exec(
+            "DELETE FROM session_tokens WHERE expires_at < ?",
+            Some(vec![now_ms().into()]),
+        )?;
+
         Ok(())
     }
 
@@ -636,6 +925,70 @@ impl RoomDurableObject {
             Some(vec![room_code.into()]),
         )?;
         Ok(())
+    }
+
+    fn issue_resume_token(&self, player_id: &str, resume_token: Option<&str>) -> Result<String> {
+        let now = now_ms();
+        let expires_at = now + RESUME_TOKEN_TTL_MS;
+        let sql = self.sql();
+
+        if let Some(token) = resume_token {
+            let rows: Vec<SessionTokenRow> = sql
+                .exec(
+                    "SELECT token, player_id, expires_at FROM session_tokens WHERE token = ? LIMIT 1",
+                    Some(vec![token.into()]),
+                )?
+                .to_array()?;
+
+            if let Some(row) = rows.first() {
+                if row.player_id == player_id && row.expires_at > now {
+                    sql.exec(
+                        "UPDATE session_tokens SET expires_at = ?, updated_at = ? WHERE token = ?",
+                        Some(vec![expires_at.into(), now.into(), token.into()]),
+                    )?;
+                    return Ok(row.token.clone());
+                }
+            }
+        }
+
+        let token = format!(
+            "resume_{:x}_{:x}",
+            now as u64,
+            (js_sys::Math::random() * 1e12) as u64
+        );
+        sql.exec(
+            "
+            INSERT INTO session_tokens (token, player_id, expires_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(token) DO UPDATE SET
+              player_id = excluded.player_id,
+              expires_at = excluded.expires_at,
+              updated_at = excluded.updated_at
+            ",
+            Some(vec![
+                token.as_str().into(),
+                player_id.into(),
+                expires_at.into(),
+                now.into(),
+            ]),
+        )?;
+
+        sql.exec(
+            "DELETE FROM session_tokens WHERE token IN (
+               SELECT token FROM session_tokens
+               WHERE player_id = ?
+               ORDER BY updated_at DESC
+               LIMIT -1 OFFSET 8
+             )",
+            Some(vec![player_id.into()]),
+        )?;
+
+        sql.exec(
+            "DELETE FROM session_tokens WHERE expires_at < ?",
+            Some(vec![now.into()]),
+        )?;
+
+        Ok(token)
     }
 
     fn read_socket_attachment(&self, ws: &WebSocket) -> Option<SocketAttachment> {
@@ -751,25 +1104,21 @@ impl RoomDurableObject {
             Some(vec![player_id.into(), now.into()]),
         )?;
 
-        sql.exec(
-            "
-            INSERT INTO movement_state (player_id, x, y, vx, vy, updated_at)
-            VALUES (?, 0, 0, 0, 0, ?)
-            ON CONFLICT(player_id) DO UPDATE SET updated_at = excluded.updated_at
-            ",
-            Some(vec![player_id.into(), now.into()]),
-        )?;
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+            player.connected = true;
+            player.last_seen = now;
+        }
 
-        sql.exec(
-            "
-            INSERT INTO movement_input_state (player_id, up, down, left, right, last_input_seq, updated_at)
-            VALUES (?, 0, 0, 0, 0, 0, ?)
-            ON CONFLICT(player_id) DO UPDATE SET updated_at = excluded.updated_at
-            ",
-            Some(vec![player_id.into(), now.into()]),
-        )?;
+        self.checkpoint_runtime_players_to_db()?;
+        self.last_checkpoint_ms.set(now);
 
         self.snapshot_dirty.set(true);
+        self.dirty_presence.set(true);
         Ok(())
     }
 
@@ -782,12 +1131,21 @@ impl RoomDurableObject {
             Some(vec![now.into(), player_id.into()]),
         )?;
 
-        sql.exec(
-            "DELETE FROM build_previews WHERE player_id = ?",
-            Some(vec![player_id.into()]),
-        )?;
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            if let Some(player) = runtime.players.get_mut(player_id) {
+                player.connected = false;
+                player.last_seen = now;
+            }
+            runtime.previews.remove(player_id);
+        }
+
+        self.checkpoint_runtime_players_to_db()?;
+        self.last_checkpoint_ms.set(now);
 
         self.snapshot_dirty.set(true);
+        self.dirty_presence.set(true);
+        self.dirty_build.set(true);
         Ok(())
     }
 
@@ -804,34 +1162,15 @@ impl RoomDurableObject {
             return Ok(false);
         }
 
-        let sql = self.sql();
-
-        let existing: Vec<MovementInputRow> = sql
-            .exec(
-                "SELECT up, down, left, right, last_input_seq FROM movement_input_state WHERE player_id = ? LIMIT 1",
-                Some(vec![player_id.into()]),
-            )?
-            .to_array()?;
-
-        let mut last_seq = existing
-            .first()
-            .map(|row| row.last_input_seq.max(0) as u32)
-            .unwrap_or(0);
-
-        let mut latest_state = existing
-            .first()
-            .map(|row| InputState {
-                up: row.up != 0,
-                down: row.down != 0,
-                left: row.left != 0,
-                right: row.right != 0,
-            })
-            .unwrap_or(InputState {
-                up: false,
-                down: false,
-                left: false,
-                right: false,
-            });
+        let now = now_ms();
+        let mut runtime = self.runtime.borrow_mut();
+        let player = runtime
+            .players
+            .entry(player_id.to_string())
+            .or_insert_with(|| Self::default_runtime_player(now));
+        let mut last_seq = player.last_input_seq;
+        let mut latest_state = player.input.clone();
+        let mut accepted = false;
 
         for command in input_batch.inputs {
             if command.seq <= last_seq {
@@ -839,6 +1178,7 @@ impl RoomDurableObject {
             }
 
             last_seq = command.seq;
+            accepted = true;
             latest_state = InputState {
                 up: command.up,
                 down: command.down,
@@ -847,38 +1187,21 @@ impl RoomDurableObject {
             };
         }
 
-        let now = now_ms();
-        sql.exec(
-            "
-            INSERT INTO movement_input_state (player_id, up, down, left, right, last_input_seq, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(player_id) DO UPDATE SET
-              up = excluded.up,
-              down = excluded.down,
-              left = excluded.left,
-              right = excluded.right,
-              last_input_seq = excluded.last_input_seq,
-              updated_at = excluded.updated_at
-            ",
-            Some(vec![
-                player_id.into(),
-                (latest_state.up as i64).into(),
-                (latest_state.down as i64).into(),
-                (latest_state.left as i64).into(),
-                (latest_state.right as i64).into(),
-                (last_seq as i64).into(),
-                now.into(),
-            ]),
-        )?;
+        if accepted {
+            player.last_input_seq = last_seq;
+            player.input = latest_state;
+            player.last_seen = now;
+        }
 
         Ok(false)
     }
 
     fn prune_stale_build_previews(&self) -> Result<()> {
-        self.sql().exec(
-            "DELETE FROM build_previews WHERE updated_at < ?",
-            Some(vec![(now_ms() - BUILD_PREVIEW_STALE_MS).into()]),
-        )?;
+        let cutoff = now_ms() - BUILD_PREVIEW_STALE_MS;
+        let mut runtime = self.runtime.borrow_mut();
+        runtime
+            .previews
+            .retain(|_, preview| preview.updated_at >= cutoff);
         Ok(())
     }
 
@@ -889,35 +1212,23 @@ impl RoomDurableObject {
         center_x: f64,
         center_y: f64,
     ) -> Result<bool> {
-        let sql = self.sql();
-
-        let occupied_rows: Vec<BuildGridOccupiedRow> = sql
-            .exec(
-                "SELECT COUNT(*) AS count FROM build_structures WHERE grid_x = ? AND grid_y = ?",
-                Some(vec![grid_x.into(), grid_y.into()]),
-            )?
-            .to_array()?;
-
-        if occupied_rows.first().is_some_and(|row| row.count > 0) {
+        let runtime = self.runtime.borrow();
+        if runtime
+            .structures
+            .values()
+            .any(|structure| structure.grid_x == grid_x && structure.grid_y == grid_y)
+        {
             return Ok(false);
         }
 
-        let players: Vec<PlayerPositionRow> = sql
-            .exec(
-                "
-                SELECT s.x, s.y
-                FROM movement_state s
-                INNER JOIN presence_players p ON p.player_id = s.player_id
-                WHERE p.connected = 1
-                ",
-                None,
-            )?
-            .to_array()?;
-
         let blocked = STRUCTURE_COLLIDER_HALF_EXTENT + PLAYER_COLLIDER_RADIUS;
-        for player in players {
-            if (player.x - center_x).abs() < blocked as f64
-                && (player.y - center_y).abs() < blocked as f64
+        for player in runtime.players.values() {
+            if !player.connected {
+                continue;
+            }
+
+            if (player.x as f64 - center_x).abs() < blocked as f64
+                && (player.y as f64 - center_y).abs() < blocked as f64
             {
                 return Ok(false);
             }
@@ -931,14 +1242,27 @@ impl RoomDurableObject {
             payload.ok_or_else(|| Error::RustError("missing build preview payload".into()))?;
         let preview: BuildPreviewPayload = serde_json::from_value(payload)
             .map_err(|_| Error::RustError("invalid build preview payload".into()))?;
+        let now = now_ms();
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+
+            if now - player.last_preview_cmd_at < PREVIEW_COMMAND_MIN_INTERVAL_MS {
+                return Ok(false);
+            }
+            player.last_preview_cmd_at = now;
+            player.last_seen = now;
+        }
 
         if !preview.active {
-            self.sql().exec(
-                "DELETE FROM build_previews WHERE player_id = ?",
-                Some(vec![player_id.into()]),
-            )?;
+            self.runtime.borrow_mut().previews.remove(player_id);
             self.prune_stale_build_previews()?;
             self.snapshot_dirty.set(true);
+            self.dirty_build.set(true);
             return Ok(false);
         }
 
@@ -957,36 +1281,23 @@ impl RoomDurableObject {
             return Err(Error::RustError("invalid structure kind".into()));
         }
 
-        let grid_x = snap_axis_to_grid(x);
-        let grid_y = snap_axis_to_grid(y);
-        let center_x = grid_cell_center(grid_x);
-        let center_y = grid_cell_center(grid_y);
+        let center_x = grid_cell_center(snap_axis_to_grid(x));
+        let center_y = grid_cell_center(snap_axis_to_grid(y));
 
-        self.sql().exec(
-            "
-            INSERT INTO build_previews (player_id, kind, x, y, grid_x, grid_y, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(player_id) DO UPDATE SET
-              kind = excluded.kind,
-              x = excluded.x,
-              y = excluded.y,
-              grid_x = excluded.grid_x,
-              grid_y = excluded.grid_y,
-              updated_at = excluded.updated_at
-            ",
-            Some(vec![
-                player_id.into(),
-                kind.into(),
-                center_x.into(),
-                center_y.into(),
-                grid_x.into(),
-                grid_y.into(),
-                now_ms().into(),
-            ]),
-        )?;
+        self.runtime.borrow_mut().previews.insert(
+            player_id.to_string(),
+            RuntimePreviewState {
+                player_id: player_id.to_string(),
+                kind: kind.to_string(),
+                x: center_x as f32,
+                y: center_y as f32,
+                updated_at: now,
+            },
+        );
 
         self.prune_stale_build_previews()?;
         self.snapshot_dirty.set(true);
+        self.dirty_build.set(true);
         Ok(false)
     }
 
@@ -1002,6 +1313,21 @@ impl RoomDurableObject {
                     payload.ok_or_else(|| Error::RustError("missing build payload".into()))?;
                 let place: BuildPlacePayload = serde_json::from_value(payload)
                     .map_err(|_| Error::RustError("invalid build payload".into()))?;
+                let now = now_ms();
+
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let player = runtime
+                        .players
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| Self::default_runtime_player(now));
+
+                    if now - player.last_place_cmd_at < PLACE_COMMAND_MIN_INTERVAL_MS {
+                        return Ok(false);
+                    }
+                    player.last_place_cmd_at = now;
+                    player.last_seen = now;
+                }
 
                 if !is_valid_structure_kind(place.kind.as_str()) {
                     return Err(Error::RustError("invalid structure kind".into()));
@@ -1021,25 +1347,48 @@ impl RoomDurableObject {
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| format!("build_{}_{}", now_ms(), js_sys::Math::random()));
 
-                self.sql().exec(
-                    "
-                    INSERT INTO build_structures (structure_id, owner_id, kind, x, y, grid_x, grid_y, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(structure_id) DO NOTHING
-                    ",
-                    Some(vec![
-                        structure_id.into(),
-                        player_id.into(),
-                        place.kind.into(),
-                        snapped_x.into(),
-                        snapped_y.into(),
-                        grid_x.into(),
-                        grid_y.into(),
-                        now_ms().into(),
-                    ]),
-                )?;
+                let structure = RuntimeStructureState {
+                    structure_id: structure_id.clone(),
+                    owner_id: player_id.to_string(),
+                    kind: place.kind.clone(),
+                    x: snapped_x as f32,
+                    y: snapped_y as f32,
+                    grid_x,
+                    grid_y,
+                    chunk_x: chunk_coord_for_grid(grid_x),
+                    chunk_y: chunk_coord_for_grid(grid_y),
+                    created_at: now,
+                };
+
+                self.runtime
+                    .borrow_mut()
+                    .structures
+                    .insert(structure_id.clone(), structure.clone());
+                self.persist_structure_insert(&structure)?;
+
+                let overflow_structure_id = {
+                    let runtime = self.runtime.borrow();
+                    if runtime.structures.len() > MAX_STRUCTURES {
+                        runtime
+                            .structures
+                            .values()
+                            .min_by_key(|value| value.created_at)
+                            .map(|value| value.structure_id.clone())
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(overflow_structure_id) = overflow_structure_id {
+                    self.runtime
+                        .borrow_mut()
+                        .structures
+                        .remove(&overflow_structure_id);
+                    self.persist_structure_delete(&overflow_structure_id)?;
+                }
 
                 self.snapshot_dirty.set(true);
+                self.dirty_build.set(true);
                 Ok(true)
             }
             "preview" => self.handle_build_preview(player_id, payload),
@@ -1049,12 +1398,11 @@ impl RoomDurableObject {
                 let remove: BuildRemovePayload = serde_json::from_value(payload)
                     .map_err(|_| Error::RustError("invalid build payload".into()))?;
 
-                self.sql().exec(
-                    "DELETE FROM build_structures WHERE structure_id = ?",
-                    Some(vec![remove.id.into()]),
-                )?;
+                self.runtime.borrow_mut().structures.remove(&remove.id);
+                self.persist_structure_delete(&remove.id)?;
 
                 self.snapshot_dirty.set(true);
+                self.dirty_build.set(true);
                 Ok(true)
             }
             _ => Err(Error::RustError("invalid build action".into())),
@@ -1066,6 +1414,21 @@ impl RoomDurableObject {
             payload.ok_or_else(|| Error::RustError("missing projectile payload".into()))?;
         let mut fire: ProjectileFirePayload = serde_json::from_value(payload)
             .map_err(|_| Error::RustError("invalid projectile payload".into()))?;
+        let now = now_ms();
+
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            let player = runtime
+                .players
+                .entry(player_id.to_string())
+                .or_insert_with(|| Self::default_runtime_player(now));
+
+            if now - player.last_projectile_fire_at < PROJECTILE_FIRE_MIN_INTERVAL_MS {
+                return Ok(false);
+            }
+            player.last_projectile_fire_at = now;
+            player.last_seen = now;
+        }
 
         let speed = (fire.vx * fire.vx + fire.vy * fire.vy).sqrt();
         if speed > PROJECTILE_MAX_SPEED && speed > 0.0 {
@@ -1074,41 +1437,47 @@ impl RoomDurableObject {
             fire.vy *= scale;
         }
 
-        let projectile_id = format!("proj_{}_{}", now_ms(), js_sys::Math::random());
-        let expires_at = now_ms() + PROJECTILE_TTL_MS;
+        let projectile_id = format!("proj_{}_{}", now, js_sys::Math::random());
+        let expires_at = now + PROJECTILE_TTL_MS;
+        let updated_at = now;
 
-        self.sql().exec(
-            "
-            INSERT INTO projectile_state (projectile_id, owner_id, x, y, vx, vy, expires_at, updated_at, client_projectile_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ",
-            Some(vec![
-                projectile_id.into(),
-                player_id.into(),
-                fire.x.into(),
-                fire.y.into(),
-                fire.vx.into(),
-                fire.vy.into(),
-                expires_at.into(),
-                now_ms().into(),
-                fire.client_projectile_id.into(),
-            ]),
-        )?;
+        self.runtime.borrow_mut().projectiles.insert(
+            projectile_id.clone(),
+            RuntimeProjectileState {
+                projectile_id,
+                owner_id: player_id.to_string(),
+                x: fire.x as f32,
+                y: fire.y as f32,
+                vx: fire.vx as f32,
+                vy: fire.vy as f32,
+                expires_at,
+                client_projectile_id: fire.client_projectile_id,
+                updated_at,
+            },
+        );
 
-        self.sql().exec(
-            "
-            DELETE FROM projectile_state
-            WHERE projectile_id IN (
-              SELECT projectile_id
-              FROM projectile_state
-              ORDER BY updated_at ASC
-              LIMIT (SELECT MAX(0, COUNT(*) - ?) FROM projectile_state)
-            )
-            ",
-            Some(vec![(MAX_PROJECTILES as i64).into()]),
-        )?;
+        let overflow_projectile_id = {
+            let runtime = self.runtime.borrow();
+            if runtime.projectiles.len() > MAX_PROJECTILES {
+                runtime
+                    .projectiles
+                    .values()
+                    .min_by_key(|projectile| projectile.updated_at)
+                    .map(|projectile| projectile.projectile_id.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(overflow_projectile_id) = overflow_projectile_id {
+            self.runtime
+                .borrow_mut()
+                .projectiles
+                .remove(&overflow_projectile_id);
+        }
 
         self.snapshot_dirty.set(true);
+        self.dirty_projectiles.set(true);
         Ok(true)
     }
 
@@ -1129,12 +1498,20 @@ impl RoomDurableObject {
 
             if movement_changed || projectile_changed {
                 self.snapshot_dirty.set(true);
+                if projectile_changed {
+                    self.dirty_projectiles.set(true);
+                }
             }
 
             if self.tick.get() % SNAPSHOT_INTERVAL_TICKS == 0 || self.snapshot_dirty.get() {
-                self.broadcast_snapshot();
+                self.broadcast_snapshot(false);
                 self.snapshot_dirty.set(false);
+                self.dirty_presence.set(false);
+                self.dirty_build.set(false);
+                self.dirty_projectiles.set(false);
             }
+
+            self.checkpoint_runtime_if_due()?;
 
             accumulator -= SIM_DT_MS;
             steps += 1;
@@ -1153,61 +1530,33 @@ impl RoomDurableObject {
             return Ok(false);
         }
 
-        let sql = self.sql();
         let now = now_ms();
-        let obstacle_rows: Vec<StructureObstacleRow> = sql
-            .exec("SELECT kind, x, y FROM build_structures", None)?
-            .to_array()?;
-        let structure_obstacles: Vec<StructureObstacle> = obstacle_rows
-            .iter()
-            .map(|row| StructureObstacle {
-                x: row.x as f32,
-                y: row.y as f32,
-                half_extent: structure_half_extent(row.kind.as_str()),
-            })
-            .collect();
+        let structure_obstacles: Vec<StructureObstacle> = {
+            let runtime = self.runtime.borrow();
+            runtime
+                .structures
+                .values()
+                .map(|structure| StructureObstacle {
+                    x: structure.x,
+                    y: structure.y,
+                    half_extent: structure_half_extent(structure.kind.as_str()),
+                })
+                .collect()
+        };
 
         let mut changed = false;
+        let mut runtime = self.runtime.borrow_mut();
 
         for player_id in connected_players {
-            let input_rows: Vec<MovementInputRow> = sql
-                .exec(
-                    "SELECT up, down, left, right, last_input_seq FROM movement_input_state WHERE player_id = ? LIMIT 1",
-                    Some(vec![player_id.as_str().into()]),
-                )?
-                .to_array()?;
-
-            let input = input_rows
-                .first()
-                .map(|row| InputState {
-                    up: row.up != 0,
-                    down: row.down != 0,
-                    left: row.left != 0,
-                    right: row.right != 0,
-                })
-                .unwrap_or(InputState {
-                    up: false,
-                    down: false,
-                    left: false,
-                    right: false,
-                });
-
-            let state_rows: Vec<MovementStateRow> = sql
-                .exec(
-                    "SELECT player_id, x, y, vx, vy FROM movement_state WHERE player_id = ? LIMIT 1",
-                    Some(vec![player_id.as_str().into()]),
-                )?
-                .to_array()?;
-
-            let (current_x, current_y) = state_rows
-                .first()
-                .map(|row| (row.x, row.y))
-                .unwrap_or((0.0, 0.0));
+            let player = runtime
+                .players
+                .entry(player_id.clone())
+                .or_insert_with(|| Self::default_runtime_player(now));
 
             let step = movement_step_with_obstacles(
-                current_x as f32,
-                current_y as f32,
-                map_input_to_core(&input),
+                player.x,
+                player.y,
+                map_input_to_core(&player.input),
                 SIM_DT_SECONDS,
                 MOVE_SPEED,
                 MOVEMENT_MAP_LIMIT,
@@ -1215,157 +1564,98 @@ impl RoomDurableObject {
                 PLAYER_COLLIDER_RADIUS,
             );
 
-            if (step.x as f64 - current_x).abs() > f64::EPSILON
-                || (step.y as f64 - current_y).abs() > f64::EPSILON
-                || state_rows.first().is_some_and(|row| {
-                    (step.vx as f64 - row.vx).abs() > f64::EPSILON
-                        || (step.vy as f64 - row.vy).abs() > f64::EPSILON
-                })
+            if (step.x - player.x).abs() > f32::EPSILON
+                || (step.y - player.y).abs() > f32::EPSILON
+                || (step.vx - player.vx).abs() > f32::EPSILON
+                || (step.vy - player.vy).abs() > f32::EPSILON
             {
                 changed = true;
             }
 
-            sql.exec(
-                "
-                INSERT INTO movement_state (player_id, x, y, vx, vy, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(player_id) DO UPDATE SET
-                  x = excluded.x,
-                  y = excluded.y,
-                  vx = excluded.vx,
-                  vy = excluded.vy,
-                  updated_at = excluded.updated_at
-                ",
-                Some(vec![
-                    player_id.as_str().into(),
-                    (step.x as f64).into(),
-                    (step.y as f64).into(),
-                    (step.vx as f64).into(),
-                    (step.vy as f64).into(),
-                    now.into(),
-                ]),
-            )?;
+            player.x = step.x;
+            player.y = step.y;
+            player.vx = step.vx;
+            player.vy = step.vy;
+            player.connected = true;
+            player.last_seen = now;
         }
 
         Ok(changed)
     }
 
     fn tick_projectiles(&self) -> Result<bool> {
-        let sql = self.sql();
         let now = now_ms();
-
-        let projectiles: Vec<ProjectileRow> = sql
-            .exec(
-                "
-                SELECT projectile_id, owner_id, x, y, vx, vy, expires_at, client_projectile_id
-                FROM projectile_state
-                ",
-                None,
-            )?
-            .to_array()?;
-
-        if projectiles.is_empty() {
+        let mut runtime = self.runtime.borrow_mut();
+        if runtime.projectiles.is_empty() {
             return Ok(false);
         }
 
         let mut changed = false;
 
-        for projectile in projectiles {
+        let projectile_ids: Vec<String> = runtime.projectiles.keys().cloned().collect();
+        for projectile_id in projectile_ids {
+            let Some(projectile) = runtime.projectiles.get_mut(&projectile_id) else {
+                continue;
+            };
+
             if projectile.expires_at <= now {
-                sql.exec(
-                    "DELETE FROM projectile_state WHERE projectile_id = ?",
-                    Some(vec![projectile.projectile_id.into()]),
-                )?;
+                runtime.projectiles.remove(&projectile_id);
                 changed = true;
                 continue;
             }
 
             let (next_x, next_y) = projectile_step(
-                projectile.x as f32,
-                projectile.y as f32,
-                projectile.vx as f32,
-                projectile.vy as f32,
+                projectile.x,
+                projectile.y,
+                projectile.vx,
+                projectile.vy,
                 SIM_DT_SECONDS,
                 PROJECTILE_MAP_LIMIT,
             );
-
-            sql.exec(
-                "UPDATE projectile_state SET x = ?, y = ?, updated_at = ? WHERE projectile_id = ?",
-                Some(vec![
-                    (next_x as f64).into(),
-                    (next_y as f64).into(),
-                    now.into(),
-                    projectile.projectile_id.into(),
-                ]),
-            )?;
+            projectile.x = next_x;
+            projectile.y = next_y;
+            projectile.updated_at = now;
             changed = true;
         }
 
         Ok(changed)
     }
 
-    fn snapshot_payload(&self) -> Result<Value> {
-        let sql = self.sql();
+    fn snapshot_payload(&self, full: bool) -> Result<Value> {
         let connected_players = self.connected_player_ids();
         let connected_set: HashSet<&str> = connected_players.iter().map(String::as_str).collect();
+        let online = connected_players.clone();
+        let now = now_ms();
 
-        let presence_rows: Vec<PresenceRow> = sql
-            .exec(
-                "SELECT player_id FROM presence_players WHERE connected = 1 ORDER BY last_seen DESC",
-                None,
-            )?
-            .to_array()?;
+        self.prune_stale_build_previews()?;
+        let runtime = self.runtime.borrow();
 
-        let online: Vec<String> = presence_rows.into_iter().map(|row| row.player_id).collect();
-
-        let movement_rows: Vec<MovementStateRow> = sql
-            .exec(
-                "SELECT player_id, x, y, vx, vy FROM movement_state ORDER BY player_id ASC",
-                None,
-            )?
-            .to_array()?;
-
-        let movement_players: Vec<Value> = movement_rows
-            .into_iter()
-            .filter(|row| connected_set.contains(row.player_id.as_str()))
-            .map(|row| {
-                json!({
-                    "id": row.player_id,
-                    "x": row.x,
-                    "y": row.y,
-                    "vx": row.vx,
-                    "vy": row.vy,
+        let mut movement_players = Vec::new();
+        for player_id in connected_players.iter() {
+            if let Some(player) = runtime.players.get(player_id) {
+                movement_players.push(json!({
+                    "id": player_id,
+                    "x": player.x,
+                    "y": player.y,
+                    "vx": player.vx,
+                    "vy": player.vy,
                     "connected": true,
-                })
-            })
-            .collect();
-
-        let input_rows: Vec<MovementInputRowWithPlayerId> = sql
-            .exec(
-                "SELECT player_id, last_input_seq FROM movement_input_state ORDER BY player_id ASC",
-                None,
-            )?
-            .to_array()?;
-
-        let mut input_acks = JsonMap::new();
-        for row in input_rows {
-            input_acks.insert(row.player_id, Value::from(row.last_input_seq.max(0)));
+                }));
+            }
         }
 
-        let structure_rows: Vec<BuildRow> = sql
-            .exec(
-                "
-                SELECT structure_id, owner_id, kind, x, y
-                FROM build_structures
-                ORDER BY created_at DESC
-                LIMIT ?
-                ",
-                Some(vec![(MAX_STRUCTURES as i64).into()]),
-            )?
-            .to_array()?;
+        let mut input_acks = JsonMap::new();
+        for player_id in connected_players.iter() {
+            if let Some(player) = runtime.players.get(player_id) {
+                input_acks.insert(player_id.clone(), Value::from(player.last_input_seq));
+            }
+        }
 
+        let mut structure_rows: Vec<&RuntimeStructureState> = runtime.structures.values().collect();
+        structure_rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
         let structures: Vec<Value> = structure_rows
             .iter()
+            .take(MAX_STRUCTURES)
             .map(|row| {
                 json!({
                     "id": row.structure_id,
@@ -1373,29 +1663,24 @@ impl RoomDurableObject {
                     "kind": row.kind,
                     "x": row.x,
                     "y": row.y,
+                    "chunkX": row.chunk_x,
+                    "chunkY": row.chunk_y,
                 })
             })
             .collect();
 
-        let preview_rows: Vec<BuildPreviewRow> = sql
-            .exec(
-                "
-                SELECT player_id, kind, x, y
-                FROM build_previews
-                WHERE updated_at > ?
-                ORDER BY updated_at DESC
-                LIMIT ?
-                ",
-                Some(vec![
-                    (now_ms() - BUILD_PREVIEW_STALE_MS).into(),
-                    (MAX_PREVIEWS as i64).into(),
-                ]),
-            )?
-            .to_array()?;
+        let mut preview_rows: Vec<&RuntimePreviewState> = runtime
+            .previews
+            .iter()
+            .map(|(_, row)| row)
+            .filter(|row| connected_set.contains(row.player_id.as_str()))
+            .filter(|row| row.updated_at > now - BUILD_PREVIEW_STALE_MS)
+            .collect();
+        preview_rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
 
         let previews: Vec<Value> = preview_rows
             .iter()
-            .filter(|row| connected_set.contains(row.player_id.as_str()))
+            .take(MAX_PREVIEWS)
             .map(|row| {
                 json!({
                     "playerId": row.player_id,
@@ -1406,21 +1691,17 @@ impl RoomDurableObject {
             })
             .collect();
 
-        let projectile_rows: Vec<ProjectileRow> = sql
-            .exec(
-                "
-                SELECT projectile_id, owner_id, x, y, vx, vy, expires_at, client_projectile_id
-                FROM projectile_state
-                WHERE expires_at > ?
-                ORDER BY updated_at DESC
-                LIMIT ?
-                ",
-                Some(vec![now_ms().into(), (MAX_PROJECTILES as i64).into()]),
-            )?
-            .to_array()?;
+        let mut projectile_rows: Vec<&RuntimeProjectileState> = runtime
+            .projectiles
+            .iter()
+            .map(|(_, row)| row)
+            .filter(|row| row.expires_at > now)
+            .collect();
+        projectile_rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
 
         let projectiles: Vec<Value> = projectile_rows
             .iter()
+            .take(MAX_PROJECTILES)
             .map(|row| {
                 json!({
                     "id": row.projectile_id,
@@ -1434,44 +1715,72 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let include_presence = full || self.dirty_presence.get();
+        let include_build = full || self.dirty_build.get();
+        let include_projectiles = full || self.dirty_projectiles.get();
+        let mut features = JsonMap::new();
+
+        if include_presence {
+            features.insert(
+                "presence".to_string(),
+                json!({
+                    "online": online,
+                    "onlineCount": connected_players.len(),
+                }),
+            );
+        }
+
+        // Movement is always emitted so clients can keep interpolation/prediction alive.
+        features.insert(
+            "movement".to_string(),
+            json!({
+                "players": movement_players,
+                "inputAcks": input_acks,
+                "speed": MOVE_SPEED,
+            }),
+        );
+
+        if include_build {
+            features.insert(
+                "build".to_string(),
+                json!({
+                    "structures": structures,
+                    "structureCount": runtime.structures.len(),
+                    "previews": previews,
+                    "previewCount": preview_rows.len().min(MAX_PREVIEWS),
+                }),
+            );
+        }
+
+        if include_projectiles {
+            features.insert(
+                "projectile".to_string(),
+                json!({
+                    "projectiles": projectiles,
+                    "projectileCount": projectile_rows.len().min(MAX_PROJECTILES),
+                }),
+            );
+        }
+
         Ok(json!({
             "roomCode": self.room_code.borrow().clone(),
             "serverTick": self.tick.get(),
             "simRateHz": SIM_RATE_HZ,
             "snapshotRateHz": SNAPSHOT_RATE_HZ,
             "serverTime": now_ms(),
-            "features": {
-                "presence": {
-                    "online": online,
-                    "onlineCount": connected_players.len(),
-                },
-                "movement": {
-                    "players": movement_players,
-                    "inputAcks": input_acks,
-                    "speed": MOVE_SPEED,
-                },
-                "build": {
-                    "structures": structures,
-                    "structureCount": structure_rows.len(),
-                    "previews": previews,
-                    "previewCount": previews.len(),
-                },
-                "projectile": {
-                    "projectiles": projectiles,
-                    "projectileCount": projectile_rows.len(),
-                },
-            }
+            "mode": if full { "full" } else { "delta" },
+            "features": features,
         }))
     }
 
-    fn send_snapshot_to(&self, socket: &WebSocket) {
-        if let Ok(payload) = self.snapshot_payload() {
+    fn send_snapshot_to(&self, socket: &WebSocket, full: bool) {
+        if let Ok(payload) = self.snapshot_payload(full) {
             self.send_envelope(socket, "snapshot", "core", "state", None, Some(payload));
         }
     }
 
-    fn broadcast_snapshot(&self) {
-        if let Ok(payload) = self.snapshot_payload() {
+    fn broadcast_snapshot(&self, full: bool) {
+        if let Ok(payload) = self.snapshot_payload(full) {
             self.broadcast_envelope("snapshot", "core", "state", Some(payload));
         }
     }
@@ -1489,6 +1798,10 @@ impl RoomDurableObject {
             }
         };
 
+        if raw.len() > 32 * 1024 {
+            return Err(Error::RustError("protocol envelope too large".into()));
+        }
+
         let envelope: ClientCommandEnvelope = serde_json::from_str(&raw)
             .map_err(|_| Error::RustError("malformed protocol envelope".into()))?;
 
@@ -1497,6 +1810,8 @@ impl RoomDurableObject {
             || envelope.seq < 1
             || envelope.feature.is_empty()
             || envelope.action.is_empty()
+            || envelope.feature.len() > 32
+            || envelope.action.len() > 32
             || !envelope.client_time.is_finite()
         {
             return Err(Error::RustError("invalid protocol envelope".into()));
@@ -1546,6 +1861,17 @@ impl RoomDurableObject {
 
         let sql = self.sql();
         let now = now_ms();
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            for player_id in players.iter() {
+                let player = runtime
+                    .players
+                    .entry(player_id.clone())
+                    .or_insert_with(|| Self::default_runtime_player(now));
+                player.connected = true;
+                player.last_seen = now;
+            }
+        }
         for player_id in players {
             sql.exec(
                 "
@@ -1570,7 +1896,12 @@ impl DurableObject for RoomDurableObject {
             tick: Cell::new(0),
             last_loop_ms: Cell::new(now_ms() as f64),
             accumulator_ms: Cell::new(0.0),
+            last_checkpoint_ms: Cell::new(now_ms()),
             snapshot_dirty: Cell::new(false),
+            dirty_presence: Cell::new(false),
+            dirty_build: Cell::new(false),
+            dirty_projectiles: Cell::new(false),
+            runtime: RefCell::new(RoomRuntimeState::default()),
         };
 
         if let Err(error) = room.initialize_schema() {
@@ -1579,6 +1910,10 @@ impl DurableObject for RoomDurableObject {
 
         if let Ok(Some(room_code)) = room.load_room_code_from_db() {
             room.room_code.replace(room_code);
+        }
+
+        if let Err(error) = room.hydrate_runtime_from_db() {
+            console_error!("failed to hydrate runtime state: {error}");
         }
 
         if let Err(error) = room.restore_presence_from_active_sockets() {
@@ -1606,7 +1941,10 @@ impl DurableObject for RoomDurableObject {
             return json_response(json!({ "error": "WebSocket upgrade required." }), 426);
         }
 
+        let resume_token_hint =
+            parse_query_param(&url, "resumeToken").or_else(|| parse_query_param(&url, "resume"));
         let player_id = authenticate_player(&url, &self.env).await?;
+        let resume_token = self.issue_resume_token(&player_id, resume_token_hint.as_deref())?;
 
         let pair = WebSocketPair::new()?;
         let server = pair.server;
@@ -1633,11 +1971,12 @@ impl DurableObject for RoomDurableObject {
                 "playerId": player_id,
                 "simRateHz": SIM_RATE_HZ,
                 "snapshotRateHz": SNAPSHOT_RATE_HZ,
+                "resumeToken": resume_token,
             })),
         );
 
-        self.send_snapshot_to(&server);
-        self.broadcast_snapshot();
+        self.send_snapshot_to(&server, true);
+        self.broadcast_snapshot(false);
 
         Response::from_websocket(client)
     }
@@ -1675,8 +2014,11 @@ impl DurableObject for RoomDurableObject {
                 self.send_ack(&ws, "core", "command", envelope.seq);
                 if state_changed {
                     self.snapshot_dirty.set(true);
-                    self.broadcast_snapshot();
+                    self.broadcast_snapshot(false);
                     self.snapshot_dirty.set(false);
+                    self.dirty_presence.set(false);
+                    self.dirty_build.set(false);
+                    self.dirty_projectiles.set(false);
                 }
             }
             Err(error) => {
@@ -1698,7 +2040,7 @@ impl DurableObject for RoomDurableObject {
         if let Some(attachment) = self.read_socket_attachment(&ws) {
             if !self.player_has_other_socket(&attachment.player_id, &ws) {
                 self.on_disconnect_player(&attachment.player_id)?;
-                self.broadcast_snapshot();
+                self.broadcast_snapshot(false);
             }
         }
 
@@ -1709,7 +2051,7 @@ impl DurableObject for RoomDurableObject {
         if let Some(attachment) = self.read_socket_attachment(&ws) {
             if !self.player_has_other_socket(&attachment.player_id, &ws) {
                 self.on_disconnect_player(&attachment.player_id)?;
-                self.broadcast_snapshot();
+                self.broadcast_snapshot(false);
             }
         }
 

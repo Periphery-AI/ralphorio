@@ -24,6 +24,15 @@ function buildWebSocketUrl(roomCode: string, playerId: string) {
   return `${protocol}//${host}/api/rooms/${encodedRoom}/ws?playerId=${encodedPlayer}`;
 }
 
+function appendResumeToken(url: string, resumeToken: string | null) {
+  if (!resumeToken) {
+    return url;
+  }
+
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}resumeToken=${encodeURIComponent(resumeToken)}`;
+}
+
 function appendAuthToken(url: string, token: string | null) {
   if (!token) {
     return url;
@@ -94,6 +103,7 @@ function parseWelcomePayload(payload: unknown): WelcomePayload | null {
     playerId: payload.playerId,
     simRateHz: payload.simRateHz,
     snapshotRateHz: payload.snapshotRateHz,
+    resumeToken: typeof payload.resumeToken === 'string' ? payload.resumeToken : undefined,
   };
 }
 
@@ -122,19 +132,29 @@ export class RoomSocket {
   private readonly playerId: string;
   private readonly handlers: Handlers;
   private readonly authToken: string | null;
+  private readonly resumeToken: string | null;
   private seq = 1;
   private pingTimer: number | null = null;
   private pingSentAt = new Map<number, number>();
 
-  constructor(roomCode: string, playerId: string, handlers: Handlers, authToken: string | null = null) {
+  constructor(
+    roomCode: string,
+    playerId: string,
+    handlers: Handlers,
+    authToken: string | null = null,
+    resumeToken: string | null = null,
+  ) {
     this.roomCode = roomCode;
     this.playerId = playerId;
     this.handlers = handlers;
     this.authToken = authToken;
+    this.resumeToken = resumeToken;
   }
 
   async connect() {
-    const url = appendAuthToken(buildWebSocketUrl(this.roomCode, this.playerId), this.authToken);
+    const baseUrl = buildWebSocketUrl(this.roomCode, this.playerId);
+    const withResume = appendResumeToken(baseUrl, this.resumeToken);
+    const url = appendAuthToken(withResume, this.authToken);
     this.handlers.onStatus('Connecting...');
 
     this.socket = new WebSocket(url);

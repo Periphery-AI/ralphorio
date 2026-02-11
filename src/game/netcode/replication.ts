@@ -129,6 +129,19 @@ export class ReplicationPipeline {
   }
 
   ingestSnapshot(snapshot: RoomSnapshot) {
+    const previous = this.snapshots[this.snapshots.length - 1];
+    const mergedSnapshot: RoomSnapshot = previous
+      ? {
+          ...snapshot,
+          features: {
+            presence: snapshot.features.presence ?? previous.features.presence,
+            movement: snapshot.features.movement ?? previous.features.movement,
+            build: snapshot.features.build ?? previous.features.build,
+            projectile: snapshot.features.projectile ?? previous.features.projectile,
+          },
+        }
+      : snapshot;
+
     const offsetSample = snapshot.serverTime - Date.now();
     if (!this.hasClockSync) {
       this.clockOffsetMs = offsetSample;
@@ -137,7 +150,7 @@ export class ReplicationPipeline {
       this.clockOffsetMs = this.clockOffsetMs * 0.9 + offsetSample * 0.1;
     }
 
-    this.snapshots.push(snapshot);
+    this.snapshots.push(mergedSnapshot);
     this.snapshots.sort((a, b) => a.serverTick - b.serverTick);
 
     if (this.snapshots.length > MAX_BUFFERED_SNAPSHOTS) {
