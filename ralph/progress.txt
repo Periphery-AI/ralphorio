@@ -56,4 +56,4 @@ Format per entry:
 - decisions: Add room DO HTTP endpoint `/api/rooms/:roomCode/character-profiles` (`GET` + `PUT`) so selector state can load/save before websocket connect; keep slot ids stable (`default`, `slot-02`, `slot-03`) and treat worker-side validation failures as safe 400 responses.
 - files: worker/src/lib.rs, src/game/character-profiles.ts, src/routes/connect-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo fmt --manifest-path worker/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; npm run build:web
-- commit: pending
+- commit: 66812ec
