@@ -243,6 +243,10 @@ export function ConnectRoute() {
     : 'Unknown';
   const canEnterRoom =
     Boolean(normalizedRoomCode) && Boolean(userId) && !isSubmitting && profileState !== 'loading';
+  const profileSyncLabel =
+    profileState === 'loading' ? 'Syncing slots' : profileState === 'error' ? 'Sync issue' : 'Ready';
+  const activeSlot = slots.find((slot) => slot.characterId === activeCharacterId) ?? slots[0] ?? null;
+  const activeSlotSprite = activeSlot ? getCharacterSprite(activeSlot.spriteId) : null;
 
   return (
     <section className="grid gap-8 lg:grid-cols-[1.15fr_0.85fr] lg:items-stretch">
@@ -252,26 +256,30 @@ export function ConnectRoute() {
 
         <p className="hud-pill w-fit">Ralph Island // Colony Sim Prototype</p>
         <h1 className="chromatic-title mt-6 max-w-2xl font-display text-4xl leading-[1.05] tracking-tight text-white sm:text-5xl lg:text-6xl">
-          Build Together In The Same World, In Real Time.
+          Gather. Craft. Fight. Place.
         </h1>
 
         <p className="mt-6 max-w-xl text-base leading-relaxed text-[#c8d5ef] sm:text-lg">
-          Each room code maps to one Cloudflare Durable Object backed by SQLite. Same code means same shared
-          simulation space, persistent player identity, and instant multiplayer.
+          Enter a room code, load your character slot, and jump straight into the early loop. The room keeps
+          progression server-side, so reconnecting returns to the same shared world.
         </p>
 
-        <div className="mt-10 grid gap-3 text-sm text-[#adc0e2] sm:grid-cols-3">
+        <div className="mt-10 grid gap-3 text-sm text-[#adc0e2] sm:grid-cols-2">
           <div className="rounded-xl border border-white/10 bg-[#0e1526]/70 px-4 py-3">
-            <p className="font-display text-lg text-white">Bevy</p>
-            <p>WASM runtime</p>
+            <p className="font-display text-lg text-white">1. Gather</p>
+            <p>Mine starter nodes for ore and materials.</p>
           </div>
           <div className="rounded-xl border border-white/10 bg-[#0e1526]/70 px-4 py-3">
-            <p className="font-display text-lg text-white">Durable Objects</p>
-            <p>Room authority</p>
+            <p className="font-display text-lg text-white">2. Craft</p>
+            <p>Queue recipes to unlock buildable parts.</p>
           </div>
           <div className="rounded-xl border border-white/10 bg-[#0e1526]/70 px-4 py-3">
-            <p className="font-display text-lg text-white">SQLite</p>
-            <p>Fast state persistence</p>
+            <p className="font-display text-lg text-white">3. Fight</p>
+            <p>Hold space to survive enemy pressure.</p>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-[#0e1526]/70 px-4 py-3">
+            <p className="font-display text-lg text-white">4. Place</p>
+            <p>Use crafted buildings to expand the base.</p>
           </div>
         </div>
       </article>
@@ -309,118 +317,141 @@ export function ConnectRoute() {
           </p>
 
           <form className="mt-8 flex flex-col gap-3" onSubmit={submit}>
-            <label className="text-xs font-semibold uppercase tracking-[0.24em] text-[#9db3db]" htmlFor="roomCode">
-              Room Code
-            </label>
-            <input
-              id="roomCode"
-              className="h-12 rounded-xl border border-[#2f3f61] bg-[#0a111f] px-4 font-mono text-lg tracking-[0.08em] text-white outline-none transition focus:border-[#67f0c1] focus:ring-2 focus:ring-[#67f0c1]/30"
-              placeholder="OMEGA-01"
-              value={roomCode}
-              onChange={(event) => setRoomCode(event.target.value)}
-              autoComplete="off"
-              autoCapitalize="characters"
-              spellCheck={false}
-            />
+            <div className="rounded-2xl border border-[#2e4165] bg-[#091325]/80 p-4">
+              <label className="text-xs font-semibold uppercase tracking-[0.24em] text-[#9db3db]" htmlFor="roomCode">
+                Room Code
+              </label>
+              <input
+                id="roomCode"
+                className="mt-2 h-12 w-full rounded-xl border border-[#2f3f61] bg-[#0a111f] px-4 font-mono text-lg tracking-[0.08em] text-white outline-none transition focus:border-[#67f0c1] focus:ring-2 focus:ring-[#67f0c1]/30"
+                placeholder="OMEGA-01"
+                value={roomCode}
+                onChange={(event) => setRoomCode(event.target.value)}
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+              />
+              <div className="mt-2 flex items-center justify-between text-[11px] uppercase tracking-[0.13em] text-[#9db3db]">
+                <span>Same code = same world</span>
+                <span className="font-mono text-[#cbe2ff]">{normalizedRoomCode || '---'}</span>
+              </div>
+            </div>
 
-            <div className="mt-2 rounded-2xl border border-[#2e4165] bg-[#091325]/80 p-4">
+            <div className="rounded-2xl border border-[#2e4165] bg-[#091325]/80 p-4">
               <div className="flex items-center justify-between gap-3">
                 <p className="hud-pill w-fit">Character Selector</p>
-                <p className="text-[11px] uppercase tracking-[0.16em] text-[#9db3db]">
-                  {profileState === 'loading'
-                    ? 'Syncing slots'
-                    : profileState === 'error'
-                      ? 'Sync issue'
-                      : 'Ready'}
-                </p>
+                <p className="text-[11px] uppercase tracking-[0.16em] text-[#9db3db]">{profileSyncLabel}</p>
               </div>
 
               <p className="mt-3 text-xs leading-relaxed text-[#9cb3dd]">
-                Pick an active slot and sprite variant before connecting. Slot names and sprite choices are
-                saved per room and restored on reconnect.
+                Pick one active slot before entering. Slot names and sprite presets are saved per room and
+                restored on reconnect.
               </p>
 
-              <div className="mt-4 grid gap-3">
+              <div className="mt-4 grid grid-cols-3 gap-2">
                 {slots.map((slot) => {
                   const isActive = slot.characterId === activeCharacterId;
                   const selectedSprite = getCharacterSprite(slot.spriteId);
                   return (
-                    <label
+                    <button
                       key={slot.characterId}
+                      type="button"
+                      onClick={() => setActiveCharacterId(slot.characterId)}
                       className={`rounded-xl border p-3 transition ${
                         isActive
-                          ? 'border-[#67f0c1]/70 bg-[#0e2030]'
+                          ? 'border-[#67f0c1]/70 bg-[#0e2030] text-white'
                           : 'border-white/10 bg-[#0a1729] hover:border-[#4f6d9f]'
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#a9bee4]">
-                            {slot.label}
-                          </p>
-                          <p className="font-mono text-[11px] text-[#7492c8]">{slot.characterId}</p>
-                        </div>
-                        <input
-                          type="radio"
-                          name="activeCharacter"
-                          className="h-4 w-4 accent-[#67f0c1]"
-                          checked={isActive}
-                          onChange={() => setActiveCharacterId(slot.characterId)}
-                        />
-                      </div>
-
-                      <input
-                        className="mt-3 h-10 w-full rounded-lg border border-[#304a73] bg-[#081120] px-3 text-sm text-white outline-none transition focus:border-[#67f0c1] focus:ring-2 focus:ring-[#67f0c1]/25"
-                        value={slot.name}
-                        onChange={(event) => updateSlotName(slot.characterId, event.target.value)}
-                        onFocus={() => setActiveCharacterId(slot.characterId)}
-                        maxLength={MAX_CHARACTER_NAME_LEN}
-                        placeholder={slot.defaultName}
-                      />
-
-                      <div className="mt-3 grid grid-cols-3 gap-2">
-                        {CHARACTER_SPRITE_CATALOG.map((sprite) => {
-                          const isSelected = sprite.id === selectedSprite.id;
-                          return (
-                            <button
-                              key={sprite.id}
-                              type="button"
-                              className={`rounded-lg border px-2 py-2 text-center transition ${
-                                isSelected
-                                  ? 'border-[#67f0c1]/80 bg-[#112538]'
-                                  : 'border-[#2e4165] bg-[#071121] hover:border-[#4f6d9f]'
-                              }`}
-                              onClick={() => {
-                                setActiveCharacterId(slot.characterId);
-                                updateSlotSprite(slot.characterId, sprite.id);
-                              }}
-                            >
-                              <span
-                                className="mx-auto block h-12 w-12 rounded-md border border-white/10 bg-[#01060f] bg-no-repeat"
-                                style={{
-                                  backgroundImage: `url(${sprite.sheetPath})`,
-                                  backgroundSize: `${SPRITE_SHEET_SIZE_PX}px ${SPRITE_SHEET_SIZE_PX}px`,
-                                  backgroundPosition: `-${sprite.previewFrame.x}px -${sprite.previewFrame.y}px`,
-                                  imageRendering: 'pixelated',
-                                }}
-                              />
-                              <span className="mt-1 block text-[10px] font-semibold uppercase tracking-[0.08em] text-[#a4bce6]">
-                                {sprite.label}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-
-                      <p className="mt-2 text-[11px] leading-relaxed text-[#8ca6d3]">
-                        Sprite: {selectedSprite.label} - {selectedSprite.description}
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#a9bee4]">
+                        {slot.label}
                       </p>
-                    </label>
+                      <p className="mt-1 truncate text-xs text-[#d5e4ff]">{slot.name || slot.defaultName}</p>
+                      <p className="mt-1 text-[10px] uppercase tracking-[0.1em] text-[#7f9bc9]">
+                        {selectedSprite.label}
+                      </p>
+                    </button>
                   );
                 })}
               </div>
 
+              {activeSlot ? (
+                <div className="mt-4 rounded-xl border border-[#34527f] bg-[#081628] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#c5dbff]">
+                        {activeSlot.label}
+                      </p>
+                      <p className="font-mono text-[11px] text-[#7a98cb]">{activeSlot.characterId}</p>
+                    </div>
+                    <p className="rounded-full border border-[#67f0c1]/55 bg-[#0d2a2f] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#b9ffe7]">
+                      Active Slot
+                    </p>
+                  </div>
+
+                  <label
+                    className="mt-3 block text-[11px] font-semibold uppercase tracking-[0.16em] text-[#9cb3dc]"
+                    htmlFor="activeSlotName"
+                  >
+                    Display Name
+                  </label>
+                  <input
+                    id="activeSlotName"
+                    className="mt-1 h-10 w-full rounded-lg border border-[#304a73] bg-[#081120] px-3 text-sm text-white outline-none transition focus:border-[#67f0c1] focus:ring-2 focus:ring-[#67f0c1]/25"
+                    value={activeSlot.name}
+                    onChange={(event) => updateSlotName(activeSlot.characterId, event.target.value)}
+                    maxLength={MAX_CHARACTER_NAME_LEN}
+                    placeholder={activeSlot.defaultName}
+                  />
+
+                  <p className="mt-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#9cb3dc]">
+                    Sprite Preset
+                  </p>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {CHARACTER_SPRITE_CATALOG.map((sprite) => {
+                      const isSelected = activeSlotSprite?.id === sprite.id;
+                      return (
+                        <button
+                          key={sprite.id}
+                          type="button"
+                          className={`rounded-lg border px-2 py-2 text-center transition ${
+                            isSelected
+                              ? 'border-[#67f0c1]/80 bg-[#112538]'
+                              : 'border-[#2e4165] bg-[#071121] hover:border-[#4f6d9f]'
+                          }`}
+                          onClick={() => updateSlotSprite(activeSlot.characterId, sprite.id)}
+                        >
+                          <span
+                            className="mx-auto block h-12 w-12 rounded-md border border-white/10 bg-[#01060f] bg-no-repeat"
+                            style={{
+                              backgroundImage: `url(${sprite.sheetPath})`,
+                              backgroundSize: `${SPRITE_SHEET_SIZE_PX}px ${SPRITE_SHEET_SIZE_PX}px`,
+                              backgroundPosition: `-${sprite.previewFrame.x}px -${sprite.previewFrame.y}px`,
+                              imageRendering: 'pixelated',
+                            }}
+                          />
+                          <span className="mt-1 block text-[10px] font-semibold uppercase tracking-[0.08em] text-[#a4bce6]">
+                            {sprite.label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {activeSlotSprite ? (
+                    <p className="mt-2 text-[11px] leading-relaxed text-[#8ca6d3]">
+                      Sprite: {activeSlotSprite.label} - {activeSlotSprite.description}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+
               {profileMessage ? <p className="mt-3 text-xs text-[#ff9eb2]">{profileMessage}</p> : null}
+            </div>
+
+            <div className="rounded-xl border border-[#2e4165] bg-[#081223] px-3 py-2 text-xs text-[#9cb3dd]">
+              <p className="font-semibold uppercase tracking-[0.14em] text-[#bfd5fb]">Core Loop</p>
+              <p className="mt-1">Hold click mine, then 1/2/3 craft, Space shoot, and Q place building.</p>
             </div>
 
             <button type="submit" className="btn-neon mt-1 disabled:opacity-60" disabled={!canEnterRoom}>

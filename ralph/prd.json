@@ -69,7 +69,7 @@
         "Inventory/crafting/build/combat information remains accessible",
         "Desktop + mobile layouts remain usable"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-105",

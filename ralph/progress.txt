@@ -71,4 +71,12 @@ Entry format:
 - decisions: Treated this as a focused UI slice on the existing room HUD architecture only (no subsystem rewrite); kept authoritative data surfaces unchanged and prioritized world visibility plus mobile-friendly panel switching over adding new panels.
 - files: src/routes/room-route.tsx, ralph/progress.txt
 - validation: npm run wasm:build:dev (pass); npm run lint (pass); npm run build:web (pass)
+- commit: cd64152
+
+- timestamp: 2026-02-11
+- item: RLP2-104
+- summary: Completed the connect-screen polish slice by replacing the dense per-slot editor stack with a compact active-slot flow, reframing lobby copy around the core gameplay loop, and keeping room entry actions clear on desktop/mobile layouts.
+- decisions: Built on the existing profile fetch/save flow and route structure; no gameplay/network rewrites. Kept all character slots persisted per room but only expanded the currently active slot editor to reduce HUD/form noise while preserving inventory/crafting/build/combat discoverability once in-room.
+- files: src/routes/connect-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: npm run lint (pass); npm run build:web (pass)
 - commit: pending
