@@ -106,7 +106,7 @@
         "Client receives synchronized state and local UI updates",
         "Persistence for user inventory survives reconnect"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-008",

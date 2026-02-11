@@ -117,6 +117,8 @@ export function RoomRoute() {
   const [latencyMs, setLatencyMs] = useState(0);
   const [structureCount, setStructureCount] = useState(0);
   const [projectileCount, setProjectileCount] = useState(0);
+  const [inventoryStackCount, setInventoryStackCount] = useState(0);
+  const [inventoryItemCount, setInventoryItemCount] = useState(0);
   const [showDevConsole, setShowDevConsole] = useState(false);
   const [devInput, setDevInput] = useState('');
   const [devLog, setDevLog] = useState<string[]>([]);
@@ -128,6 +130,7 @@ export function RoomRoute() {
   const devInputRef = useRef<HTMLInputElement | null>(null);
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const interpDelayRef = useRef(DEFAULT_INTERP_DELAY_MS);
+  const authoritativePlayerIdRef = useRef(clientPlayerId);
 
   const pushDevLog = (line: string) => {
     setDevLog((existing) => [...existing.slice(-11), line]);
@@ -154,6 +157,7 @@ export function RoomRoute() {
       return;
     }
 
+    authoritativePlayerIdRef.current = clientPlayerId;
     replicationRef.current = new ReplicationPipeline(interpDelayRef.current);
 
     let inputPump: number | null = null;
@@ -183,6 +187,7 @@ export function RoomRoute() {
           },
           onWelcome: (payload) => {
             setServerPlayerId(payload.playerId);
+            authoritativePlayerIdRef.current = payload.playerId;
             setSimRateHz(payload.simRateHz);
             setSnapshotRateHz(payload.snapshotRateHz);
             setConnectionStatus(`Connected to ${payload.roomCode}`);
@@ -210,6 +215,7 @@ export function RoomRoute() {
             const movement = snapshot.features.movement;
             const build = snapshot.features.build;
             const projectile = snapshot.features.projectile;
+            const inventory = snapshot.features.inventory;
 
             if (movement) {
               localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
@@ -221,6 +227,23 @@ export function RoomRoute() {
 
             if (projectile) {
               setProjectileCount(projectile.projectileCount);
+            }
+
+            if (inventory) {
+              const localInventory =
+                inventory.players.find(
+                  (player) => player.playerId === authoritativePlayerIdRef.current,
+                ) ?? null;
+
+              if (!localInventory) {
+                setInventoryStackCount(0);
+                setInventoryItemCount(0);
+              } else {
+                setInventoryStackCount(localInventory.stacks.length);
+                setInventoryItemCount(
+                  localInventory.stacks.reduce((total, stack) => total + stack.amount, 0),
+                );
+              }
             }
           },
           onAck: (seq) => {
@@ -412,6 +435,8 @@ export function RoomRoute() {
           <MetricPill label="Interp" value={`${Math.round(interpDelayMs)}ms`} />
           <MetricPill label="Ack" value={lastAckSeq} />
           <MetricPill label="Online" value={activePlayers} />
+          <MetricPill label="Inv" value={inventoryItemCount} />
+          <MetricPill label="Stacks" value={inventoryStackCount} />
           <MetricPill label="Structures" value={structureCount} />
           <MetricPill label="Projectiles" value={projectileCount} />
           <span className="hidden rounded-md border border-white/15 bg-[#101b31] px-3 py-1.5 text-[#cfddf9] md:inline-flex">

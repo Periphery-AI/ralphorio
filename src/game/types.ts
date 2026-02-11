@@ -91,6 +91,7 @@ export type TerrainSnapshot = {
 };
 
 export type InventoryStack = {
+  slot: number;
   resource: string;
   amount: number;
 };

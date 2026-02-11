@@ -335,11 +335,16 @@ function parseInventoryStack(payload: unknown) {
     return null;
   }
 
-  if (typeof payload.resource !== 'string' || !isNonNegativeInteger(payload.amount)) {
+  if (
+    !isNonNegativeInteger(payload.slot) ||
+    typeof payload.resource !== 'string' ||
+    !isNonNegativeInteger(payload.amount)
+  ) {
     return null;
   }
 
   return {
+    slot: payload.slot,
     resource: payload.resource,
     amount: payload.amount,
   };

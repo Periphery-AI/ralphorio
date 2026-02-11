@@ -49,6 +49,15 @@ const ROOM_META_TERRAIN_SEED_KEY: &str = "terrain_seed";
 const DEFAULT_CHARACTER_SPRITE_ID: &str = "engineer-default";
 const SUPPORTED_CHARACTER_SPRITE_IDS: [&str; 3] =
     ["engineer-default", "surveyor-cyan", "machinist-rose"];
+const SUPPORTED_RESOURCE_IDS: [&str; 7] = [
+    "iron_ore",
+    "copper_ore",
+    "coal",
+    "stone",
+    "iron_plate",
+    "copper_plate",
+    "gear",
+];
 const DEFAULT_CHARACTER_PROFILE_ID: &str = "default";
 const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
@@ -185,6 +194,13 @@ struct InventorySplitPayload {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct InventoryDiscardPayload {
+    slot: u16,
+    amount: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MiningStartPayload {
     node_id: String,
 }
@@ -297,6 +313,14 @@ struct CharacterIdRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct InventoryStackRow {
+    player_id: String,
+    slot: i64,
+    resource: String,
+    amount: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct RuntimeHydratedPlayerRow {
     player_id: String,
     x: f64,
@@ -363,12 +387,250 @@ struct RuntimeProjectileState {
     updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeInventoryStackState {
+    resource: String,
+    amount: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeInventoryState {
+    max_slots: u8,
+    slots: Vec<Option<RuntimeInventoryStackState>>,
+}
+
+impl RuntimeInventoryState {
+    fn new(max_slots: u8) -> Self {
+        Self {
+            max_slots,
+            slots: vec![None; max_slots as usize],
+        }
+    }
+
+    fn normalize(&mut self) {
+        let expected_len = self.max_slots as usize;
+        if self.slots.len() < expected_len {
+            self.slots.resize(expected_len, None);
+        } else if self.slots.len() > expected_len {
+            self.slots.truncate(expected_len);
+        }
+    }
+
+    fn slot_index(&self, slot: u16) -> Result<usize> {
+        let index = slot as usize;
+        if index >= self.max_slots as usize {
+            return Err(Error::RustError("inventory slot out of bounds".into()));
+        }
+        Ok(index)
+    }
+
+    fn first_free_slot(&self) -> Option<usize> {
+        self.slots.iter().position(Option::is_none)
+    }
+
+    #[allow(dead_code)]
+    fn add_resource(&mut self, resource: &str, amount: u32) -> Result<()> {
+        if !is_supported_resource_id(resource) {
+            return Err(Error::RustError("invalid inventory resource id".into()));
+        }
+        if amount == 0 {
+            return Err(Error::RustError("inventory amount must be positive".into()));
+        }
+
+        if let Some(existing) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|stack| stack.resource == resource)
+        {
+            existing.amount = existing
+                .amount
+                .checked_add(amount)
+                .ok_or_else(|| Error::RustError("inventory stack overflow".into()))?;
+            return Ok(());
+        }
+
+        let Some(free_slot) = self.first_free_slot() else {
+            return Err(Error::RustError("inventory has no free slot".into()));
+        };
+
+        self.slots[free_slot] = Some(RuntimeInventoryStackState {
+            resource: resource.to_string(),
+            amount,
+        });
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn remove_resource(&mut self, resource: &str, amount: u32) -> Result<()> {
+        if !is_supported_resource_id(resource) {
+            return Err(Error::RustError("invalid inventory resource id".into()));
+        }
+        if amount == 0 {
+            return Err(Error::RustError("inventory amount must be positive".into()));
+        }
+
+        let available: u32 = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|stack| stack.resource == resource)
+            .map(|stack| stack.amount)
+            .sum();
+
+        if available < amount {
+            return Err(Error::RustError("insufficient inventory resource".into()));
+        }
+
+        let mut remaining = amount;
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.resource != resource || remaining == 0 {
+                continue;
+            }
+            let taken = slot.amount.min(remaining);
+            slot.amount -= taken;
+            remaining -= taken;
+        }
+
+        for slot in self.slots.iter_mut() {
+            if slot.as_ref().is_some_and(|stack| stack.amount == 0) {
+                *slot = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn move_stack(&mut self, from_slot: u16, to_slot: u16, amount: Option<u32>) -> Result<()> {
+        if from_slot == to_slot {
+            return Err(Error::RustError(
+                "inventory source and destination match".into(),
+            ));
+        }
+        let from_index = self.slot_index(from_slot)?;
+        let to_index = self.slot_index(to_slot)?;
+
+        let source = self.slots[from_index]
+            .clone()
+            .ok_or_else(|| Error::RustError("inventory source slot is empty".into()))?;
+        let moving_amount = amount.unwrap_or(source.amount);
+
+        if moving_amount == 0 || moving_amount > source.amount {
+            return Err(Error::RustError("invalid inventory move amount".into()));
+        }
+
+        let destination = self.slots[to_index].clone();
+        match destination {
+            None => {
+                if moving_amount == source.amount {
+                    self.slots[to_index] = Some(source);
+                    self.slots[from_index] = None;
+                } else {
+                    self.slots[to_index] = Some(RuntimeInventoryStackState {
+                        resource: source.resource.clone(),
+                        amount: moving_amount,
+                    });
+                    self.slots[from_index] = Some(RuntimeInventoryStackState {
+                        resource: source.resource,
+                        amount: source.amount - moving_amount,
+                    });
+                }
+                Ok(())
+            }
+            Some(mut destination_stack) => {
+                if destination_stack.resource == source.resource {
+                    destination_stack.amount = destination_stack
+                        .amount
+                        .checked_add(moving_amount)
+                        .ok_or_else(|| Error::RustError("inventory stack overflow".into()))?;
+
+                    let remaining = source.amount - moving_amount;
+                    self.slots[to_index] = Some(destination_stack);
+                    self.slots[from_index] = if remaining == 0 {
+                        None
+                    } else {
+                        Some(RuntimeInventoryStackState {
+                            resource: source.resource,
+                            amount: remaining,
+                        })
+                    };
+                    return Ok(());
+                }
+
+                if moving_amount != source.amount {
+                    return Err(Error::RustError(
+                        "cannot partially move into occupied slot with different resource".into(),
+                    ));
+                }
+
+                self.slots[to_index] = Some(source);
+                self.slots[from_index] = Some(destination_stack);
+                Ok(())
+            }
+        }
+    }
+
+    fn split_stack(&mut self, slot: u16, amount: u32) -> Result<()> {
+        let source_index = self.slot_index(slot)?;
+        if amount == 0 {
+            return Err(Error::RustError("invalid inventory split amount".into()));
+        }
+
+        let source = self.slots[source_index]
+            .clone()
+            .ok_or_else(|| Error::RustError("inventory source slot is empty".into()))?;
+        if amount >= source.amount {
+            return Err(Error::RustError(
+                "split amount must be less than stack size".into(),
+            ));
+        }
+
+        let Some(destination_index) = self.first_free_slot() else {
+            return Err(Error::RustError("inventory has no free slot".into()));
+        };
+
+        self.slots[source_index] = Some(RuntimeInventoryStackState {
+            resource: source.resource.clone(),
+            amount: source.amount - amount,
+        });
+        self.slots[destination_index] = Some(RuntimeInventoryStackState {
+            resource: source.resource,
+            amount,
+        });
+        Ok(())
+    }
+
+    fn discard_from_slot(&mut self, slot: u16, amount: Option<u32>) -> Result<()> {
+        let slot_index = self.slot_index(slot)?;
+        let source = self.slots[slot_index]
+            .clone()
+            .ok_or_else(|| Error::RustError("inventory source slot is empty".into()))?;
+        let drop_amount = amount.unwrap_or(source.amount);
+
+        if drop_amount == 0 || drop_amount > source.amount {
+            return Err(Error::RustError("invalid inventory discard amount".into()));
+        }
+
+        if drop_amount == source.amount {
+            self.slots[slot_index] = None;
+        } else {
+            self.slots[slot_index] = Some(RuntimeInventoryStackState {
+                resource: source.resource,
+                amount: source.amount - drop_amount,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct RoomRuntimeState {
     players: HashMap<String, RuntimePlayerState>,
     structures: HashMap<String, RuntimeStructureState>,
     previews: HashMap<String, RuntimePreviewState>,
     projectiles: HashMap<String, RuntimeProjectileState>,
+    inventories: HashMap<String, RuntimeInventoryState>,
 }
 
 fn now_ms() -> i64 {
@@ -447,6 +709,12 @@ fn is_supported_character_sprite_id(sprite_id: &str) -> bool {
     SUPPORTED_CHARACTER_SPRITE_IDS
         .iter()
         .any(|supported| supported == &sprite_id)
+}
+
+fn is_supported_resource_id(resource_id: &str) -> bool {
+    SUPPORTED_RESOURCE_IDS
+        .iter()
+        .any(|supported| supported == &resource_id)
 }
 
 fn default_character_name_for_player(player_id: &str) -> String {
@@ -706,6 +974,7 @@ pub struct RoomDurableObject {
     dirty_presence: Cell<bool>,
     dirty_build: Cell<bool>,
     dirty_projectiles: Cell<bool>,
+    dirty_inventory: Cell<bool>,
     terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
 }
@@ -772,11 +1041,23 @@ impl RoomDurableObject {
             )?
             .to_array()?;
 
+        let inventory_rows: Vec<InventoryStackRow> = sql
+            .exec(
+                "
+                SELECT player_id, slot, resource, amount
+                FROM player_inventory_stacks
+                ORDER BY player_id ASC, slot ASC
+                ",
+                None,
+            )?
+            .to_array()?;
+
         let mut runtime = self.runtime.borrow_mut();
         runtime.players.clear();
         runtime.structures.clear();
         runtime.previews.clear();
         runtime.projectiles.clear();
+        runtime.inventories.clear();
 
         for row in player_rows {
             runtime.players.insert(
@@ -820,6 +1101,33 @@ impl RoomDurableObject {
                     created_at: row.created_at.unwrap_or(now),
                 },
             );
+        }
+
+        for row in inventory_rows {
+            if row.slot < 0
+                || row.slot >= DEFAULT_INVENTORY_MAX_SLOTS as i64
+                || row.amount <= 0
+                || !is_supported_resource_id(row.resource.as_str())
+            {
+                continue;
+            }
+
+            let Ok(amount) = u32::try_from(row.amount) else {
+                continue;
+            };
+            if amount == 0 {
+                continue;
+            }
+
+            let inventory = runtime
+                .inventories
+                .entry(row.player_id)
+                .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+            inventory.normalize();
+            inventory.slots[row.slot as usize] = Some(RuntimeInventoryStackState {
+                resource: row.resource,
+                amount,
+            });
         }
 
         drop(runtime);
@@ -891,6 +1199,64 @@ impl RoomDurableObject {
                     player_id.as_str().into(),
                     (player.connected as i64).into(),
                     player.last_seen.into(),
+                ]),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_runtime_inventory_for_player(&self, player_id: &str) {
+        let mut runtime = self.runtime.borrow_mut();
+        runtime
+            .inventories
+            .entry(player_id.to_string())
+            .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+    }
+
+    fn persist_inventory_for_player(&self, player_id: &str) -> Result<()> {
+        let inventory = {
+            let runtime = self.runtime.borrow();
+            runtime
+                .inventories
+                .get(player_id)
+                .cloned()
+                .unwrap_or_else(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS))
+        };
+        self.persist_inventory_state(player_id, &inventory)
+    }
+
+    fn persist_inventory_state(
+        &self,
+        player_id: &str,
+        inventory: &RuntimeInventoryState,
+    ) -> Result<()> {
+        let sql = self.sql();
+        let now = now_ms();
+        let mut normalized = inventory.clone();
+        normalized.normalize();
+
+        sql.exec(
+            "DELETE FROM player_inventory_stacks WHERE player_id = ?",
+            Some(vec![player_id.into()]),
+        )?;
+
+        for (slot_index, maybe_stack) in normalized.slots.iter().enumerate() {
+            let Some(stack) = maybe_stack else {
+                continue;
+            };
+
+            sql.exec(
+                "
+                INSERT INTO player_inventory_stacks (player_id, slot, resource, amount, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ",
+                Some(vec![
+                    player_id.into(),
+                    (slot_index as i64).into(),
+                    stack.resource.as_str().into(),
+                    (stack.amount as i64).into(),
+                    now.into(),
                 ]),
             )?;
         }
@@ -1406,6 +1772,25 @@ impl RoomDurableObject {
 
         sql.exec(
             "
+            CREATE TABLE IF NOT EXISTS player_inventory_stacks (
+              player_id TEXT NOT NULL,
+              slot INTEGER NOT NULL,
+              resource TEXT NOT NULL,
+              amount INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY(player_id, slot)
+            )
+            ",
+            None,
+        )?;
+
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idx_player_inventory_player ON player_inventory_stacks(player_id)",
+            None,
+        )?;
+
+        sql.exec(
+            "
             CREATE TABLE IF NOT EXISTS build_structures (
               structure_id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
@@ -1519,6 +1904,11 @@ impl RoomDurableObject {
         sql.exec(
             "DELETE FROM session_tokens WHERE expires_at < ?",
             Some(vec![now_ms().into()]),
+        )?;
+
+        sql.exec(
+            "DELETE FROM player_inventory_stacks WHERE slot < 0 OR slot >= ? OR amount <= 0",
+            Some(vec![(DEFAULT_INVENTORY_MAX_SLOTS as i64).into()]),
         )?;
 
         self.backfill_character_profiles_from_presence()?;
@@ -1761,6 +2151,7 @@ impl RoomDurableObject {
         )?;
 
         self.ensure_default_character_profile(player_id)?;
+        self.ensure_runtime_inventory_for_player(player_id);
 
         {
             let mut runtime = self.runtime.borrow_mut();
@@ -1788,6 +2179,7 @@ impl RoomDurableObject {
 
         self.snapshot_dirty.set(true);
         self.dirty_presence.set(true);
+        self.dirty_inventory.set(true);
         Ok(())
     }
 
@@ -1815,6 +2207,7 @@ impl RoomDurableObject {
         self.snapshot_dirty.set(true);
         self.dirty_presence.set(true);
         self.dirty_build.set(true);
+        self.dirty_inventory.set(true);
         Ok(())
     }
 
@@ -2181,9 +2574,23 @@ impl RoomDurableObject {
                     return Err(Error::RustError("invalid inventory move payload".into()));
                 }
 
-                Err(Error::RustError(
-                    "inventory commands are not implemented".into(),
-                ))
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let inventory = runtime
+                        .inventories
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                    inventory.normalize();
+                    inventory.move_stack(
+                        move_payload.from_slot,
+                        move_payload.to_slot,
+                        move_payload.amount,
+                    )?;
+                }
+
+                self.persist_inventory_for_player(player_id)?;
+                self.dirty_inventory.set(true);
+                Ok(true)
             }
             "split" => {
                 let payload =
@@ -2197,9 +2604,45 @@ impl RoomDurableObject {
                     return Err(Error::RustError("invalid inventory split payload".into()));
                 }
 
-                Err(Error::RustError(
-                    "inventory commands are not implemented".into(),
-                ))
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let inventory = runtime
+                        .inventories
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                    inventory.normalize();
+                    inventory.split_stack(split_payload.slot, split_payload.amount)?;
+                }
+
+                self.persist_inventory_for_player(player_id)?;
+                self.dirty_inventory.set(true);
+                Ok(true)
+            }
+            "discard" => {
+                let payload =
+                    payload.ok_or_else(|| Error::RustError("missing inventory payload".into()))?;
+                let discard_payload: InventoryDiscardPayload = serde_json::from_value(payload)
+                    .map_err(|_| Error::RustError("invalid inventory payload".into()))?;
+
+                if discard_payload.slot >= DEFAULT_INVENTORY_MAX_SLOTS as u16
+                    || discard_payload.amount.is_some_and(|amount| amount == 0)
+                {
+                    return Err(Error::RustError("invalid inventory discard payload".into()));
+                }
+
+                {
+                    let mut runtime = self.runtime.borrow_mut();
+                    let inventory = runtime
+                        .inventories
+                        .entry(player_id.to_string())
+                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+                    inventory.normalize();
+                    inventory.discard_from_slot(discard_payload.slot, discard_payload.amount)?;
+                }
+
+                self.persist_inventory_for_player(player_id)?;
+                self.dirty_inventory.set(true);
+                Ok(true)
             }
             _ => Err(Error::RustError("invalid inventory action".into())),
         }
@@ -2453,6 +2896,7 @@ impl RoomDurableObject {
                 self.dirty_presence.set(false);
                 self.dirty_build.set(false);
                 self.dirty_projectiles.set(false);
+                self.dirty_inventory.set(false);
             }
 
             self.checkpoint_runtime_if_due()?;
@@ -2670,10 +3114,39 @@ impl RoomDurableObject {
             }));
         }
 
+        let mut inventory_players = Vec::with_capacity(connected_players.len());
+        for player_id in connected_players.iter() {
+            let inventory = runtime
+                .inventories
+                .get(player_id)
+                .cloned()
+                .unwrap_or_else(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+            let stacks: Vec<Value> = inventory
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot_index, stack)| {
+                    stack.as_ref().map(|stack| {
+                        json!({
+                            "slot": slot_index,
+                            "resource": stack.resource,
+                            "amount": stack.amount,
+                        })
+                    })
+                })
+                .collect();
+
+            inventory_players.push(json!({
+                "playerId": player_id,
+                "maxSlots": inventory.max_slots,
+                "stacks": stacks,
+            }));
+        }
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
-        let include_inventory = full;
+        let include_inventory = full || self.dirty_inventory.get();
         let include_mining = full;
         let include_crafting = full;
         let include_combat = full;
@@ -2737,8 +3210,8 @@ impl RoomDurableObject {
                 json!({
                     "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
                     "revision": self.tick.get(),
-                    "players": [],
-                    "playerCount": 0,
+                    "players": inventory_players,
+                    "playerCount": connected_players.len(),
                 }),
             );
         }
@@ -2931,6 +3404,10 @@ impl RoomDurableObject {
                     .or_insert_with(|| Self::default_runtime_player(now));
                 player.connected = true;
                 player.last_seen = now;
+                runtime
+                    .inventories
+                    .entry(player_id.clone())
+                    .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
             }
         }
         for player_id in players {
@@ -2962,6 +3439,7 @@ impl DurableObject for RoomDurableObject {
             dirty_presence: Cell::new(false),
             dirty_build: Cell::new(false),
             dirty_projectiles: Cell::new(false),
+            dirty_inventory: Cell::new(false),
             terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
         };
@@ -3099,6 +3577,7 @@ impl DurableObject for RoomDurableObject {
                     self.dirty_presence.set(false);
                     self.dirty_build.set(false);
                     self.dirty_projectiles.set(false);
+                    self.dirty_inventory.set(false);
                 }
             }
             Err(error) => {
@@ -3136,5 +3615,84 @@ impl DurableObject for RoomDurableObject {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot_state(inventory: &RuntimeInventoryState, slot: usize) -> Option<(String, u32)> {
+        inventory
+            .slots
+            .get(slot)
+            .and_then(|stack| stack.as_ref())
+            .map(|stack| (stack.resource.clone(), stack.amount))
+    }
+
+    #[test]
+    fn inventory_add_and_remove_resources() {
+        let mut inventory = RuntimeInventoryState::new(4);
+        inventory.add_resource("iron_ore", 12).expect("add iron");
+        inventory.add_resource("iron_ore", 8).expect("merge iron");
+        inventory.add_resource("stone", 5).expect("add stone");
+
+        assert_eq!(
+            slot_state(&inventory, 0),
+            Some(("iron_ore".to_string(), 20))
+        );
+        assert_eq!(slot_state(&inventory, 1), Some(("stone".to_string(), 5)));
+
+        inventory
+            .remove_resource("iron_ore", 7)
+            .expect("remove iron");
+        assert_eq!(
+            slot_state(&inventory, 0),
+            Some(("iron_ore".to_string(), 13))
+        );
+    }
+
+    #[test]
+    fn inventory_move_merge_split_and_discard() {
+        let mut inventory = RuntimeInventoryState::new(4);
+        inventory.add_resource("iron_ore", 10).expect("seed iron");
+        inventory.add_resource("stone", 3).expect("seed stone");
+
+        inventory.move_stack(1, 2, None).expect("move stone");
+        assert_eq!(slot_state(&inventory, 1), None);
+        assert_eq!(slot_state(&inventory, 2), Some(("stone".to_string(), 3)));
+
+        inventory.split_stack(0, 4).expect("split iron");
+        assert_eq!(slot_state(&inventory, 0), Some(("iron_ore".to_string(), 6)));
+        assert_eq!(slot_state(&inventory, 1), Some(("iron_ore".to_string(), 4)));
+
+        inventory.move_stack(1, 0, None).expect("merge split stack");
+        assert_eq!(
+            slot_state(&inventory, 0),
+            Some(("iron_ore".to_string(), 10))
+        );
+        assert_eq!(slot_state(&inventory, 1), None);
+
+        inventory
+            .discard_from_slot(0, Some(6))
+            .expect("discard partial stack");
+        assert_eq!(slot_state(&inventory, 0), Some(("iron_ore".to_string(), 4)));
+
+        inventory
+            .discard_from_slot(0, None)
+            .expect("discard full stack");
+        assert_eq!(slot_state(&inventory, 0), None);
+    }
+
+    #[test]
+    fn inventory_rejects_partial_swap_with_different_resource() {
+        let mut inventory = RuntimeInventoryState::new(3);
+        inventory.add_resource("iron_ore", 10).expect("seed iron");
+        inventory.add_resource("stone", 2).expect("seed stone");
+
+        let error = inventory
+            .move_stack(0, 1, Some(4))
+            .expect_err("partial swap should fail");
+        assert!(format!("{error}").contains("different resource"));
     }
 }
