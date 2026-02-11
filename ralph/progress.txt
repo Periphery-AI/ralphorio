@@ -18,3 +18,10 @@ Format per entry:
 - files: ralph/prd.json, ralph/prompt.md, ralph/progress.txt, scripts/ralph-once.sh, scripts/afk-ralph.sh
 - validation: bash -n scripts/ralph-once.sh scripts/afk-ralph.sh; scripts/ralph-once.sh --dry-run; scripts/afk-ralph.sh 1 --dry-run
 - commit: pending
+- timestamp: 2026-02-11
+- item: RL-016
+- summary: Completed deterministic terrain generation pipeline from server seed metadata to client tile rendering with terrain/resource layers.
+- decisions: Persist per-room `terrain_seed` in DO `room_meta`; expose terrain config via `features.terrain` every snapshot; centralize deterministic terrain sampling (`sample_terrain`) in `sim-core` for server/client parity and future resource loops.
+- files: sim-core/src/lib.rs, worker/src/lib.rs, src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/prd.json, ralph/progress.txt
+- validation: cargo test --manifest-path sim-core/Cargo.toml; cargo check --manifest-path worker/Cargo.toml; cargo check --manifest-path game-client/Cargo.toml --target wasm32-unknown-unknown; npm run build
+- commit: pending

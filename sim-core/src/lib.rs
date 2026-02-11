@@ -29,6 +29,161 @@ pub struct StructureObstacle {
 
 pub const PLAYER_COLLIDER_RADIUS: f32 = 10.0;
 pub const STRUCTURE_COLLIDER_HALF_EXTENT: f32 = 11.0;
+pub const TERRAIN_GENERATOR_VERSION: u32 = 1;
+pub const TERRAIN_TILE_SIZE: u32 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainBaseKind {
+    DeepWater,
+    ShallowWater,
+    Grass,
+    Dirt,
+    Rock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainResourceKind {
+    IronOre,
+    CopperOre,
+    Coal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainSample {
+    pub base: TerrainBaseKind,
+    pub resource: Option<TerrainResourceKind>,
+    pub resource_richness: u16,
+}
+
+pub fn deterministic_seed_from_room_code(room_code: &str) -> u64 {
+    // FNV-1a 64-bit hash with uppercased room code for stable seed derivation.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in room_code.trim().to_ascii_uppercase().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn hash_grid(seed: u64, x: i32, y: i32) -> u64 {
+    let x_bits = x as i64 as u64;
+    let y_bits = y as i64 as u64;
+    splitmix64(
+        seed ^ x_bits.wrapping_mul(0x517c_c1b7_2722_0a95)
+            ^ y_bits.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+    )
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn smoothstep(value: f32) -> f32 {
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn lattice_value(seed: u64, x: i32, y: i32) -> f32 {
+    let sample = (hash_grid(seed, x, y) >> 40) as u32;
+    (sample as f32 / 16_777_215.0) * 2.0 - 1.0
+}
+
+fn value_noise(seed: u64, x: f32, y: f32, frequency: f32) -> f32 {
+    let fx = x * frequency;
+    let fy = y * frequency;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let tx = smoothstep(fx - x0 as f32);
+    let ty = smoothstep(fy - y0 as f32);
+
+    let n00 = lattice_value(seed, x0, y0);
+    let n10 = lattice_value(seed, x1, y0);
+    let n01 = lattice_value(seed, x0, y1);
+    let n11 = lattice_value(seed, x1, y1);
+
+    let nx0 = lerp(n00, n10, tx);
+    let nx1 = lerp(n01, n11, tx);
+    lerp(nx0, nx1, ty)
+}
+
+fn fractal_noise(seed: u64, x: i32, y: i32, base_frequency: f32) -> f32 {
+    let mut amplitude = 0.62;
+    let mut frequency = base_frequency;
+    let mut value = 0.0;
+    let mut normalizer = 0.0;
+
+    for octave in 0..4 {
+        let octave_seed = splitmix64(seed ^ octave as u64);
+        value += value_noise(octave_seed, x as f32, y as f32, frequency) * amplitude;
+        normalizer += amplitude;
+        amplitude *= 0.52;
+        frequency *= 2.03;
+    }
+
+    if normalizer <= f32::EPSILON {
+        0.0
+    } else {
+        (value / normalizer).clamp(-1.0, 1.0)
+    }
+}
+
+pub fn sample_terrain(seed: u64, tile_x: i32, tile_y: i32) -> TerrainSample {
+    let elevation = fractal_noise(seed ^ 0x6a09_e667_f3bc_c909, tile_x, tile_y, 0.0175);
+    let moisture = fractal_noise(seed ^ 0xbb67_ae85_84ca_a73b, tile_x, tile_y, 0.024);
+    let ore_patch = fractal_noise(seed ^ 0x3c6e_f372_fe94_f82b, tile_x, tile_y, 0.031);
+    let ore_mix = fractal_noise(seed ^ 0xa54f_f53a_5f1d_36f1, tile_x, tile_y, 0.087);
+
+    let base = if elevation < -0.34 {
+        TerrainBaseKind::DeepWater
+    } else if elevation < -0.14 {
+        TerrainBaseKind::ShallowWater
+    } else if elevation > 0.50 {
+        TerrainBaseKind::Rock
+    } else if moisture < -0.25 {
+        TerrainBaseKind::Dirt
+    } else {
+        TerrainBaseKind::Grass
+    };
+
+    let can_host_resources = !matches!(
+        base,
+        TerrainBaseKind::DeepWater | TerrainBaseKind::ShallowWater
+    );
+    let resource = if can_host_resources && ore_patch > 0.37 {
+        if ore_mix > 0.33 {
+            Some(TerrainResourceKind::IronOre)
+        } else if ore_mix > -0.08 {
+            Some(TerrainResourceKind::CopperOre)
+        } else {
+            Some(TerrainResourceKind::Coal)
+        }
+    } else {
+        None
+    };
+
+    let resource_richness = if resource.is_some() {
+        let normalized_patch = (ore_patch - 0.37).max(0.0);
+        let normalized_mix = (ore_mix + 1.0) * 0.5;
+        let richness = 50.0 + normalized_patch * 900.0 + normalized_mix * 180.0;
+        richness.round().clamp(50.0, 1200.0) as u16
+    } else {
+        0
+    };
+
+    TerrainSample {
+        base,
+        resource,
+        resource_richness,
+    }
+}
 
 pub fn clamp_axis(value: f32, map_limit: f32) -> f32 {
     value.max(-map_limit).min(map_limit)
@@ -315,5 +470,56 @@ mod tests {
 
         assert!((a.0 - b.0).abs() < 0.0001);
         assert!((a.1 - b.1).abs() < 0.0001);
+    }
+
+    #[test]
+    fn deterministic_room_seed_is_case_insensitive() {
+        let lower = deterministic_seed_from_room_code("north_hub");
+        let upper = deterministic_seed_from_room_code("NORTH_HUB");
+        assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn terrain_sample_is_deterministic_for_same_seed_and_tile() {
+        let seed = deterministic_seed_from_room_code("ALPHA_ROOM");
+        let first = sample_terrain(seed, 42, -13);
+        let second = sample_terrain(seed, 42, -13);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn terrain_samples_change_with_seed() {
+        let seed_a = deterministic_seed_from_room_code("ALPHA_ROOM");
+        let seed_b = deterministic_seed_from_room_code("BRAVO_ROOM");
+
+        let mut changed = false;
+        for x in -6..=6 {
+            for y in -6..=6 {
+                if sample_terrain(seed_a, x, y) != sample_terrain(seed_b, x, y) {
+                    changed = true;
+                    break;
+                }
+            }
+            if changed {
+                break;
+            }
+        }
+
+        assert!(changed);
+    }
+
+    #[test]
+    fn terrain_resource_richness_is_only_present_with_resource() {
+        let seed = deterministic_seed_from_room_code("RESOURCE_TEST");
+        for x in -24..=24 {
+            for y in -24..=24 {
+                let sample = sample_terrain(seed, x, y);
+                if sample.resource.is_some() {
+                    assert!(sample.resource_richness > 0);
+                } else {
+                    assert_eq!(sample.resource_richness, 0);
+                }
+            }
+        }
     }
 }

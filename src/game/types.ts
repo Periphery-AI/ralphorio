@@ -59,6 +59,12 @@ export type ProjectileSnapshot = {
   projectileCount: number;
 };
 
+export type TerrainSnapshot = {
+  seed: string;
+  generatorVersion: number;
+  tileSize: number;
+};
+
 export type RoomSnapshot = {
   roomCode: string;
   serverTick: number;
@@ -70,6 +76,7 @@ export type RoomSnapshot = {
     movement?: MovementSnapshot;
     build?: BuildSnapshot;
     projectile?: ProjectileSnapshot;
+    terrain?: TerrainSnapshot;
   };
 };
 
@@ -128,4 +135,5 @@ export type RenderSnapshotPayload = {
   structures: BuildStructure[];
   previews: BuildPreview[];
   projectiles: ProjectileState[];
+  terrain: TerrainSnapshot | null;
 };

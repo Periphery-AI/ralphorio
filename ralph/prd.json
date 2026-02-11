@@ -40,7 +40,7 @@
         "Client render path supports terrain layers/tiles without breaking current movement and build systems",
         "Terrain data model is compatible with future automation and resource distribution loops"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RL-002",

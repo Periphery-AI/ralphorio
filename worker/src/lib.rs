@@ -3,8 +3,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value};
 use sim_core::{
-    movement_step_with_obstacles, projectile_step, InputState as CoreInputState, StructureObstacle,
-    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+    deterministic_seed_from_room_code, movement_step_with_obstacles, projectile_step,
+    InputState as CoreInputState, StructureObstacle, PLAYER_COLLIDER_RADIUS,
+    STRUCTURE_COLLIDER_HALF_EXTENT, TERRAIN_GENERATOR_VERSION, TERRAIN_TILE_SIZE,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,8 @@ const PROJECTILE_FIRE_MIN_INTERVAL_MS: i64 = 33;
 const MAX_STRUCTURES: usize = 1024;
 const MAX_PROJECTILES: usize = 4096;
 const MAX_PREVIEWS: usize = 256;
+const ROOM_META_ROOM_CODE_KEY: &str = "room_code";
+const ROOM_META_TERRAIN_SEED_KEY: &str = "terrain_seed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SocketAttachment {
@@ -157,7 +160,7 @@ struct BuildRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct RoomCodeRow {
+struct MetaValueRow {
     value: String,
 }
 
@@ -521,6 +524,7 @@ pub struct RoomDurableObject {
     dirty_presence: Cell<bool>,
     dirty_build: Cell<bool>,
     dirty_projectiles: Cell<bool>,
+    terrain_seed: Cell<u64>,
     runtime: RefCell<RoomRuntimeState>,
 }
 
@@ -943,25 +947,59 @@ impl RoomDurableObject {
         Ok(())
     }
 
-    fn load_room_code_from_db(&self) -> Result<Option<String>> {
-        let sql = self.sql();
-        let rows: Vec<RoomCodeRow> = sql
+    fn load_room_meta_value(&self, key: &str) -> Result<Option<String>> {
+        let rows: Vec<MetaValueRow> = self
+            .sql()
             .exec(
-                "SELECT value FROM room_meta WHERE key = 'room_code' LIMIT 1",
-                None,
+                "SELECT value FROM room_meta WHERE key = ? LIMIT 1",
+                Some(vec![key.into()]),
             )?
             .to_array()?;
 
         Ok(rows.first().map(|row| row.value.clone()))
     }
 
-    fn persist_room_code(&self, room_code: &str) -> Result<()> {
-        let sql = self.sql();
-        sql.exec(
-            "INSERT INTO room_meta (key, value) VALUES ('room_code', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            Some(vec![room_code.into()]),
+    fn persist_room_meta_value(&self, key: &str, value: &str) -> Result<()> {
+        self.sql().exec(
+            "INSERT INTO room_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            Some(vec![key.into(), value.into()]),
         )?;
         Ok(())
+    }
+
+    fn load_room_code_from_db(&self) -> Result<Option<String>> {
+        self.load_room_meta_value(ROOM_META_ROOM_CODE_KEY)
+    }
+
+    fn persist_room_code(&self, room_code: &str) -> Result<()> {
+        self.persist_room_meta_value(ROOM_META_ROOM_CODE_KEY, room_code)
+    }
+
+    fn load_terrain_seed_from_db(&self) -> Result<Option<u64>> {
+        let Some(raw_seed) = self.load_room_meta_value(ROOM_META_TERRAIN_SEED_KEY)? else {
+            return Ok(None);
+        };
+
+        match raw_seed.parse::<u64>() {
+            Ok(seed) => Ok(Some(seed)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn persist_terrain_seed(&self, terrain_seed: u64) -> Result<()> {
+        self.persist_room_meta_value(ROOM_META_TERRAIN_SEED_KEY, &terrain_seed.to_string())
+    }
+
+    fn ensure_terrain_seed(&self, room_code: &str) -> Result<u64> {
+        if let Some(existing_seed) = self.load_terrain_seed_from_db()? {
+            self.terrain_seed.set(existing_seed);
+            return Ok(existing_seed);
+        }
+
+        let derived_seed = deterministic_seed_from_room_code(room_code);
+        self.persist_terrain_seed(derived_seed)?;
+        self.terrain_seed.set(derived_seed);
+        Ok(derived_seed)
     }
 
     fn issue_resume_token(&self, player_id: &str, resume_token: Option<&str>) -> Result<String> {
@@ -1788,6 +1826,15 @@ impl RoomDurableObject {
             }),
         );
 
+        features.insert(
+            "terrain".to_string(),
+            json!({
+                "seed": self.terrain_seed.get().to_string(),
+                "generatorVersion": TERRAIN_GENERATOR_VERSION,
+                "tileSize": TERRAIN_TILE_SIZE,
+            }),
+        );
+
         if include_build {
             features.insert(
                 "build".to_string(),
@@ -1949,6 +1996,7 @@ impl DurableObject for RoomDurableObject {
             dirty_presence: Cell::new(false),
             dirty_build: Cell::new(false),
             dirty_projectiles: Cell::new(false),
+            terrain_seed: Cell::new(deterministic_seed_from_room_code("UNKNOWN")),
             runtime: RefCell::new(RoomRuntimeState::default()),
         };
 
@@ -1958,6 +2006,15 @@ impl DurableObject for RoomDurableObject {
 
         if let Ok(Some(room_code)) = room.load_room_code_from_db() {
             room.room_code.replace(room_code);
+        }
+
+        let startup_room_code = room.room_code.borrow().clone();
+        if startup_room_code != "UNKNOWN" {
+            if let Err(error) = room.ensure_terrain_seed(startup_room_code.as_str()) {
+                console_error!("failed to ensure terrain seed: {error}");
+            }
+        } else if let Ok(Some(seed)) = room.load_terrain_seed_from_db() {
+            room.terrain_seed.set(seed);
         }
 
         if let Err(error) = room.hydrate_runtime_from_db() {
@@ -1978,6 +2035,7 @@ impl DurableObject for RoomDurableObject {
 
         self.room_code.replace(room_code.clone());
         self.persist_room_code(&room_code)?;
+        self.ensure_terrain_seed(&room_code)?;
 
         let upgrade = req
             .headers()

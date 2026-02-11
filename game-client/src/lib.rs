@@ -5,15 +5,16 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sim_core::{
-    movement_step_with_obstacles, InputState as CoreInputState, StructureObstacle,
-    PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+    movement_step_with_obstacles, sample_terrain, InputState as CoreInputState, StructureObstacle,
+    TerrainBaseKind, TerrainResourceKind, PLAYER_COLLIDER_RADIUS, STRUCTURE_COLLIDER_HALF_EXTENT,
+    TERRAIN_GENERATOR_VERSION, TERRAIN_TILE_SIZE,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
-const TILE_SIZE: f32 = 32.0;
+const DEFAULT_TERRAIN_TILE_SIZE: f32 = TERRAIN_TILE_SIZE as f32;
 const CHARACTER_FRAME_SIZE: f32 = 48.0;
 const CHARACTER_ANIMATION_FPS: f32 = 12.0;
 const CHARACTER_ANIMATION_FRAMES: usize = 4;
@@ -46,7 +47,9 @@ const SNAPSHOT_Z: f32 = 4.0;
 const STRUCTURE_Z: f32 = 3.0;
 const PROJECTILE_Z: f32 = 5.0;
 const FLOOR_Z: f32 = 0.0;
+const TERRAIN_RESOURCE_OVERLAY_Z: f32 = 0.15;
 const BUILD_PREVIEW_Z: f32 = 3.6;
+const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -99,6 +102,14 @@ struct ProjectileState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainSnapshotState {
+    seed: String,
+    generator_version: u32,
+    tile_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotPayload {
     #[serde(rename = "serverTick")]
     server_tick: u32,
@@ -115,6 +126,8 @@ struct SnapshotPayload {
     previews: Vec<BuildPreviewState>,
     #[serde(default)]
     projectiles: Vec<ProjectileState>,
+    #[serde(default)]
+    terrain: Option<TerrainSnapshotState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +180,18 @@ struct RemoteTarget(Vec2);
 #[derive(Component)]
 struct StructureActor {
     id: String,
+}
+
+#[derive(Component)]
+struct TerrainTileActor {
+    grid_x: i32,
+    grid_y: i32,
+}
+
+#[derive(Component)]
+struct TerrainResourceOverlayActor {
+    grid_x: i32,
+    grid_y: i32,
 }
 
 #[derive(Component)]
@@ -304,6 +329,29 @@ impl Default for BuildPlacementState {
     }
 }
 
+#[derive(Resource)]
+struct TerrainRenderState {
+    seed: u64,
+    tile_size: f32,
+    generator_version: u32,
+    render_radius_tiles: i32,
+    last_center_cell: Option<IVec2>,
+    needs_refresh: bool,
+}
+
+impl Default for TerrainRenderState {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            tile_size: DEFAULT_TERRAIN_TILE_SIZE,
+            generator_version: TERRAIN_GENERATOR_VERSION,
+            render_radius_tiles: TERRAIN_RENDER_RADIUS_TILES,
+            last_center_cell: None,
+            needs_refresh: true,
+        }
+    }
+}
+
 fn clear_protocol_queues() {
     if let Ok(mut queue) = INBOUND_SNAPSHOTS.lock() {
         queue.clear();
@@ -356,6 +404,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         .insert_resource(NextInputSeq::default())
         .insert_resource(InputHistory::default())
         .insert_resource(BuildPlacementState::default())
+        .insert_resource(TerrainRenderState::default())
         .insert_resource(FootstepState::default())
         .add_plugins(
             DefaultPlugins
@@ -387,6 +436,7 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             )
                 .chain(),
         );
+    app.add_systems(Update, sync_terrain_tiles.after(apply_latest_snapshot));
 
     app.run();
     Ok(())
@@ -469,26 +519,6 @@ fn setup_world(
 
     commands.spawn(Camera2dBundle::default());
 
-    for x in -25..=25 {
-        for y in -25..=25 {
-            let tint = if (x + y) % 2 == 0 {
-                Color::srgb_u8(24, 44, 33)
-            } else {
-                Color::srgb_u8(21, 35, 27)
-            };
-
-            commands.spawn(SpriteBundle {
-                sprite: Sprite {
-                    color: tint,
-                    custom_size: Some(Vec2::splat(TILE_SIZE - 1.0)),
-                    ..default()
-                },
-                transform: Transform::from_xyz(x as f32 * TILE_SIZE, y as f32 * TILE_SIZE, FLOOR_Z),
-                ..default()
-            });
-        }
-    }
-
     let texture = asset_server.load("sprites/factorio-character-sheet.png");
     let layout = atlas_layouts.add(TextureAtlasLayout::from_grid(
         UVec2::splat(CHARACTER_FRAME_SIZE as u32),
@@ -541,6 +571,7 @@ fn apply_pending_session_reset(
     mut next_input_seq: ResMut<NextInputSeq>,
     mut input_history: ResMut<InputHistory>,
     mut placement: ResMut<BuildPlacementState>,
+    mut terrain_state: ResMut<TerrainRenderState>,
     mut footstep_state: ResMut<FootstepState>,
     mut local_query: Query<
         (
@@ -561,6 +592,7 @@ fn apply_pending_session_reset(
     preview_query: Query<Entity, With<BuildPreviewActor>>,
     projectile_query: Query<Entity, With<ProjectileActor>>,
     predicted_projectile_query: Query<Entity, With<PredictedProjectileActor>>,
+    terrain_query: Query<Entity, Or<(With<TerrainTileActor>, With<TerrainResourceOverlayActor>)>>,
 ) {
     if !take_pending_session_reset() {
         return;
@@ -573,6 +605,8 @@ fn apply_pending_session_reset(
     next_input_seq.0 = 1;
     input_history.0.clear();
     *placement = BuildPlacementState::default();
+    terrain_state.last_center_cell = None;
+    terrain_state.needs_refresh = true;
     *footstep_state = FootstepState::default();
 
     if let Ok((mut transform, mut actor, mut velocity, mut animator, mut atlas)) =
@@ -607,6 +641,9 @@ fn apply_pending_session_reset(
         commands.entity(entity).despawn_recursive();
     }
     for entity in &predicted_projectile_query {
+        commands.entity(entity).despawn_recursive();
+    }
+    for entity in &terrain_query {
         commands.entity(entity).despawn_recursive();
     }
 }
@@ -1060,6 +1097,7 @@ fn apply_latest_snapshot(
     mut commands: Commands,
     character_atlas: Res<CharacterAtlasHandles>,
     current_player_id: Res<CurrentPlayerId>,
+    mut terrain_state: ResMut<TerrainRenderState>,
     mut input_history: ResMut<InputHistory>,
     mut local_query: Query<(&mut Transform, &mut Actor), (With<LocalActor>, Without<RemoteActor>)>,
     remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
@@ -1092,8 +1130,27 @@ fn apply_latest_snapshot(
         structures,
         previews,
         projectiles,
+        terrain,
         ..
     } = snapshot;
+
+    if let Some(terrain) = terrain {
+        if let Ok(seed) = terrain.seed.parse::<u64>() {
+            let tile_size = terrain.tile_size.max(8) as f32;
+            let terrain_changed = terrain_state.seed != seed
+                || terrain_state.generator_version != terrain.generator_version
+                || (terrain_state.tile_size - tile_size).abs() > f32::EPSILON;
+
+            if terrain_changed {
+                terrain_state.seed = seed;
+                terrain_state.generator_version = terrain.generator_version;
+                terrain_state.tile_size = tile_size;
+                terrain_state.last_center_cell = None;
+                terrain_state.needs_refresh = true;
+            }
+        }
+    }
+
     let structure_obstacles: Vec<StructureObstacle> = structures
         .iter()
         .map(|structure| StructureObstacle {
@@ -1351,6 +1408,166 @@ fn follow_camera(
 
     camera_transform.translation.x = local_transform.translation.x;
     camera_transform.translation.y = local_transform.translation.y;
+}
+
+fn world_to_terrain_cell(world_axis: f32, tile_size: f32) -> i32 {
+    (world_axis / tile_size).floor() as i32
+}
+
+fn tint_channel(channel: u8, delta: i16) -> u8 {
+    (channel as i16 + delta).clamp(0, 255) as u8
+}
+
+fn terrain_parity_delta(grid_x: i32, grid_y: i32) -> i16 {
+    if (grid_x + grid_y) & 1 == 0 {
+        5
+    } else {
+        -5
+    }
+}
+
+fn terrain_base_color(base: TerrainBaseKind, grid_x: i32, grid_y: i32) -> Color {
+    let (r, g, b) = match base {
+        TerrainBaseKind::DeepWater => (13, 38, 86),
+        TerrainBaseKind::ShallowWater => (33, 78, 124),
+        TerrainBaseKind::Grass => (40, 92, 58),
+        TerrainBaseKind::Dirt => (97, 79, 49),
+        TerrainBaseKind::Rock => (95, 101, 112),
+    };
+    let delta = terrain_parity_delta(grid_x, grid_y);
+    Color::srgb_u8(
+        tint_channel(r, delta),
+        tint_channel(g, delta),
+        tint_channel(b, delta),
+    )
+}
+
+fn terrain_resource_overlay_color(
+    resource: TerrainResourceKind,
+    richness: u16,
+    grid_x: i32,
+    grid_y: i32,
+) -> Color {
+    let (r, g, b) = match resource {
+        TerrainResourceKind::IronOre => (119, 153, 184),
+        TerrainResourceKind::CopperOre => (195, 123, 66),
+        TerrainResourceKind::Coal => (66, 68, 74),
+    };
+    let delta = terrain_parity_delta(grid_x + 1, grid_y + 1);
+    let alpha = (0.18 + (richness as f32 / 1200.0) * 0.35).clamp(0.18, 0.53);
+    Color::srgba(
+        tint_channel(r, delta) as f32 / 255.0,
+        tint_channel(g, delta) as f32 / 255.0,
+        tint_channel(b, delta) as f32 / 255.0,
+        alpha,
+    )
+}
+
+fn sync_terrain_tiles(
+    mut commands: Commands,
+    mut terrain_state: ResMut<TerrainRenderState>,
+    local_transform_query: Query<&Transform, (With<LocalActor>, Without<TerrainTileActor>)>,
+    terrain_tile_query: Query<(Entity, &TerrainTileActor)>,
+    terrain_overlay_query: Query<(Entity, &TerrainResourceOverlayActor)>,
+) {
+    let Ok(local_transform) = local_transform_query.get_single() else {
+        return;
+    };
+
+    let tile_size = terrain_state.tile_size.max(8.0);
+    let center = IVec2::new(
+        world_to_terrain_cell(local_transform.translation.x, tile_size),
+        world_to_terrain_cell(local_transform.translation.y, tile_size),
+    );
+    let center_changed = terrain_state.last_center_cell != Some(center);
+
+    if !terrain_state.needs_refresh && !center_changed {
+        return;
+    }
+
+    let mut base_entities: HashMap<(i32, i32), Entity> = terrain_tile_query
+        .iter()
+        .map(|(entity, tile)| ((tile.grid_x, tile.grid_y), entity))
+        .collect();
+    let mut overlay_entities: HashMap<(i32, i32), Entity> = terrain_overlay_query
+        .iter()
+        .map(|(entity, overlay)| ((overlay.grid_x, overlay.grid_y), entity))
+        .collect();
+
+    if terrain_state.needs_refresh {
+        for entity in base_entities.values() {
+            commands.entity(*entity).despawn_recursive();
+        }
+        for entity in overlay_entities.values() {
+            commands.entity(*entity).despawn_recursive();
+        }
+        base_entities.clear();
+        overlay_entities.clear();
+    }
+
+    let radius = terrain_state.render_radius_tiles.max(2);
+    for grid_x in (center.x - radius)..=(center.x + radius) {
+        for grid_y in (center.y - radius)..=(center.y + radius) {
+            let key = (grid_x, grid_y);
+            let sample = sample_terrain(terrain_state.seed, grid_x, grid_y);
+            if base_entities.remove(&key).is_none() {
+                commands.spawn((
+                    SpriteBundle {
+                        sprite: Sprite {
+                            color: terrain_base_color(sample.base, grid_x, grid_y),
+                            custom_size: Some(Vec2::splat(tile_size)),
+                            ..default()
+                        },
+                        transform: Transform::from_xyz(
+                            grid_x as f32 * tile_size,
+                            grid_y as f32 * tile_size,
+                            FLOOR_Z,
+                        ),
+                        ..default()
+                    },
+                    TerrainTileActor { grid_x, grid_y },
+                ));
+            }
+
+            if let Some(resource) = sample.resource {
+                if overlay_entities.remove(&key).is_none() {
+                    commands.spawn((
+                        SpriteBundle {
+                            sprite: Sprite {
+                                color: terrain_resource_overlay_color(
+                                    resource,
+                                    sample.resource_richness,
+                                    grid_x,
+                                    grid_y,
+                                ),
+                                custom_size: Some(Vec2::splat(tile_size * 0.48)),
+                                ..default()
+                            },
+                            transform: Transform::from_xyz(
+                                grid_x as f32 * tile_size,
+                                grid_y as f32 * tile_size,
+                                TERRAIN_RESOURCE_OVERLAY_Z,
+                            ),
+                            ..default()
+                        },
+                        TerrainResourceOverlayActor { grid_x, grid_y },
+                    ));
+                }
+            } else if let Some(entity) = overlay_entities.remove(&key) {
+                commands.entity(entity).despawn_recursive();
+            }
+        }
+    }
+
+    for entity in base_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+    for entity in overlay_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
+    terrain_state.last_center_cell = Some(center);
+    terrain_state.needs_refresh = false;
 }
 
 fn spawn_remote_actor(

@@ -138,6 +138,7 @@ export class ReplicationPipeline {
             movement: snapshot.features.movement ?? previous.features.movement,
             build: snapshot.features.build ?? previous.features.build,
             projectile: snapshot.features.projectile ?? previous.features.projectile,
+            terrain: snapshot.features.terrain ?? previous.features.terrain,
           },
         }
       : snapshot;
@@ -222,6 +223,7 @@ export class ReplicationPipeline {
     const projectiles = interpolateProjectiles(olderProjectiles, newerProjectiles, alpha);
     const structures = copyStructures(latest.features.build?.structures ?? []);
     const previews = copyPreviews(latest.features.build?.previews ?? []);
+    const terrain = latest.features.terrain ?? null;
 
     return {
       serverTick: latest.serverTick,
@@ -232,6 +234,7 @@ export class ReplicationPipeline {
       structures,
       previews,
       projectiles,
+      terrain,
     };
   }
 }
