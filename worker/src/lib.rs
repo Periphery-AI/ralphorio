@@ -455,6 +455,8 @@ struct RuntimePreviewState {
     kind: String,
     x: f32,
     y: f32,
+    can_place: bool,
+    reason: Option<String>,
     updated_at: i64,
 }
 
@@ -3554,6 +3556,49 @@ impl RoomDurableObject {
         Ok(true)
     }
 
+    fn evaluate_structure_placement(
+        &self,
+        player_id: &str,
+        kind: &str,
+        grid_x: i64,
+        grid_y: i64,
+        center_x: f64,
+        center_y: f64,
+        consume_inventory: bool,
+    ) -> Result<Option<String>> {
+        if !self.can_place_structure_at_cell(grid_x, grid_y, center_x, center_y)? {
+            return Ok(Some("build cell is blocked".to_string()));
+        }
+
+        if consume_inventory {
+            let mut runtime = self.runtime.borrow_mut();
+            let inventory = runtime
+                .inventories
+                .entry(player_id.to_string())
+                .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
+            inventory.normalize();
+            if let Err(error) = consume_structure_build_cost(inventory, kind) {
+                return Ok(Some(format!("{error}")));
+            }
+            return Ok(None);
+        }
+
+        let mut preview_inventory = {
+            let mut runtime = self.runtime.borrow_mut();
+            if let Some(inventory) = runtime.inventories.get_mut(player_id) {
+                inventory.normalize();
+                inventory.clone()
+            } else {
+                RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS)
+            }
+        };
+        if let Err(error) = consume_structure_build_cost(&mut preview_inventory, kind) {
+            return Ok(Some(format!("{error}")));
+        }
+
+        Ok(None)
+    }
+
     fn handle_build_preview(&self, player_id: &str, payload: Option<Value>) -> Result<bool> {
         let payload =
             payload.ok_or_else(|| Error::RustError("missing build preview payload".into()))?;
@@ -3600,6 +3645,12 @@ impl RoomDurableObject {
 
         let center_x = grid_cell_center(snap_axis_to_grid(x));
         let center_y = grid_cell_center(snap_axis_to_grid(y));
+        let grid_x = snap_axis_to_grid(x);
+        let grid_y = snap_axis_to_grid(y);
+        let reason = self.evaluate_structure_placement(
+            player_id, kind, grid_x, grid_y, center_x, center_y, false,
+        )?;
+        let can_place = reason.is_none();
 
         self.runtime.borrow_mut().previews.insert(
             player_id.to_string(),
@@ -3608,6 +3659,8 @@ impl RoomDurableObject {
                 kind: kind.to_string(),
                 x: center_x as f32,
                 y: center_y as f32,
+                can_place,
+                reason,
                 updated_at: now,
             },
         );
@@ -3655,18 +3708,16 @@ impl RoomDurableObject {
                 let snapped_x = grid_cell_center(grid_x);
                 let snapped_y = grid_cell_center(grid_y);
 
-                if !self.can_place_structure_at_cell(grid_x, grid_y, snapped_x, snapped_y)? {
-                    return Err(Error::RustError("build cell is blocked".into()));
-                }
-
-                {
-                    let mut runtime = self.runtime.borrow_mut();
-                    let inventory = runtime
-                        .inventories
-                        .entry(player_id.to_string())
-                        .or_insert_with(|| RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS));
-                    inventory.normalize();
-                    consume_structure_build_cost(inventory, place.kind.as_str())?;
+                if let Some(reason) = self.evaluate_structure_placement(
+                    player_id,
+                    place.kind.as_str(),
+                    grid_x,
+                    grid_y,
+                    snapped_x,
+                    snapped_y,
+                    true,
+                )? {
+                    return Err(Error::RustError(reason));
                 }
                 self.persist_inventory_for_player(player_id)?;
 
@@ -5194,6 +5245,8 @@ impl RoomDurableObject {
                     "kind": row.kind,
                     "x": row.x,
                     "y": row.y,
+                    "canPlace": row.can_place,
+                    "reason": row.reason,
                 })
             })
             .collect();

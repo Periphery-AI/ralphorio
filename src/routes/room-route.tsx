@@ -179,6 +179,8 @@ type BuildPanelState = {
   kind: string;
   x: number;
   y: number;
+  canPlace: boolean;
+  reason: string | null;
 };
 
 const EMPTY_INVENTORY_PANEL: InventoryPanelState = {
@@ -325,6 +327,9 @@ export function RoomRoute() {
         {
           onStatus: (status) => {
             setConnectionStatus(status);
+            if (status.startsWith('Error:')) {
+              pushDevLog(status);
+            }
           },
           onWelcome: (payload) => {
             setServerPlayerId(payload.playerId);
@@ -378,6 +383,8 @@ export function RoomRoute() {
                       kind: localBuildPreview.kind,
                       x: Math.round(localBuildPreview.x),
                       y: Math.round(localBuildPreview.y),
+                      canPlace: localBuildPreview.canPlace,
+                      reason: localBuildPreview.reason,
                     }
                   : null,
               );
@@ -755,6 +762,16 @@ export function RoomRoute() {
                         <p className="mt-1 font-mono text-[#9ce7cf]">
                           x={selectedBuildPanel.x} y={selectedBuildPanel.y}
                         </p>
+                        <p
+                          className={`mt-1 ${
+                            selectedBuildPanel.canPlace ? 'text-[#8be3bf]' : 'text-[#ff9d90]'
+                          }`}
+                        >
+                          {selectedBuildPanel.canPlace ? 'Placement valid' : 'Placement blocked'}
+                        </p>
+                        {!selectedBuildPanel.canPlace && selectedBuildPanel.reason ? (
+                          <p className="mt-1 text-[#ffb7ad]">{selectedBuildPanel.reason}</p>
+                        ) : null}
                       </>
                     ) : (
                       <p className="text-[#8ea8d6]">No active build preview. Press Q to enter build mode.</p>

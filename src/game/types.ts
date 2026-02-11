@@ -48,6 +48,8 @@ export type BuildPreview = {
   x: number;
   y: number;
   kind: string;
+  canPlace: boolean;
+  reason: string | null;
 };
 
 export type PresenceSnapshot = {

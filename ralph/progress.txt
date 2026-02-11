@@ -39,4 +39,12 @@ Entry format:
 - decisions: Keep server-authoritative combat state unchanged; client now treats enemies as render-only entities sourced from validated combat snapshots so existing projectile combat can target the visible positions.
 - files: src/game/types.ts, src/game/netcode/replication.ts, game-client/src/lib.rs, ralph/progress.txt
 - validation: npm run wasm:build:dev (pass); npm run build:web (pass)
+- commit: 7dc82dc
+
+- timestamp: 2026-02-11
+- item: RLP2-102
+- summary: Implemented authoritative placement validation feedback by reusing server placement rules for preview and placement commands, then surfacing `canPlace` + failure reason through protocol parsing into the in-room HUD and status/dev log.
+- decisions: Kept existing authoritative placement/persistence flow and structure replication intact; added a single shared worker validation path (`evaluate_structure_placement`) so preview validity and actual placement rejection reasons stay aligned.
+- files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/routes/room-route.tsx, game-client/src/lib.rs, ralph/progress.txt
+- validation: cargo test (worker) (pass); cargo test (sim-core) (pass); npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending

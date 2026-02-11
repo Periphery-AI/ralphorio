@@ -108,6 +108,14 @@ struct BuildPreviewState {
     x: f32,
     y: f32,
     kind: String,
+    #[serde(rename = "canPlace", default = "default_preview_can_place")]
+    can_place: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn default_preview_can_place() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,7 +787,7 @@ fn setup_world(
     commands.spawn((
         SpriteBundle {
             sprite: Sprite {
-                color: structure_preview_color("beacon", true),
+                color: structure_preview_color("beacon", true, true),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
                 ..default()
             },
@@ -994,7 +1002,7 @@ fn set_local_build_ghost_visible(
         } else {
             Visibility::Hidden
         };
-        sprite.color = structure_preview_color(kind, true);
+        sprite.color = structure_preview_color(kind, true, true);
     }
 }
 
@@ -1896,10 +1904,13 @@ fn apply_latest_snapshot(
         }
 
         if let Some(entity) = preview_entities.remove(&preview.player_id) {
-            commands.entity(entity).insert(Transform::from_xyz(
-                preview.x,
-                preview.y,
-                BUILD_PREVIEW_Z,
+            commands.entity(entity).insert((
+                Transform::from_xyz(preview.x, preview.y, BUILD_PREVIEW_Z),
+                Sprite {
+                    color: structure_preview_color(preview.kind.as_str(), false, preview.can_place),
+                    custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
+                    ..default()
+                },
             ));
         } else {
             spawn_build_preview_actor(&mut commands, &preview);
@@ -2410,7 +2421,12 @@ fn structure_color(kind: &str) -> Color {
     }
 }
 
-fn structure_preview_color(kind: &str, is_local: bool) -> Color {
+fn structure_preview_color(kind: &str, is_local: bool, can_place: bool) -> Color {
+    if !can_place {
+        let alpha = if is_local { 0.58 } else { 0.42 };
+        return Color::srgba(235.0 / 255.0, 112.0 / 255.0, 103.0 / 255.0, alpha);
+    }
+
     let base = structure_color(kind).to_srgba();
     let alpha = if is_local { 0.55 } else { 0.35 };
     Color::srgba(base.red, base.green, base.blue, alpha)
@@ -2595,7 +2611,7 @@ fn spawn_build_preview_actor(commands: &mut Commands, preview: &BuildPreviewStat
     commands.spawn((
         SpriteBundle {
             sprite: Sprite {
-                color: structure_preview_color(preview.kind.as_str(), false),
+                color: structure_preview_color(preview.kind.as_str(), false, preview.can_place),
                 custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
                 ..default()
             },

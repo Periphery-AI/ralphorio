@@ -177,12 +177,30 @@ function parseBuildPreview(payload: unknown) {
     return null;
   }
 
+  if (payload.canPlace !== undefined && typeof payload.canPlace !== 'boolean') {
+    return null;
+  }
+
+  if (payload.reason !== undefined && payload.reason !== null && typeof payload.reason !== 'string') {
+    return null;
+  }
+
   return {
     playerId: payload.playerId,
     x: payload.x,
     y: payload.y,
     kind: payload.kind,
+    canPlace: payload.canPlace ?? true,
+    reason: typeof payload.reason === 'string' ? payload.reason : null,
   };
+}
+
+function parseErrorMessage(payload: unknown) {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  return typeof payload.message === 'string' ? payload.message : null;
 }
 
 function parseProjectileState(payload: unknown) {
@@ -1004,7 +1022,12 @@ export class RoomSocket {
       }
 
       if (envelope.kind === 'error') {
-        this.handlers.onStatus(`Error: ${envelope.feature}.${envelope.action}`);
+        const message = parseErrorMessage(envelope.payload);
+        this.handlers.onStatus(
+          message
+            ? `Error: ${envelope.feature}.${envelope.action} - ${message}`
+            : `Error: ${envelope.feature}.${envelope.action}`,
+        );
       }
     });
 
