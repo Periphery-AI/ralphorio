@@ -281,6 +281,15 @@ type ProgressionPanelState = {
   objectives: ProgressionObjectivePanelState[];
 };
 
+type CombatPanelState = {
+  health: number;
+  maxHealth: number;
+  attackPower: number;
+  armor: number;
+  targetedBy: number;
+  enemyCount: number;
+};
+
 type HudPanelState = 'goals' | 'inventory' | 'crafting' | 'build' | 'telemetry';
 
 const EMPTY_INVENTORY_PANEL: InventoryPanelState = {
@@ -299,6 +308,15 @@ const EMPTY_PROGRESSION_PANEL: ProgressionPanelState = {
   combatReady: false,
   combatReadyInMs: 0,
   objectives: [],
+};
+
+const EMPTY_COMBAT_PANEL: CombatPanelState = {
+  health: 0,
+  maxHealth: 0,
+  attackPower: 0,
+  armor: 0,
+  targetedBy: 0,
+  enemyCount: 0,
 };
 
 function titleCaseToken(token: string) {
@@ -347,6 +365,7 @@ export function RoomRoute() {
   const [craftingPanel, setCraftingPanel] = useState<CraftingPanelState>(EMPTY_CRAFTING_PANEL);
   const [progressionPanel, setProgressionPanel] =
     useState<ProgressionPanelState>(EMPTY_PROGRESSION_PANEL);
+  const [combatPanel, setCombatPanel] = useState<CombatPanelState>(EMPTY_COMBAT_PANEL);
   const [selectedBuildPanel, setSelectedBuildPanel] = useState<BuildPanelState | null>(null);
   const [buildPreviewCount, setBuildPreviewCount] = useState(0);
   const [isHudExpanded, setIsHudExpanded] = useState(true);
@@ -401,6 +420,7 @@ export function RoomRoute() {
       setInventoryPanel(EMPTY_INVENTORY_PANEL);
       setCraftingPanel(EMPTY_CRAFTING_PANEL);
       setProgressionPanel(EMPTY_PROGRESSION_PANEL);
+      setCombatPanel(EMPTY_COMBAT_PANEL);
       setSelectedBuildPanel(null);
       setBuildPreviewCount(0);
       setIsHudExpanded(true);
@@ -462,6 +482,7 @@ export function RoomRoute() {
             const mining = snapshot.features.mining;
             const drops = snapshot.features.drops;
             const crafting = snapshot.features.crafting;
+            const combat = snapshot.features.combat;
             const progression = snapshot.features.progression;
 
             if (movement) {
@@ -534,6 +555,28 @@ export function RoomRoute() {
                 setCraftingPanel({
                   active: localCraftQueue.active ? { ...localCraftQueue.active } : null,
                   pending: localCraftQueue.pending.map((entry) => ({ ...entry })),
+                });
+              }
+            }
+
+            if (combat) {
+              const localCombat =
+                combat.players.find(
+                  (playerCombat) => playerCombat.playerId === authoritativePlayerIdRef.current,
+                ) ?? null;
+              if (!localCombat) {
+                setCombatPanel(EMPTY_COMBAT_PANEL);
+              } else {
+                const targetedBy = combat.enemies.filter(
+                  (enemy) => enemy.targetPlayerId === authoritativePlayerIdRef.current,
+                ).length;
+                setCombatPanel({
+                  health: localCombat.health,
+                  maxHealth: localCombat.maxHealth,
+                  attackPower: localCombat.attackPower,
+                  armor: localCombat.armor,
+                  targetedBy,
+                  enemyCount: combat.enemyCount,
                 });
               }
             }
@@ -707,6 +750,16 @@ export function RoomRoute() {
   const enemyWarmupLabel = progressionPanel.combatReady
     ? 'Active'
     : `${Math.max(0, Math.ceil(progressionPanel.combatReadyInMs / 1000))}s`;
+  const combatHealthLabel =
+    combatPanel.maxHealth > 0 ? `${combatPanel.health}/${combatPanel.maxHealth}` : '--';
+  const combatThreatLabel =
+    combatPanel.enemyCount === 0
+      ? 'Clear'
+      : combatPanel.targetedBy > 0
+        ? `${combatPanel.targetedBy} on you`
+        : `${combatPanel.enemyCount} nearby`;
+  const lowHealthWarning =
+    combatPanel.maxHealth > 0 && combatPanel.health / combatPanel.maxHealth <= 0.35;
 
   if (!isLoaded) {
     return (
@@ -758,6 +811,8 @@ export function RoomRoute() {
               Goal: {activeObjective.label}
             </span>
           ) : null}
+          <QuickMetric label="HP" value={combatHealthLabel} />
+          <QuickMetric label="Threat" value={combatThreatLabel} />
           <QuickMetric label="Ping" value={`${latencyMs}ms`} />
           <QuickMetric label="Online" value={activePlayers} />
           <button
@@ -794,6 +849,14 @@ export function RoomRoute() {
                   <p key={`${line}-${index}`}>{line}</p>
                 ))}
               </div>
+            </div>
+          ) : null}
+          {lowHealthWarning ? (
+            <div className="pointer-events-none absolute right-3 top-3 z-20 rounded-lg border border-[#a84b50]/80 bg-[#2c0d14]/88 px-3 py-2 backdrop-blur">
+              <p className="text-[10px] uppercase tracking-[0.16em] text-[#ffb8bf]">
+                Critical Health
+              </p>
+              <p className="mt-1 text-xs text-[#ffd9de]">Retreat or craft before re-engaging.</p>
             </div>
           ) : null}
           {!showDevConsole ? (
@@ -841,6 +904,8 @@ export function RoomRoute() {
                     <OverlayPanel eyebrow="Authoritative" title="Session Objectives">
                       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                         <TelemetryMetric label="Stage" value={titleCaseToken(progressionPanel.stage)} />
+                        <TelemetryMetric label="Health" value={combatHealthLabel} />
+                        <TelemetryMetric label="Threat" value={combatThreatLabel} />
                         <TelemetryMetric
                           label="Complete"
                           value={`${completedObjectiveCount}/${progressionPanel.objectives.length}`}
@@ -985,6 +1050,8 @@ export function RoomRoute() {
                         <TelemetryMetric label="Mining" value={miningActiveCount} />
                         <TelemetryMetric label="Drops" value={dropCount} />
                         <TelemetryMetric label="Projectiles" value={projectileCount} />
+                        <TelemetryMetric label="Attack" value={combatPanel.attackPower} />
+                        <TelemetryMetric label="Armor" value={combatPanel.armor} />
                       </div>
                       <div className="mt-2 rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5 text-xs text-[#cfe0ff]">
                         <p>

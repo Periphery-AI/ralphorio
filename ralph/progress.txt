@@ -95,4 +95,12 @@ Entry format:
 - decisions: Built directly on existing authoritative inventory/crafting/build/combat runtime state and snapshot protocol; no subsystem rewrites. Added objective derivation in worker snapshots rather than client-only heuristics so goals stay consistent with authoritative state and malformed payload checks remain strict end-to-end.
 - files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
 - validation: cargo test --manifest-path worker/Cargo.toml (pass, 29 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
+- commit: 7ee02c3
+
+- timestamp: 2026-02-11
+- item: RLP2-106
+- summary: Improved authoritative combat readability by adding in-world enemy health bars and damage popups in Bevy, plus room HUD combat telemetry (HP/threat/attack/armor) and a low-health warning so combat state is readable without opening debug tooling.
+- decisions: Built entirely on existing authoritative combat snapshots + combat event feed (no combat protocol rewrite). In-world cues are now derived from snapshot health deltas to align feedback with server-resolved outcomes while keeping module boundaries intact.
+- files: game-client/src/lib.rs, src/routes/room-route.tsx, ralph/progress.txt
+- validation: npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
 - commit: pending

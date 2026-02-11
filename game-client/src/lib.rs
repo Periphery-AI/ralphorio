@@ -70,6 +70,12 @@ const MINING_INTERACT_RADIUS: f32 = 20.0;
 const DROP_Z: f32 = 2.58;
 const DROP_BASE_SIZE: f32 = 10.0;
 const ENEMY_BASE_SIZE: f32 = 22.0;
+const ENEMY_HEALTH_BAR_HEIGHT: f32 = 3.0;
+const ENEMY_HEALTH_BAR_OFFSET_Y: f32 = 5.0;
+const ENEMY_HEALTH_BAR_Z: f32 = ENEMY_Z + 0.08;
+const COMBAT_POPUP_Z: f32 = ENEMY_Z + 0.25;
+const COMBAT_POPUP_TTL_SECONDS: f32 = 0.72;
+const COMBAT_POPUP_RISE_SPEED: f32 = 34.0;
 const DROP_PICKUP_INTERACT_RADIUS: f32 = 84.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
 const CRAFT_QUEUE_COUNT_PER_PRESS: u32 = 1;
@@ -225,8 +231,25 @@ struct EnemySnapshotState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayerCombatSnapshotState {
+    #[serde(rename = "playerId")]
+    player_id: String,
+    health: u32,
+    #[serde(rename = "maxHealth")]
+    max_health: u32,
+    #[serde(rename = "attackPower")]
+    _attack_power: u32,
+    #[serde(rename = "armor")]
+    _armor: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CombatSnapshotState {
+    #[serde(default)]
     enemies: Vec<EnemySnapshotState>,
+    #[serde(default)]
+    players: Vec<PlayerCombatSnapshotState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +390,7 @@ struct ProjectileActor {
 #[derive(Component)]
 struct EnemyActor {
     id: String,
+    health: u32,
 }
 
 #[derive(Component)]
@@ -384,6 +408,19 @@ struct PredictedProjectileLifetime(f32);
 struct PredictedProjectileTarget {
     has_target: bool,
     position: Vec2,
+}
+
+#[derive(Component)]
+struct EnemyHealthBarActor {
+    enemy_id: String,
+}
+
+#[derive(Component)]
+struct CombatPopupActor {
+    ttl: f32,
+    max_ttl: f32,
+    rise_speed: f32,
+    base_color: Color,
 }
 
 #[derive(Clone, Copy)]
@@ -648,7 +685,8 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             animate_character_sprites.after(smooth_remote_motion),
         )
         .add_systems(Update, animate_mining_effects.after(apply_latest_snapshot))
-        .add_systems(Update, follow_camera.after(animate_character_sprites));
+        .add_systems(Update, animate_combat_popups.after(apply_latest_snapshot))
+        .add_systems(Update, follow_camera.after(animate_combat_popups));
     app.add_systems(Update, sync_terrain_tiles.after(apply_latest_snapshot));
 
     app.run();
@@ -845,6 +883,8 @@ fn apply_pending_session_reset(
             With<BuildPreviewActor>,
             With<ProjectileActor>,
             With<EnemyActor>,
+            With<EnemyHealthBarActor>,
+            With<CombatPopupActor>,
             With<PredictedProjectileActor>,
             With<TerrainTileActor>,
             With<TerrainResourceOverlayActor>,
@@ -1567,8 +1607,17 @@ fn apply_latest_snapshot(
     >,
     mut name_label_query: Query<&mut Text, With<ActorNameLabel>>,
     world_object_query: Query<
-        (Entity, Option<&StructureActor>, Option<&EnemyActor>),
-        Or<(With<StructureActor>, With<EnemyActor>)>,
+        (
+            Entity,
+            Option<&StructureActor>,
+            Option<&EnemyActor>,
+            Option<&EnemyHealthBarActor>,
+        ),
+        Or<(
+            With<StructureActor>,
+            With<EnemyActor>,
+            With<EnemyHealthBarActor>,
+        )>,
     >,
     mining_node_query: Query<(Entity, &MiningNodeActor)>,
     mining_progress_query: Query<(Entity, &MiningProgressActor)>,
@@ -1753,7 +1802,7 @@ fn apply_latest_snapshot(
 
     let mut structure_entities: HashMap<String, Entity> = world_object_query
         .iter()
-        .filter_map(|(entity, structure, _)| {
+        .filter_map(|(entity, structure, _, _)| {
             structure.map(|structure| (structure.id.clone(), entity))
         })
         .collect();
@@ -1774,15 +1823,27 @@ fn apply_latest_snapshot(
         commands.entity(*entity).despawn_recursive();
     }
 
-    let latest_enemies = combat.map_or_else(Vec::new, |snapshot| snapshot.enemies);
-    let mut enemy_entities: HashMap<String, Entity> = world_object_query
+    let (latest_enemies, _combat_players) = if let Some(snapshot) = combat {
+        (snapshot.enemies, snapshot.players)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let mut enemy_entities: HashMap<String, (Entity, u32)> = world_object_query
         .iter()
-        .filter_map(|(entity, _, enemy)| enemy.map(|enemy| (enemy.id.clone(), entity)))
+        .filter_map(|(entity, _, enemy, _)| enemy.map(|enemy| (enemy.id.clone(), (entity, enemy.health))))
+        .collect();
+    let mut enemy_health_bar_entities: HashMap<String, Entity> = world_object_query
+        .iter()
+        .filter_map(|(entity, _, _, bar)| bar.map(|bar| (bar.enemy_id.clone(), entity)))
         .collect();
     for enemy in latest_enemies {
         if enemy.health == 0 {
-            if let Some(entity) = enemy_entities.remove(enemy.id.as_str()) {
+            if let Some((entity, _)) = enemy_entities.remove(enemy.id.as_str()) {
                 commands.entity(entity).despawn_recursive();
+            }
+            if let Some(bar_entity) = enemy_health_bar_entities.remove(enemy.id.as_str()) {
+                commands.entity(bar_entity).despawn_recursive();
             }
             continue;
         }
@@ -1792,7 +1853,17 @@ fn apply_latest_snapshot(
             .zip(enemy.target_player_id.as_deref())
             .is_some_and(|(local_id, target_id)| local_id == target_id);
 
-        if let Some(entity) = enemy_entities.remove(enemy.id.as_str()) {
+        if let Some((entity, previous_health)) = enemy_entities.remove(enemy.id.as_str()) {
+            if previous_health > enemy.health {
+                let applied_damage = previous_health - enemy.health;
+                spawn_combat_popup(
+                    &mut commands,
+                    format!("-{applied_damage}"),
+                    enemy.x,
+                    enemy.y + enemy_size(enemy.kind.as_str()) * 0.92,
+                    Color::srgb_u8(255, 205, 126),
+                );
+            }
             commands.entity(entity).insert((
                 Transform::from_xyz(enemy.x, enemy.y, ENEMY_Z),
                 Sprite {
@@ -1805,13 +1876,47 @@ fn apply_latest_snapshot(
                     custom_size: Some(Vec2::splat(enemy_size(enemy.kind.as_str()))),
                     ..default()
                 },
+                EnemyActor {
+                    id: enemy.id.clone(),
+                    health: enemy.health,
+                },
             ));
         } else {
             spawn_enemy_actor(&mut commands, &enemy, targets_local_player);
         }
+
+        if let Some(bar_entity) = enemy_health_bar_entities.remove(enemy.id.as_str()) {
+            commands.entity(bar_entity).insert((
+                Transform::from_xyz(
+                    enemy.x,
+                    enemy.y + enemy_size(enemy.kind.as_str()) + ENEMY_HEALTH_BAR_OFFSET_Y,
+                    ENEMY_HEALTH_BAR_Z,
+                ),
+                Sprite {
+                    color: enemy_health_bar_color(
+                        enemy.health,
+                        enemy.max_health,
+                        targets_local_player,
+                    ),
+                    custom_size: Some(Vec2::new(
+                        enemy_health_bar_width(enemy.kind.as_str(), enemy.health, enemy.max_health),
+                        ENEMY_HEALTH_BAR_HEIGHT,
+                    )),
+                    ..default()
+                },
+                EnemyHealthBarActor {
+                    enemy_id: enemy.id.clone(),
+                },
+            ));
+        } else {
+            spawn_enemy_health_bar_actor(&mut commands, &enemy, targets_local_player);
+        }
     }
 
-    for entity in enemy_entities.values() {
+    for (entity, _) in enemy_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+    for entity in enemy_health_bar_entities.values() {
         commands.entity(*entity).despawn_recursive();
     }
 
@@ -2152,6 +2257,28 @@ fn animate_mining_effects(
         };
         transform.translation.z =
             MINING_PROGRESS_Z + if is_local { 0.06 * local_pulse } else { 0.0 };
+    }
+}
+
+fn animate_combat_popups(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut popup_query: Query<(Entity, &mut CombatPopupActor, &mut Transform, &mut Text)>,
+) {
+    let dt = time.delta_seconds();
+    for (entity, mut popup, mut transform, mut text) in &mut popup_query {
+        popup.ttl -= dt;
+        if popup.ttl <= 0.0 {
+            commands.entity(entity).despawn_recursive();
+            continue;
+        }
+
+        transform.translation.y += popup.rise_speed * dt;
+        let alpha = (popup.ttl / popup.max_ttl).clamp(0.0, 1.0);
+        let base = popup.base_color.to_srgba();
+        if let Some(section) = text.sections.get_mut(0) {
+            section.style.color = Color::srgba(base.red, base.green, base.blue, alpha);
+        }
     }
 }
 
@@ -2509,6 +2636,27 @@ fn enemy_color(kind: &str, health: u32, max_health: u32, targets_local_player: b
     )
 }
 
+fn enemy_health_ratio(health: u32, max_health: u32) -> f32 {
+    if max_health == 0 {
+        0.0
+    } else {
+        (health as f32 / max_health as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn enemy_health_bar_width(kind: &str, health: u32, max_health: u32) -> f32 {
+    let ratio = enemy_health_ratio(health, max_health);
+    (enemy_size(kind) * 1.25 * ratio).max(2.0)
+}
+
+fn enemy_health_bar_color(health: u32, max_health: u32, targets_local_player: bool) -> Color {
+    let ratio = enemy_health_ratio(health, max_health);
+    let warning_boost = if targets_local_player { 0.1 } else { 0.0 };
+    let red = (0.93 - ratio * 0.36 + warning_boost).clamp(0.0, 1.0);
+    let green = (0.22 + ratio * 0.68).clamp(0.0, 1.0);
+    Color::srgba(red, green, 0.2, 0.92)
+}
+
 fn mining_node_base_color(kind: &str) -> Color {
     match kind {
         "iron_ore" => Color::srgb_u8(133, 163, 188),
@@ -2580,6 +2728,59 @@ fn spawn_enemy_actor(
         },
         EnemyActor {
             id: enemy.id.clone(),
+            health: enemy.health,
+        },
+    ));
+}
+
+fn spawn_enemy_health_bar_actor(
+    commands: &mut Commands,
+    enemy: &EnemySnapshotState,
+    targets_local_player: bool,
+) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: enemy_health_bar_color(enemy.health, enemy.max_health, targets_local_player),
+                custom_size: Some(Vec2::new(
+                    enemy_health_bar_width(enemy.kind.as_str(), enemy.health, enemy.max_health),
+                    ENEMY_HEALTH_BAR_HEIGHT,
+                )),
+                ..default()
+            },
+            transform: Transform::from_xyz(
+                enemy.x,
+                enemy.y + enemy_size(enemy.kind.as_str()) + ENEMY_HEALTH_BAR_OFFSET_Y,
+                ENEMY_HEALTH_BAR_Z,
+            ),
+            ..default()
+        },
+        EnemyHealthBarActor {
+            enemy_id: enemy.id.clone(),
+        },
+    ));
+}
+
+fn spawn_combat_popup(commands: &mut Commands, text: String, x: f32, y: f32, color: Color) {
+    commands.spawn((
+        Text2dBundle {
+            text: Text::from_section(
+                text,
+                TextStyle {
+                    font_size: 17.0,
+                    color,
+                    ..default()
+                },
+            ),
+            text_anchor: bevy::sprite::Anchor::BottomCenter,
+            transform: Transform::from_xyz(x, y, COMBAT_POPUP_Z),
+            ..default()
+        },
+        CombatPopupActor {
+            ttl: COMBAT_POPUP_TTL_SECONDS,
+            max_ttl: COMBAT_POPUP_TTL_SECONDS,
+            rise_speed: COMBAT_POPUP_RISE_SPEED,
+            base_color: color,
         },
     ));
 }
