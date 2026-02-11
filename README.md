@@ -1,44 +1,58 @@
-# Ralph Island Multiplayer Skeleton
+# Ralph Island Multiplayer Foundation
 
-A production-oriented starter for a large multiplayer browser game:
+A production-grade skeleton for a large co-op browser game:
 
 - Frontend: Vite + React + Tailwind + TanStack Router
-- Game client: Rust + Bevy compiled to WASM
-- Multiplayer backend: Cloudflare Worker + Durable Objects + SQLite storage
+- Auth: Clerk
+- Game client: Rust + Bevy (WASM)
+- Shared simulation: Rust `sim-core` (WASM in DO + native crate in Bevy)
+- Multiplayer backend: Cloudflare Worker + Durable Objects + SQLite
 - Transport: WebSockets
-- Hosting target: `will.ralph-island.com`
+- Domain target: `will.ralph-island.com`
 
-## Current Scope
+## What is implemented now
 
-- Connect to a room code (`/`)
-- Join shared world (`/room/:roomCode`)
-- Move with WASD/arrow keys
-- See all connected players in the same room
-- Room state persisted in Durable Object SQLite storage (`players` table)
+- Room-based multiplayer (`/room/:roomCode`)
+- Server-authoritative simulation loop in Durable Objects
+- Rust `sim-core` executes authoritative movement/projectile integration in DO
+- Deterministic fixed simulation tick (`60Hz`) + snapshot stream (`20Hz`)
+- Client prediction + local reconciliation pipeline for movement
+- Snapshot interpolation buffer for smoother remote rendering
+- Authoritative structures and projectiles
+- Protocol v2 envelopes with command acks + ping/pong latency tracking
 
-## Architecture
+## Runtime architecture
 
-### Browser
+### Durable Object (authority)
 
-1. React route `/room/:roomCode` boots Bevy WASM in a `<canvas>`.
-2. Browser opens `ws(s)://<host>/api/rooms/:roomCode/ws?playerId=<stable-id>`.
-3. Worker Durable Object sends snapshots of connected players.
-4. React forwards snapshots into Rust (`push_snapshot`).
-5. Rust emits local movement events (`drain_move_events`) which are sent back to Worker.
+- One room code => one `RoomDurableObject`
+- Fixed-step simulation loop in `worker/src/index.ts`
+- Feature modules:
+  - `presence`
+  - `movement`
+  - `build`
+  - `projectile`
+- Per-feature SQLite migrations via `worker/src/framework/migrations.ts`
+- Shared Rust simulation runtime loaded in Worker from `worker/src/sim-core/sim_core.wasm`
 
-### Cloudflare Durable Object
+### Browser client
 
-- One DO instance per room code (`idFromName(roomCode)`)
-- SQLite table in DO storage:
-  - `player_id` (PK)
-  - `x`, `y`
-  - `connected`
-  - `updated_at`
-- On connect/move/close:
-  - writes are persisted in SQLite
-  - snapshot broadcasts to all room sockets
+- `src/game/network-client.ts`: protocol transport and command sending
+- `src/game/netcode/replication.ts`: clock sync + interpolation buffering
+- `src/routes/room-route.tsx`: room session orchestration, pumps input/render data
+- `src/game/bridge.ts`: JS <-> Bevy WASM bridge
 
-## Prerequisites
+### Bevy WASM
+
+- `game-client/src/lib.rs`
+- Uses `sim-core` crate directly for deterministic movement stepping parity
+- Local fixed-step simulation and sequenced input emission
+- Authoritative correction + replay of unacked input history
+- Remote smoothing + rendering of structures/projectiles
+
+## Development
+
+### Prerequisites
 
 - Node.js 20+
 - Rust toolchain
@@ -53,7 +67,17 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 ```
 
-## Local Development
+### Env setup
+
+```bash
+cp .env.example .env
+```
+
+Set at least:
+
+- `VITE_CLERK_PUBLISHABLE_KEY`
+
+### Run locally
 
 Install deps:
 
@@ -61,11 +85,13 @@ Install deps:
 npm install
 ```
 
-Run Worker (terminal 1):
+Run worker (terminal 1):
 
 ```bash
 npm run worker:dev
 ```
+
+(`worker:dev` builds `sim-core` WASM first.)
 
 Run frontend (terminal 2):
 
@@ -73,27 +99,22 @@ Run frontend (terminal 2):
 npm run dev
 ```
 
-Open the Vite URL from terminal 2. Use the same room code in multiple tabs.
-
 ## Build
 
 ```bash
 npm run build
 ```
 
-This runs:
+This builds Bevy WASM first, then the web app.
 
-1. Rust WASM build (`wasm-pack` into `src/game/wasm`)
-2. TypeScript + Vite web build into `dist/`
+## Deploy
 
-## Deploy To Cloudflare
-
-`worker/wrangler.toml` is already configured with:
+`worker/wrangler.toml` is configured for:
 
 - Durable Object binding `ROOMS`
-- SQLite migration (`new_sqlite_classes = ["RoomDurableObject"]`)
-- static assets from `../dist`
-- custom domain route: `will.ralph-island.com/*`
+- SQLite DO class migration
+- Static assets from `dist/`
+- custom domain route for `will.ralph-island.com`
 
 Deploy:
 
@@ -101,12 +122,7 @@ Deploy:
 npm run deploy
 ```
 
-## Notes On Server Runtime Choice
+## Notes
 
-You asked about running Rust inside Durable Objects and using Bevy ECS server-side. That is possible later with a dedicated Rust/WASM server module (for example using `bevy_ecs` only), but for this skeleton the DO authoritative loop is TypeScript for fastest iteration and simplest Cloudflare deployment path.
-
-## Project Layout
-
-- `src/` React app + WASM bridge
-- `game-client/` Rust Bevy game crate
-- `worker/` Cloudflare Worker + Durable Object backend
+- This rewrite is server-authoritative and netcode-focused so gameplay systems can be added safely.
+- Architecture details: `docs/networking-architecture.md`.

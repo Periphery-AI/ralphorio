@@ -2,19 +2,30 @@ use bevy::prelude::*;
 use bevy::window::WindowResolution;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sim_core::{movement_step, InputState as CoreInputState};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 const TILE_SIZE: f32 = 32.0;
 const PLAYER_SIZE: f32 = 22.0;
+const STRUCTURE_SIZE: f32 = 18.0;
+const PROJECTILE_SIZE: f32 = 8.0;
+const MAP_LIMIT: f32 = 5000.0;
 const MOVE_SPEED: f32 = 220.0;
-const REMOTE_LERP_RATE: f32 = 16.0;
+const CLIENT_SIM_HZ: f32 = 60.0;
+const CLIENT_SIM_DT: f32 = 1.0 / CLIENT_SIM_HZ;
+const MAX_SIM_STEPS_PER_FRAME: usize = 8;
+const MAX_INPUT_HISTORY: usize = 512;
+const MAX_OUTBOUND_INPUTS: usize = 256;
+const REMOTE_LERP_RATE: f32 = 18.0;
 const SNAPSHOT_Z: f32 = 4.0;
+const STRUCTURE_Z: f32 = 3.0;
+const PROJECTILE_Z: f32 = 5.0;
 const FLOOR_Z: f32 = 0.0;
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static OUTBOUND_MOVES: Lazy<Mutex<Vec<MoveEvent>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static NEXT_PLAYER_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static STARTED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
@@ -23,18 +34,70 @@ struct PlayerState {
     id: String,
     x: f32,
     y: f32,
+    vx: f32,
+    vy: f32,
     connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotPayload {
-    players: Vec<PlayerState>,
+struct StructureState {
+    id: String,
+    x: f32,
+    y: f32,
+    kind: String,
+    #[serde(rename = "ownerId")]
+    owner_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MoveEvent {
+struct ProjectileState {
+    id: String,
     x: f32,
     y: f32,
+    vx: f32,
+    vy: f32,
+    #[serde(rename = "ownerId")]
+    owner_id: String,
+    #[serde(rename = "clientProjectileId")]
+    client_projectile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotPayload {
+    #[serde(rename = "serverTick")]
+    server_tick: u32,
+    #[serde(rename = "simRateHz")]
+    sim_rate_hz: u32,
+    #[serde(rename = "localAckSeq")]
+    local_ack_seq: u32,
+    players: Vec<PlayerState>,
+    #[serde(default)]
+    structures: Vec<StructureState>,
+    #[serde(default)]
+    projectiles: Vec<ProjectileState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InputState {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InputCommand {
+    seq: u32,
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+#[derive(Clone)]
+struct InputHistoryEntry {
+    seq: u32,
+    state: InputState,
 }
 
 #[derive(Component)]
@@ -51,11 +114,33 @@ struct RemoteActor;
 #[derive(Component)]
 struct RemoteTarget(Vec2);
 
+#[derive(Component)]
+struct StructureActor {
+    id: String,
+}
+
+#[derive(Component)]
+struct ProjectileActor {
+    id: String,
+}
+
 #[derive(Resource, Default)]
 struct CurrentPlayerId(Option<String>);
 
 #[derive(Resource, Default)]
-struct LastSentPosition(Option<Vec2>);
+struct SimAccumulator(f32);
+
+#[derive(Resource)]
+struct NextInputSeq(u32);
+
+impl Default for NextInputSeq {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+#[derive(Resource, Default)]
+struct InputHistory(VecDeque<InputHistoryEntry>);
 
 #[wasm_bindgen]
 pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
@@ -79,7 +164,9 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::srgb_u8(3, 10, 22)))
         .insert_resource(CurrentPlayerId::default())
-        .insert_resource(LastSentPosition::default())
+        .insert_resource(SimAccumulator::default())
+        .insert_resource(NextInputSeq::default())
+        .insert_resource(InputHistory::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(primary_window),
             ..default()
@@ -89,12 +176,12 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
             Update,
             (
                 sync_player_id,
-                local_movement,
-                follow_camera,
+                simulate_local_player,
                 apply_latest_snapshot,
                 smooth_remote_motion,
-                emit_move_updates,
-            ),
+                follow_camera,
+            )
+                .chain(),
         );
 
     app.run();
@@ -117,8 +204,8 @@ pub fn push_snapshot(snapshot_json: String) -> Result<(), JsValue> {
         .lock()
         .map_err(|_| JsValue::from_str("snapshot queue mutex poisoned"))?;
     queue.push(snapshot);
-    if queue.len() > 8 {
-        let overflow = queue.len() - 8;
+    if queue.len() > 12 {
+        let overflow = queue.len() - 12;
         queue.drain(0..overflow);
     }
 
@@ -126,8 +213,8 @@ pub fn push_snapshot(snapshot_json: String) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn drain_move_events() -> String {
-    let mut queue = match OUTBOUND_MOVES.lock() {
+pub fn drain_input_events() -> String {
+    let mut queue = match OUTBOUND_INPUTS.lock() {
         Ok(queue) => queue,
         Err(_) => return "[]".to_string(),
     };
@@ -136,7 +223,7 @@ pub fn drain_move_events() -> String {
         return "[]".to_string();
     }
 
-    let drained: Vec<MoveEvent> = queue.drain(..).collect();
+    let drained: Vec<InputCommand> = queue.drain(..).collect();
     serde_json::to_string(&drained).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -198,58 +285,99 @@ fn sync_player_id(
     }
 }
 
-fn local_movement(
+fn sample_input_state(input: &ButtonInput<KeyCode>) -> InputState {
+    InputState {
+        up: input.pressed(KeyCode::KeyW) || input.pressed(KeyCode::ArrowUp),
+        down: input.pressed(KeyCode::KeyS) || input.pressed(KeyCode::ArrowDown),
+        left: input.pressed(KeyCode::KeyA) || input.pressed(KeyCode::ArrowLeft),
+        right: input.pressed(KeyCode::KeyD) || input.pressed(KeyCode::ArrowRight),
+    }
+}
+
+fn to_core_input(input: &InputState) -> CoreInputState {
+    CoreInputState {
+        up: input.up,
+        down: input.down,
+        left: input.left,
+        right: input.right,
+    }
+}
+
+fn simulate_local_player(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    mut accumulator: ResMut<SimAccumulator>,
+    mut next_input_seq: ResMut<NextInputSeq>,
+    mut input_history: ResMut<InputHistory>,
     mut local_transform_query: Query<&mut Transform, With<LocalActor>>,
 ) {
-    let mut direction = Vec2::ZERO;
-
-    if input.pressed(KeyCode::KeyW) || input.pressed(KeyCode::ArrowUp) {
-        direction.y += 1.0;
-    }
-    if input.pressed(KeyCode::KeyS) || input.pressed(KeyCode::ArrowDown) {
-        direction.y -= 1.0;
-    }
-    if input.pressed(KeyCode::KeyA) || input.pressed(KeyCode::ArrowLeft) {
-        direction.x -= 1.0;
-    }
-    if input.pressed(KeyCode::KeyD) || input.pressed(KeyCode::ArrowRight) {
-        direction.x += 1.0;
-    }
-
-    if direction == Vec2::ZERO {
-        return;
-    }
-
     let Ok(mut transform) = local_transform_query.get_single_mut() else {
         return;
     };
 
-    let delta = direction.normalize() * MOVE_SPEED * time.delta_seconds();
-    transform.translation.x += delta.x;
-    transform.translation.y += delta.y;
-}
+    accumulator.0 += time.delta_seconds();
+    let mut steps = 0;
 
-fn follow_camera(
-    local_transform_query: Query<&Transform, (With<LocalActor>, Without<Camera2d>)>,
-    mut camera_query: Query<&mut Transform, (With<Camera2d>, Without<LocalActor>)>,
-) {
-    let Ok(local_transform) = local_transform_query.get_single() else {
-        return;
-    };
-    let Ok(mut camera_transform) = camera_query.get_single_mut() else {
-        return;
-    };
+    while accumulator.0 >= CLIENT_SIM_DT && steps < MAX_SIM_STEPS_PER_FRAME {
+        accumulator.0 -= CLIENT_SIM_DT;
+        steps += 1;
 
-    camera_transform.translation.x = local_transform.translation.x;
-    camera_transform.translation.y = local_transform.translation.y;
+        let state = sample_input_state(&input);
+        let step = movement_step(
+            transform.translation.x,
+            transform.translation.y,
+            to_core_input(&state),
+            CLIENT_SIM_DT,
+            MOVE_SPEED,
+            MAP_LIMIT,
+        );
+        transform.translation.x = step.x;
+        transform.translation.y = step.y;
+
+        let seq = next_input_seq.0;
+        next_input_seq.0 = next_input_seq.0.saturating_add(1);
+
+        input_history.0.push_back(InputHistoryEntry {
+            seq,
+            state: state.clone(),
+        });
+
+        if input_history.0.len() > MAX_INPUT_HISTORY {
+            let overflow = input_history.0.len() - MAX_INPUT_HISTORY;
+            for _ in 0..overflow {
+                input_history.0.pop_front();
+            }
+        }
+
+        if let Ok(mut outbound) = OUTBOUND_INPUTS.lock() {
+            outbound.push(InputCommand {
+                seq,
+                up: state.up,
+                down: state.down,
+                left: state.left,
+                right: state.right,
+            });
+
+            if outbound.len() > MAX_OUTBOUND_INPUTS {
+                let overflow = outbound.len() - MAX_OUTBOUND_INPUTS;
+                outbound.drain(0..overflow);
+            }
+        }
+    }
+
+    if steps == MAX_SIM_STEPS_PER_FRAME && accumulator.0 >= CLIENT_SIM_DT {
+        accumulator.0 = 0.0;
+    }
 }
 
 fn apply_latest_snapshot(
     mut commands: Commands,
     current_player_id: Res<CurrentPlayerId>,
+    mut input_history: ResMut<InputHistory>,
+    mut local_query: Query<(&mut Transform, &mut Actor), (With<LocalActor>, Without<RemoteActor>)>,
     remote_query: Query<(Entity, &Actor), (With<RemoteActor>, Without<LocalActor>)>,
+    structure_query: Query<(Entity, &StructureActor)>,
+    projectile_query: Query<(Entity, &ProjectileActor)>,
 ) {
     let latest_snapshot = {
         let mut queue = match INBOUND_SNAPSHOTS.lock() {
@@ -280,6 +408,16 @@ fn apply_latest_snapshot(
             .is_some_and(|player_id| player_id == player.id);
 
         if is_local {
+            if let Ok((mut local_transform, mut local_actor)) = local_query.get_single_mut() {
+                local_actor.id = player.id.clone();
+                reconcile_local_transform(
+                    &mut local_transform,
+                    Vec2::new(player.x, player.y),
+                    snapshot.local_ack_seq,
+                    &mut input_history,
+                );
+            }
+
             if let Some(entity) = remote_entities.remove(&player.id) {
                 commands.entity(entity).despawn_recursive();
             }
@@ -299,6 +437,76 @@ fn apply_latest_snapshot(
     for entity in remote_entities.values() {
         commands.entity(*entity).despawn_recursive();
     }
+
+    let mut structure_entities: HashMap<String, Entity> = structure_query
+        .iter()
+        .map(|(entity, structure)| (structure.id.clone(), entity))
+        .collect();
+
+    for structure in snapshot.structures {
+        if let Some(entity) = structure_entities.remove(&structure.id) {
+            commands
+                .entity(entity)
+                .insert(Transform::from_xyz(structure.x, structure.y, STRUCTURE_Z));
+        } else {
+            spawn_structure_actor(&mut commands, &structure);
+        }
+    }
+
+    for entity in structure_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+
+    let mut projectile_entities: HashMap<String, Entity> = projectile_query
+        .iter()
+        .map(|(entity, projectile)| (projectile.id.clone(), entity))
+        .collect();
+
+    for projectile in snapshot.projectiles {
+        if let Some(entity) = projectile_entities.remove(&projectile.id) {
+            commands
+                .entity(entity)
+                .insert(Transform::from_xyz(projectile.x, projectile.y, PROJECTILE_Z));
+        } else {
+            spawn_projectile_actor(&mut commands, &projectile);
+        }
+    }
+
+    for entity in projectile_entities.values() {
+        commands.entity(*entity).despawn_recursive();
+    }
+}
+
+fn reconcile_local_transform(
+    local_transform: &mut Transform,
+    authoritative_position: Vec2,
+    local_ack_seq: u32,
+    input_history: &mut InputHistory,
+) {
+    while input_history
+        .0
+        .front()
+        .is_some_and(|entry| entry.seq <= local_ack_seq)
+    {
+        input_history.0.pop_front();
+    }
+
+    let mut replay_position = authoritative_position;
+    for entry in input_history.0.iter() {
+        let step = movement_step(
+            replay_position.x,
+            replay_position.y,
+            to_core_input(&entry.state),
+            CLIENT_SIM_DT,
+            MOVE_SPEED,
+            MAP_LIMIT,
+        );
+        replay_position.x = step.x;
+        replay_position.y = step.y;
+    }
+
+    local_transform.translation.x = replay_position.x;
+    local_transform.translation.y = replay_position.y;
 }
 
 fn smooth_remote_motion(
@@ -316,36 +524,19 @@ fn smooth_remote_motion(
     }
 }
 
-fn emit_move_updates(
-    mut last_sent_position: ResMut<LastSentPosition>,
-    local_transform_query: Query<&Transform, With<LocalActor>>,
+fn follow_camera(
+    local_transform_query: Query<&Transform, (With<LocalActor>, Without<Camera2d>)>,
+    mut camera_query: Query<&mut Transform, (With<Camera2d>, Without<LocalActor>)>,
 ) {
     let Ok(local_transform) = local_transform_query.get_single() else {
         return;
     };
-
-    let current_position = local_transform.translation.truncate();
-    let should_send = last_sent_position
-        .0
-        .is_none_or(|last| last.distance_squared(current_position) > 0.01);
-
-    if !should_send {
+    let Ok(mut camera_transform) = camera_query.get_single_mut() else {
         return;
-    }
+    };
 
-    last_sent_position.0 = Some(current_position);
-
-    if let Ok(mut queue) = OUTBOUND_MOVES.lock() {
-        queue.push(MoveEvent {
-            x: current_position.x,
-            y: current_position.y,
-        });
-
-        if queue.len() > 64 {
-            let overflow = queue.len() - 64;
-            queue.drain(0..overflow);
-        }
-    }
+    camera_transform.translation.x = local_transform.translation.x;
+    camera_transform.translation.y = local_transform.translation.y;
 }
 
 fn spawn_remote_actor(commands: &mut Commands, player: &PlayerState) {
@@ -364,5 +555,46 @@ fn spawn_remote_actor(commands: &mut Commands, player: &PlayerState) {
         },
         RemoteActor,
         RemoteTarget(Vec2::new(player.x, player.y)),
+    ));
+}
+
+fn spawn_structure_actor(commands: &mut Commands, structure: &StructureState) {
+    let color = match structure.kind.as_str() {
+        "beacon" => Color::srgb_u8(99, 210, 255),
+        "miner" => Color::srgb_u8(167, 139, 250),
+        "assembler" => Color::srgb_u8(74, 222, 128),
+        _ => Color::srgb_u8(255, 255, 255),
+    };
+
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color,
+                custom_size: Some(Vec2::splat(STRUCTURE_SIZE)),
+                ..default()
+            },
+            transform: Transform::from_xyz(structure.x, structure.y, STRUCTURE_Z),
+            ..default()
+        },
+        StructureActor {
+            id: structure.id.clone(),
+        },
+    ));
+}
+
+fn spawn_projectile_actor(commands: &mut Commands, projectile: &ProjectileState) {
+    commands.spawn((
+        SpriteBundle {
+            sprite: Sprite {
+                color: Color::srgb_u8(248, 250, 134),
+                custom_size: Some(Vec2::splat(PROJECTILE_SIZE)),
+                ..default()
+            },
+            transform: Transform::from_xyz(projectile.x, projectile.y, PROJECTILE_Z),
+            ..default()
+        },
+        ProjectileActor {
+            id: projectile.id.clone(),
+        },
     ));
 }

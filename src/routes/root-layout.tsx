@@ -8,7 +8,7 @@ export function RootLayout() {
 
   if (isRoomRoute) {
     return (
-      <div className="h-screen overflow-hidden bg-[#04070c] text-white">
+      <div className="h-dvh min-h-0 overflow-hidden bg-[#04070c] text-white">
         <Outlet />
       </div>
     );

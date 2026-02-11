@@ -1,9 +1,9 @@
-import type { MoveEvent, PlayerState } from './types';
+import type { InputCommand, RenderSnapshotPayload } from './types';
 import init, {
   boot_game,
   set_player_id,
   push_snapshot,
-  drain_move_events,
+  drain_input_events,
 } from './wasm/client';
 
 let booted = false;
@@ -47,19 +47,19 @@ export async function setPlayerId(playerId: string) {
   set_player_id(playerId);
 }
 
-export async function pushSnapshot(players: PlayerState[]) {
+export async function pushRenderSnapshot(payload: RenderSnapshotPayload) {
   await initialize();
-  push_snapshot(JSON.stringify({ players }));
+  push_snapshot(JSON.stringify(payload));
 }
 
-export async function drainMoveEvents() {
+export async function drainInputCommands() {
   await initialize();
 
   try {
-    const raw = drain_move_events();
-    return JSON.parse(raw) as MoveEvent[];
+    const raw = drain_input_events();
+    return JSON.parse(raw) as InputCommand[];
   } catch (error) {
-    console.error('Failed to parse move events from WASM.', error);
+    console.error('Failed to parse input commands from WASM.', error);
     return [];
   }
 }

@@ -10,8 +10,10 @@
     "build:web": "tsc -b && vite build",
     "wasm:build": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --release",
     "wasm:build:dev": "wasm-pack build game-client --target web --out-dir ../src/game/wasm --out-name client --dev",
-    "worker:dev": "wrangler dev --config worker/wrangler.toml",
-    "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
+    "sim:build:worker": "cargo build --manifest-path sim-core/Cargo.toml --target wasm32-unknown-unknown --release && mkdir -p worker/src/sim-core && cp sim-core/target/wasm32-unknown-unknown/release/sim_core.wasm worker/src/sim-core/sim_core.wasm",
+    "worker:dev": "npm-run-all sim:build:worker worker:dev:raw",
+    "worker:dev:raw": "wrangler dev --config worker/wrangler.toml",
+    "deploy": "npm run build && npm run sim:build:worker && wrangler deploy --config worker/wrangler.toml",
     "lint": "eslint .",
     "preview": "vite preview"
   },

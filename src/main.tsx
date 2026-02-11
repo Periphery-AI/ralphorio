@@ -6,7 +6,8 @@ import { router } from './router';
 import './index.css';
 
 const rootElement = document.getElementById('root');
-const publishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+const env = import.meta.env as Record<string, string | undefined>;
+const publishableKey = env.VITE_CLERK_PUBLISHABLE_KEY ?? env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 if (!rootElement) {
   throw new Error('Root element #root was not found.');
@@ -27,7 +28,7 @@ if (!publishableKey) {
     </StrictMode>,
   );
 } else {
-createRoot(rootElement).render(
+  createRoot(rootElement).render(
     <StrictMode>
       <ClerkProvider publishableKey={publishableKey} afterSignOutUrl="/">
         <RouterProvider router={router} />

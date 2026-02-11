@@ -11,11 +11,16 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
 src/game/wasm/*
 !src/game/wasm/.gitkeep
 worker/.wrangler
+worker/.dev.vars
 
 game-client/target/*
+sim-core/target/*
 
 # Editor directories and files
 .vscode/*
@@ -27,4 +32,3 @@ game-client/target/*
 *.njsproj
 *.sln
 *.sw?
-
