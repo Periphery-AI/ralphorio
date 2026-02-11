@@ -87,4 +87,12 @@ Entry format:
 - decisions: Kept the existing combat/materialization architecture and inserted a minimal `connected_at` readiness gate instead of rewriting enemy AI/spawn subsystems; enemies now only spawn/aggro for combat-ready players after a 75s grace window. Tightened beacon placement progression by requiring `gear` in addition to plates while preserving existing miner/assembler costs and replication rules.
 - files: worker/src/lib.rs, ralph/progress.txt
 - validation: cargo test --manifest-path worker/Cargo.toml (pass, 27 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass)
+- commit: 6a487b7
+
+- timestamp: 2026-02-11
+- item: RLP2-105
+- summary: Completed the progression-clarity polish slice by adding server-authored gameplay objectives (gather -> smelt -> craft -> build -> fight -> expand) with warmup countdown, wiring that feature through strict snapshot parsing into a dedicated in-room Goals HUD panel, and retuning enemy warmup to 120s so first combat pressure lands after players establish starter flow.
+- decisions: Built directly on existing authoritative inventory/crafting/build/combat runtime state and snapshot protocol; no subsystem rewrites. Added objective derivation in worker snapshots rather than client-only heuristics so goals stay consistent with authoritative state and malformed payload checks remain strict end-to-end.
+- files: worker/src/lib.rs, src/game/types.ts, src/game/network-client.ts, src/game/netcode/replication.ts, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: cargo test --manifest-path worker/Cargo.toml (pass, 29 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass); npm run lint (pass)
 - commit: pending

@@ -29,6 +29,7 @@ type DropSnapshot = NonNullable<SnapshotFeatures['drops']>;
 type CraftingSnapshot = NonNullable<SnapshotFeatures['crafting']>;
 type CombatSnapshot = NonNullable<SnapshotFeatures['combat']>;
 type CharacterSnapshot = NonNullable<SnapshotFeatures['character']>;
+type ProgressionSnapshot = NonNullable<SnapshotFeatures['progression']>;
 
 const MAX_SNAPSHOT_LIST_ITEMS = 4096;
 const protocolFeatureSet = new Set<string>(PROTOCOL_FEATURES);
@@ -744,6 +745,57 @@ function parseCharacterSnapshot(payload: unknown): CharacterSnapshot | null {
   };
 }
 
+function parseProgressionObjective(payload: unknown) {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  if (
+    typeof payload.id !== 'string' ||
+    typeof payload.label !== 'string' ||
+    !isNonNegativeInteger(payload.current) ||
+    !isPositiveInteger(payload.target) ||
+    typeof payload.done !== 'boolean'
+  ) {
+    return null;
+  }
+
+  return {
+    id: payload.id,
+    label: payload.label,
+    current: payload.current,
+    target: payload.target,
+    done: payload.done,
+  };
+}
+
+function parseProgressionSnapshot(payload: unknown): ProgressionSnapshot | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const objectives = parseArray(payload.objectives, parseProgressionObjective, 32);
+  if (
+    !isPositiveInteger(payload.schemaVersion) ||
+    typeof payload.stage !== 'string' ||
+    typeof payload.nextHint !== 'string' ||
+    typeof payload.combatReady !== 'boolean' ||
+    !isNonNegativeInteger(payload.combatReadyInMs) ||
+    !objectives
+  ) {
+    return null;
+  }
+
+  return {
+    schemaVersion: payload.schemaVersion,
+    stage: payload.stage,
+    nextHint: payload.nextHint,
+    combatReady: payload.combatReady,
+    combatReadyInMs: payload.combatReadyInMs,
+    objectives,
+  };
+}
+
 function parseServerEnvelope(raw: string): ServerEnvelope | null {
   let parsed: unknown;
   try {
@@ -918,6 +970,14 @@ function parseRoomSnapshot(payload: unknown): RoomSnapshot | null {
       return null;
     }
     features.character = character;
+  }
+
+  if ('progression' in rawFeatures) {
+    const progression = parseProgressionSnapshot(rawFeatures.progression);
+    if (!progression) {
+      return null;
+    }
+    features.progression = progression;
   }
 
   return {

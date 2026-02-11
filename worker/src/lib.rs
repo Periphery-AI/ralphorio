@@ -62,7 +62,7 @@ const ENEMY_MOVE_SPEED: f32 = 86.0;
 const ENEMY_ATTACK_COOLDOWN_TICKS: u64 = 24;
 const ENEMY_SPAWN_MODULUS: u64 = 997;
 const ENEMY_SPAWN_THRESHOLD: u64 = 7;
-const ENEMY_SPAWN_GRACE_MS: i64 = 75_000;
+const ENEMY_SPAWN_GRACE_MS: i64 = 120_000;
 const ENEMY_SPAWN_SALT: u64 = 0x6d13_ef42_2dd9_1f7a;
 const ENEMY_KIND_BITER: &str = "biter";
 const ENEMY_MAX_HEALTH: u16 = 64;
@@ -109,10 +109,15 @@ const MAX_PROTOCOL_IDENTIFIER_LEN: usize = 64;
 const MAX_CHARACTER_NAME_LEN: usize = 32;
 const MAX_CHARACTER_PROFILE_SLOTS: usize = 8;
 
-const BUILD_COST_BEACON: [(&str, u32); 3] =
-    [("iron_plate", 4), ("copper_plate", 2), ("gear", 1)];
+const BUILD_COST_BEACON: [(&str, u32); 3] = [("iron_plate", 4), ("copper_plate", 2), ("gear", 1)];
 const BUILD_COST_MINER: [(&str, u32); 2] = [("iron_plate", 3), ("gear", 2)];
 const BUILD_COST_ASSEMBLER: [(&str, u32); 2] = [("iron_plate", 9), ("gear", 5)];
+
+const OBJECTIVE_TARGET_IRON_ORE: u32 = 8;
+const OBJECTIVE_TARGET_COPPER_ORE: u32 = 4;
+const OBJECTIVE_TARGET_IRON_PLATE: u32 = 6;
+const OBJECTIVE_TARGET_COPPER_PLATE: u32 = 2;
+const OBJECTIVE_TARGET_GEAR: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -433,6 +438,7 @@ struct RuntimePlayerState {
     connected: bool,
     connected_at: i64,
     last_seen: i64,
+    enemy_kill_count: u32,
     last_preview_cmd_at: i64,
     last_place_cmd_at: i64,
     last_projectile_fire_at: i64,
@@ -997,6 +1003,264 @@ struct RoomRuntimeState {
     enemies: HashMap<String, RuntimeEnemyState>,
     combat_players: HashMap<String, RuntimePlayerCombatState>,
     craft_queues: HashMap<String, RuntimeCraftQueueState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressionObjectiveState {
+    id: &'static str,
+    label: &'static str,
+    current: u32,
+    target: u32,
+    done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressionSnapshotState {
+    stage: &'static str,
+    next_hint: String,
+    combat_ready: bool,
+    combat_ready_in_ms: i64,
+    objectives: Vec<ProgressionObjectiveState>,
+}
+
+fn inventory_resource_total(inventory: Option<&RuntimeInventoryState>, resource: &str) -> u32 {
+    inventory.map_or(0, |inventory| {
+        inventory
+            .slots
+            .iter()
+            .flatten()
+            .filter(|stack| stack.resource == resource)
+            .map(|stack| stack.amount)
+            .sum()
+    })
+}
+
+fn progression_objective(
+    id: &'static str,
+    label: &'static str,
+    current: u32,
+    target: u32,
+) -> ProgressionObjectiveState {
+    ProgressionObjectiveState {
+        id,
+        label,
+        current,
+        target,
+        done: current >= target,
+    }
+}
+
+fn build_progression_snapshot(
+    runtime: &RoomRuntimeState,
+    player_id: &str,
+    now: i64,
+) -> ProgressionSnapshotState {
+    let inventory = runtime.inventories.get(player_id);
+    let iron_ore = inventory_resource_total(inventory, "iron_ore");
+    let copper_ore = inventory_resource_total(inventory, "copper_ore");
+    let iron_plate = inventory_resource_total(inventory, "iron_plate");
+    let copper_plate = inventory_resource_total(inventory, "copper_plate");
+    let gear = inventory_resource_total(inventory, "gear");
+
+    let mut owned_structure_count = 0u32;
+    let mut owned_miner_count = 0u32;
+    let mut owned_assembler_count = 0u32;
+    for structure in runtime
+        .structures
+        .values()
+        .filter(|structure| structure.owner_id == player_id)
+    {
+        owned_structure_count = owned_structure_count.saturating_add(1);
+        if structure.kind == "miner" {
+            owned_miner_count = owned_miner_count.saturating_add(1);
+        } else if structure.kind == "assembler" {
+            owned_assembler_count = owned_assembler_count.saturating_add(1);
+        }
+    }
+
+    let player = runtime.players.get(player_id);
+    let combat_ready_in_ms = player.map_or(0, |player| {
+        (ENEMY_SPAWN_GRACE_MS - now.saturating_sub(player.connected_at)).max(0)
+    });
+    let combat_ready = player.is_some_and(|player| player.connected) && combat_ready_in_ms == 0;
+    let enemy_kill_count = player.map_or(0, |player| player.enemy_kill_count);
+
+    if iron_ore < OBJECTIVE_TARGET_IRON_ORE || copper_ore < OBJECTIVE_TARGET_COPPER_ORE {
+        return ProgressionSnapshotState {
+            stage: "gather",
+            next_hint: "Mine nearby iron and copper nodes to stockpile starter materials."
+                .to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![
+                progression_objective(
+                    "mine_iron_ore",
+                    "Mine iron ore",
+                    iron_ore,
+                    OBJECTIVE_TARGET_IRON_ORE,
+                ),
+                progression_objective(
+                    "mine_copper_ore",
+                    "Mine copper ore",
+                    copper_ore,
+                    OBJECTIVE_TARGET_COPPER_ORE,
+                ),
+            ],
+        };
+    }
+
+    if iron_plate < OBJECTIVE_TARGET_IRON_PLATE || copper_plate < OBJECTIVE_TARGET_COPPER_PLATE {
+        return ProgressionSnapshotState {
+            stage: "smelt",
+            next_hint: "Press 1/2 to smelt ore into plates for your first structure.".to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![
+                progression_objective(
+                    "smelt_iron_plate",
+                    "Smelt iron plates",
+                    iron_plate,
+                    OBJECTIVE_TARGET_IRON_PLATE,
+                ),
+                progression_objective(
+                    "smelt_copper_plate",
+                    "Smelt copper plates",
+                    copper_plate,
+                    OBJECTIVE_TARGET_COPPER_PLATE,
+                ),
+            ],
+        };
+    }
+
+    if gear < OBJECTIVE_TARGET_GEAR {
+        return ProgressionSnapshotState {
+            stage: "craft",
+            next_hint: "Press 3 to craft a gear, then enter build mode with Q.".to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "craft_gear",
+                "Craft a gear",
+                gear,
+                OBJECTIVE_TARGET_GEAR,
+            )],
+        };
+    }
+
+    if owned_structure_count == 0 {
+        return ProgressionSnapshotState {
+            stage: "build",
+            next_hint: "Place your first beacon to claim space and unlock expansion goals."
+                .to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "place_first_structure",
+                "Place first structure",
+                owned_structure_count,
+                1,
+            )],
+        };
+    }
+
+    if !combat_ready {
+        let seconds_remaining = ((combat_ready_in_ms + 999) / 1_000).max(0);
+        return ProgressionSnapshotState {
+            stage: "fortify",
+            next_hint: format!("Enemies wake in {seconds_remaining}s. Keep mining and crafting."),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "survive_enemy_warmup",
+                "Survive enemy warmup",
+                u32::from(combat_ready),
+                1,
+            )],
+        };
+    }
+
+    if enemy_kill_count == 0 {
+        return ProgressionSnapshotState {
+            stage: "fight",
+            next_hint: "Use Space to shoot biters and secure your first kill.".to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "defeat_first_biter",
+                "Defeat first biter",
+                enemy_kill_count,
+                1,
+            )],
+        };
+    }
+
+    if owned_miner_count == 0 {
+        return ProgressionSnapshotState {
+            stage: "expand",
+            next_hint: "Craft and place a miner to expand your base footprint.".to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "place_miner",
+                "Place a miner",
+                owned_miner_count,
+                1,
+            )],
+        };
+    }
+
+    if owned_assembler_count == 0 {
+        return ProgressionSnapshotState {
+            stage: "expand",
+            next_hint: "Craft and place an assembler to finish the starter base loop.".to_string(),
+            combat_ready,
+            combat_ready_in_ms,
+            objectives: vec![progression_objective(
+                "place_assembler",
+                "Place an assembler",
+                owned_assembler_count,
+                1,
+            )],
+        };
+    }
+
+    ProgressionSnapshotState {
+        stage: "expand",
+        next_hint: "Maintain defenses, gather resources, and keep expanding together.".to_string(),
+        combat_ready,
+        combat_ready_in_ms,
+        objectives: vec![progression_objective(
+            "starter_base_established",
+            "Starter base established",
+            1,
+            1,
+        )],
+    }
+}
+
+fn progression_snapshot_to_json(progression: &ProgressionSnapshotState) -> Value {
+    let objectives: Vec<Value> = progression
+        .objectives
+        .iter()
+        .map(|objective| {
+            json!({
+                "id": objective.id,
+                "label": objective.label,
+                "current": objective.current,
+                "target": objective.target,
+                "done": objective.done,
+            })
+        })
+        .collect();
+
+    json!({
+        "schemaVersion": GAMEPLAY_SCHEMA_VERSION,
+        "stage": progression.stage,
+        "nextHint": progression.next_hint,
+        "combatReady": progression.combat_ready,
+        "combatReadyInMs": progression.combat_ready_in_ms,
+        "objectives": objectives,
+    })
 }
 
 fn now_ms() -> i64 {
@@ -1737,6 +2001,7 @@ impl RoomDurableObject {
             connected: false,
             connected_at: now,
             last_seen: now,
+            enemy_kill_count: 0,
             last_preview_cmd_at: 0,
             last_place_cmd_at: 0,
             last_projectile_fire_at: 0,
@@ -1845,6 +2110,7 @@ impl RoomDurableObject {
                     connected: row.connected != 0,
                     connected_at: row.last_seen.max(0),
                     last_seen: row.last_seen.max(0),
+                    enemy_kill_count: 0,
                     last_preview_cmd_at: 0,
                     last_place_cmd_at: 0,
                     last_projectile_fire_at: 0,
@@ -4957,6 +5223,12 @@ impl RoomDurableObject {
                     continue;
                 }
 
+                if let Some(attacker_player_id) = attacker_player_id.as_deref() {
+                    if let Some(player) = runtime.players.get_mut(attacker_player_id) {
+                        player.enemy_kill_count = player.enemy_kill_count.saturating_add(1);
+                    }
+                }
+
                 let (drop_resource, drop_amount) =
                     enemy_drop_for_kind(defeated_enemy.kind.as_str());
                 drops_to_spawn.push((
@@ -5532,6 +5804,10 @@ impl RoomDurableObject {
             })
             .collect();
 
+        let progression_snapshot = recipient_player_id
+            .map(|player_id| build_progression_snapshot(&runtime, player_id, now))
+            .map(|progression| progression_snapshot_to_json(&progression));
+
         let include_presence = full || self.dirty_presence.get();
         let include_build = full || self.dirty_build.get();
         let include_projectiles = full || self.dirty_projectiles.get();
@@ -5544,6 +5820,7 @@ impl RoomDurableObject {
         let include_crafting = full || self.dirty_crafting.get();
         let include_combat = full || self.dirty_combat.get() || enemies_discovered;
         let include_character = full || self.dirty_presence.get();
+        let include_progression = progression_snapshot.is_some();
         let mut features = JsonMap::new();
 
         if include_presence {
@@ -5666,6 +5943,12 @@ impl RoomDurableObject {
                     "playerCount": connected_players.len(),
                 }),
             );
+        }
+
+        if include_progression {
+            if let Some(progression_snapshot) = progression_snapshot {
+                features.insert("progression".to_string(), progression_snapshot);
+            }
         }
 
         Ok(json!({
@@ -6440,6 +6723,7 @@ mod tests {
             connected: true,
             connected_at: 0,
             last_seen: 0,
+            enemy_kill_count: 0,
             last_preview_cmd_at: 0,
             last_place_cmd_at: 0,
             last_projectile_fire_at: 0,
@@ -6634,6 +6918,98 @@ mod tests {
             &player,
             1_000 + ENEMY_SPAWN_GRACE_MS + 500
         ));
+    }
+
+    #[test]
+    fn progression_snapshot_prioritizes_gather_stage_when_ore_is_missing() {
+        let mut runtime = RoomRuntimeState::default();
+        let mut player = RoomDurableObject::default_runtime_player(5_000);
+        player.connected = true;
+        runtime.players.insert("local".to_string(), player);
+
+        let progression = build_progression_snapshot(&runtime, "local", 6_000);
+        assert_eq!(progression.stage, "gather");
+        assert_eq!(progression.objectives.len(), 2);
+        assert_eq!(progression.objectives[0].id, "mine_iron_ore");
+        assert_eq!(progression.objectives[1].id, "mine_copper_ore");
+        assert!(!progression.objectives[0].done);
+        assert!(!progression.objectives[1].done);
+    }
+
+    #[test]
+    fn progression_snapshot_transitions_from_warmup_to_fight_and_expand() {
+        let player_id = "pilot";
+        let now = 300_000;
+        let mut runtime = RoomRuntimeState::default();
+
+        let mut player = RoomDurableObject::default_runtime_player(0);
+        player.connected = true;
+        player.connected_at = now - ENEMY_SPAWN_GRACE_MS + 15_000;
+        runtime.players.insert(player_id.to_string(), player);
+
+        let mut inventory = RuntimeInventoryState::new(DEFAULT_INVENTORY_MAX_SLOTS);
+        inventory
+            .add_resource("iron_ore", OBJECTIVE_TARGET_IRON_ORE)
+            .expect("seed iron ore");
+        inventory
+            .add_resource("copper_ore", OBJECTIVE_TARGET_COPPER_ORE)
+            .expect("seed copper ore");
+        inventory
+            .add_resource("iron_plate", OBJECTIVE_TARGET_IRON_PLATE)
+            .expect("seed iron plate");
+        inventory
+            .add_resource("copper_plate", OBJECTIVE_TARGET_COPPER_PLATE)
+            .expect("seed copper plate");
+        inventory
+            .add_resource("gear", OBJECTIVE_TARGET_GEAR)
+            .expect("seed gear");
+        runtime.inventories.insert(player_id.to_string(), inventory);
+
+        runtime.structures.insert(
+            "structure:beacon".to_string(),
+            RuntimeStructureState {
+                structure_id: "structure:beacon".to_string(),
+                owner_id: player_id.to_string(),
+                kind: "beacon".to_string(),
+                x: 0.0,
+                y: 0.0,
+                grid_x: 0,
+                grid_y: 0,
+                chunk_x: 0,
+                chunk_y: 0,
+                created_at: now - 1_000,
+            },
+        );
+
+        let warmup = build_progression_snapshot(&runtime, player_id, now);
+        assert_eq!(warmup.stage, "fortify");
+        assert!(!warmup.combat_ready);
+        assert!(warmup.combat_ready_in_ms > 0);
+
+        {
+            let player = runtime
+                .players
+                .get_mut(player_id)
+                .expect("runtime player should exist");
+            player.connected_at = now - ENEMY_SPAWN_GRACE_MS;
+        }
+        let fight = build_progression_snapshot(&runtime, player_id, now);
+        assert_eq!(fight.stage, "fight");
+        assert!(fight.combat_ready);
+        assert_eq!(fight.combat_ready_in_ms, 0);
+        assert_eq!(fight.objectives[0].id, "defeat_first_biter");
+        assert!(!fight.objectives[0].done);
+
+        {
+            let player = runtime
+                .players
+                .get_mut(player_id)
+                .expect("runtime player should exist");
+            player.enemy_kill_count = 1;
+        }
+        let expand = build_progression_snapshot(&runtime, player_id, now);
+        assert_eq!(expand.stage, "expand");
+        assert_eq!(expand.objectives[0].id, "place_miner");
     }
 
     #[test]

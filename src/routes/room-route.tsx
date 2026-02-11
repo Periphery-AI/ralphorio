@@ -265,7 +265,23 @@ type BuildPanelState = {
   reason: string | null;
 };
 
-type HudPanelState = 'inventory' | 'crafting' | 'build' | 'telemetry';
+type ProgressionObjectivePanelState = {
+  id: string;
+  label: string;
+  current: number;
+  target: number;
+  done: boolean;
+};
+
+type ProgressionPanelState = {
+  stage: string;
+  nextHint: string;
+  combatReady: boolean;
+  combatReadyInMs: number;
+  objectives: ProgressionObjectivePanelState[];
+};
+
+type HudPanelState = 'goals' | 'inventory' | 'crafting' | 'build' | 'telemetry';
 
 const EMPTY_INVENTORY_PANEL: InventoryPanelState = {
   maxSlots: 0,
@@ -275,6 +291,14 @@ const EMPTY_INVENTORY_PANEL: InventoryPanelState = {
 const EMPTY_CRAFTING_PANEL: CraftingPanelState = {
   active: null,
   pending: [],
+};
+
+const EMPTY_PROGRESSION_PANEL: ProgressionPanelState = {
+  stage: 'gather',
+  nextHint: 'Mine ore to start the progression loop.',
+  combatReady: false,
+  combatReadyInMs: 0,
+  objectives: [],
 };
 
 function titleCaseToken(token: string) {
@@ -321,10 +345,12 @@ export function RoomRoute() {
   const [interpDelayMs, setInterpDelayMs] = useState(DEFAULT_INTERP_DELAY_MS);
   const [inventoryPanel, setInventoryPanel] = useState<InventoryPanelState>(EMPTY_INVENTORY_PANEL);
   const [craftingPanel, setCraftingPanel] = useState<CraftingPanelState>(EMPTY_CRAFTING_PANEL);
+  const [progressionPanel, setProgressionPanel] =
+    useState<ProgressionPanelState>(EMPTY_PROGRESSION_PANEL);
   const [selectedBuildPanel, setSelectedBuildPanel] = useState<BuildPanelState | null>(null);
   const [buildPreviewCount, setBuildPreviewCount] = useState(0);
   const [isHudExpanded, setIsHudExpanded] = useState(true);
-  const [activeHudPanel, setActiveHudPanel] = useState<HudPanelState>('inventory');
+  const [activeHudPanel, setActiveHudPanel] = useState<HudPanelState>('goals');
 
   const socketRef = useRef<RoomSocket | null>(null);
   const replicationRef = useRef(new ReplicationPipeline());
@@ -374,10 +400,11 @@ export function RoomRoute() {
       setCombatFeed([]);
       setInventoryPanel(EMPTY_INVENTORY_PANEL);
       setCraftingPanel(EMPTY_CRAFTING_PANEL);
+      setProgressionPanel(EMPTY_PROGRESSION_PANEL);
       setSelectedBuildPanel(null);
       setBuildPreviewCount(0);
       setIsHudExpanded(true);
-      setActiveHudPanel('inventory');
+      setActiveHudPanel('goals');
       setConnectionStatus('Booting game...');
       await bootGame(CANVAS_ID);
       await resetSessionState();
@@ -435,6 +462,7 @@ export function RoomRoute() {
             const mining = snapshot.features.mining;
             const drops = snapshot.features.drops;
             const crafting = snapshot.features.crafting;
+            const progression = snapshot.features.progression;
 
             if (movement) {
               localPosRef.current = localPlayerPosition(movement.players, clientPlayerId);
@@ -508,6 +536,16 @@ export function RoomRoute() {
                   pending: localCraftQueue.pending.map((entry) => ({ ...entry })),
                 });
               }
+            }
+
+            if (progression) {
+              setProgressionPanel({
+                stage: progression.stage,
+                nextHint: progression.nextHint,
+                combatReady: progression.combatReady,
+                combatReadyInMs: progression.combatReadyInMs,
+                objectives: progression.objectives.map((objective) => ({ ...objective })),
+              });
             }
           },
           onAck: (seq) => {
@@ -661,6 +699,14 @@ export function RoomRoute() {
       : `${inventoryPanel.stacks.length}`;
   const activeCraftLabel = craftingPanel.active ? titleCaseToken(craftingPanel.active.recipe) : 'Idle';
   const queuedCraftCount = craftingPanel.pending.reduce((total, entry) => total + entry.count, 0);
+  const completedObjectiveCount = progressionPanel.objectives.filter((objective) => objective.done).length;
+  const activeObjective =
+    progressionPanel.objectives.find((objective) => !objective.done) ??
+    progressionPanel.objectives[0] ??
+    null;
+  const enemyWarmupLabel = progressionPanel.combatReady
+    ? 'Active'
+    : `${Math.max(0, Math.ceil(progressionPanel.combatReadyInMs / 1000))}s`;
 
   if (!isLoaded) {
     return (
@@ -707,6 +753,11 @@ export function RoomRoute() {
           <span className="hidden rounded-md border border-[#365479] bg-[#10203b]/88 px-3 py-1.5 text-[11px] uppercase tracking-[0.14em] text-[#c5dbff] xl:inline-flex">
             Hold Click mine | Q build | E pickup | Space shoot | 1/2/3 craft
           </span>
+          {activeObjective ? (
+            <span className="hidden rounded-md border border-[#3a5b80] bg-[#10213a]/90 px-3 py-1.5 text-[11px] text-[#cbe0ff] lg:inline-flex">
+              Goal: {activeObjective.label}
+            </span>
+          ) : null}
           <QuickMetric label="Ping" value={`${latencyMs}ms`} />
           <QuickMetric label="Online" value={activePlayers} />
           <button
@@ -752,6 +803,11 @@ export function RoomRoute() {
                   <OverlayPanelShell>
                     <div className="flex flex-wrap items-center gap-2">
                       <HudTabButton
+                        active={activeHudPanel === 'goals'}
+                        label={`Goals ${completedObjectiveCount}/${progressionPanel.objectives.length}`}
+                        onClick={() => setActiveHudPanel('goals')}
+                      />
+                      <HudTabButton
                         active={activeHudPanel === 'inventory'}
                         label={`Inventory ${inventoryItemCount}`}
                         onClick={() => setActiveHudPanel('inventory')}
@@ -780,6 +836,45 @@ export function RoomRoute() {
                       </button>
                     </div>
                   </OverlayPanelShell>
+
+                  {activeHudPanel === 'goals' ? (
+                    <OverlayPanel eyebrow="Authoritative" title="Session Objectives">
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                        <TelemetryMetric label="Stage" value={titleCaseToken(progressionPanel.stage)} />
+                        <TelemetryMetric
+                          label="Complete"
+                          value={`${completedObjectiveCount}/${progressionPanel.objectives.length}`}
+                        />
+                        <TelemetryMetric label="Enemy Warmup" value={enemyWarmupLabel} />
+                      </div>
+                      <div className="mt-2 rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5 text-xs text-[#cfe0ff]">
+                        <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Next Hint</p>
+                        <p className="mt-1">{progressionPanel.nextHint}</p>
+                      </div>
+                      <div className="mt-2 max-h-36 overflow-y-auto rounded-md border border-[#273f69] bg-[#081326]/86 p-2 text-xs text-[#d4e3ff]">
+                        {progressionPanel.objectives.length === 0 ? (
+                          <p className="text-[#8ea8d6]">Waiting for objective data...</p>
+                        ) : (
+                          <div className="space-y-1">
+                            {progressionPanel.objectives.map((objective) => (
+                              <div
+                                key={objective.id}
+                                className="flex items-center justify-between rounded border border-[#2a3f66] bg-[#0b162a]/84 px-2 py-1"
+                              >
+                                <span className={objective.done ? 'text-[#8be3bf]' : 'text-[#dbe9ff]'}>
+                                  {objective.done ? 'Completed: ' : 'Active: '}
+                                  {objective.label}
+                                </span>
+                                <span className="font-mono text-[#9ce7cf]">
+                                  {objective.current}/{objective.target}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </OverlayPanel>
+                  ) : null}
 
                   {activeHudPanel === 'inventory' ? (
                     <OverlayPanel eyebrow="Authoritative" title={`Inventory ${inventoryItemCount} items`}>

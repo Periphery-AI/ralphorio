@@ -145,6 +145,7 @@ export class ReplicationPipeline {
             crafting: snapshot.features.crafting ?? previous.features.crafting,
             combat: snapshot.features.combat ?? previous.features.combat,
             character: snapshot.features.character ?? previous.features.character,
+            progression: snapshot.features.progression ?? previous.features.progression,
           },
         }
       : snapshot;

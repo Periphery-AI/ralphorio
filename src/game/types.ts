@@ -214,6 +214,23 @@ export type CharacterSnapshot = {
   playerCount: number;
 };
 
+export type ProgressionObjective = {
+  id: string;
+  label: string;
+  current: number;
+  target: number;
+  done: boolean;
+};
+
+export type ProgressionSnapshot = {
+  schemaVersion: number;
+  stage: string;
+  nextHint: string;
+  combatReady: boolean;
+  combatReadyInMs: number;
+  objectives: ProgressionObjective[];
+};
+
 export type RoomSnapshot = {
   roomCode: string;
   serverTick: number;
@@ -233,6 +250,7 @@ export type RoomSnapshot = {
     crafting?: CraftingSnapshot;
     combat?: CombatSnapshot;
     character?: CharacterSnapshot;
+    progression?: ProgressionSnapshot;
   };
 };
 

@@ -80,7 +80,7 @@
         "Recipe costs and drop/mining yields avoid dead ends",
         "Player progression has clear short-term goals"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-106",
