@@ -75,7 +75,7 @@ CMD=(
   codex exec
   --model "$MODEL"
   --cd "$ROOT_DIR"
-  "${YOLO_FLAG[@]}"
+  "--yolo"
   --output-last-message "$LAST_MSG_FILE"
   "$PROMPT"
 )
