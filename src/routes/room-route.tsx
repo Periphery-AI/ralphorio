@@ -637,6 +637,8 @@ export function RoomRoute() {
           <span className="hud-pill">Click = Place (Build Mode)</span>
           <span className="hud-pill">E = Pickup</span>
           <span className="hud-pill">Space = Shoot</span>
+          <span className="hud-pill">1/2/3 = Craft</span>
+          <span className="hud-pill">X = Clear Craft</span>
           <MetricPill label="Tick" value={serverTick} />
           <MetricPill label="Sim" value={`${simRateHz}Hz`} />
           <MetricPill label="Snap" value={`${snapshotRateHz}Hz`} />
@@ -724,6 +726,13 @@ export function RoomRoute() {
                     ) : (
                       <p className="mt-1 text-[#8ea8d6]">Idle</p>
                     )}
+                  </div>
+                  <div className="mt-2 rounded-md border border-[#2f4976] bg-[#0a172b]/88 px-2 py-1.5 text-xs text-[#cfe0ff]">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-[#88a7de]">Hotkeys</p>
+                    <p className="mt-1">1: Iron Plate (1 Iron Ore)</p>
+                    <p>2: Copper Plate (1 Copper Ore)</p>
+                    <p>3: Gear (2 Iron Plate)</p>
+                    <p className="text-[#9ec6ff]">X: Clear crafting queue</p>
                   </div>
                   <div className="mt-2 max-h-32 overflow-y-auto rounded-md border border-[#273f69] bg-[#081326]/86 p-2 text-xs text-[#d4e3ff]">
                     {craftingPanel.pending.length === 0 ? (

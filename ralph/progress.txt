@@ -56,3 +56,11 @@ Entry format:
 - files: worker/src/lib.rs, ralph/prd.json, ralph/progress.txt
 - validation: cargo test --manifest-path worker/Cargo.toml (pass, 26 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass)
 - commit: pending
+
+- timestamp: 2026-02-11
+- item: RLP2-103
+- summary: Removed the inventory-to-crafting gameplay blocker by adding direct in-game crafting controls (hotkeys queue/cancel authoritative crafting commands) and surfacing those controls in the room HUD so mined resources can immediately progress into craft outputs for building/combat recipes.
+- decisions: Built on the existing server-authoritative crafting queue + build-cost consumption flow in the worker; no subsystem rewrites. Implemented client-side control wiring in Bevy (`crafting.queue` and `crafting.cancel`) and only added lightweight UI discoverability in `src`.
+- files: game-client/src/lib.rs, src/routes/room-route.tsx, ralph/prd.json, ralph/progress.txt
+- validation: cargo test --manifest-path worker/Cargo.toml (pass, 26 tests); cargo test --manifest-path sim-core/Cargo.toml (pass, 13 tests); npm run wasm:build:dev (pass); npm run build:web (pass)
+- commit: pending

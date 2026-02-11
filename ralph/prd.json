@@ -58,7 +58,7 @@
         "Crafting consumes resources and yields outputs",
         "Craft outputs are usable for placement/combat progression"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "RLP2-104",

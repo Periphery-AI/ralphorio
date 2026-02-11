@@ -72,6 +72,10 @@ const DROP_BASE_SIZE: f32 = 10.0;
 const ENEMY_BASE_SIZE: f32 = 22.0;
 const DROP_PICKUP_INTERACT_RADIUS: f32 = 84.0;
 const TERRAIN_RENDER_RADIUS_TILES: i32 = 24;
+const CRAFT_QUEUE_COUNT_PER_PRESS: u32 = 1;
+const RECIPE_SMELT_IRON_PLATE: &str = "smelt_iron_plate";
+const RECIPE_SMELT_COPPER_PLATE: &str = "smelt_copper_plate";
+const RECIPE_CRAFT_GEAR: &str = "craft_gear";
 
 static INBOUND_SNAPSHOTS: Lazy<Mutex<Vec<SnapshotPayload>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static OUTBOUND_INPUTS: Lazy<Mutex<Vec<InputCommand>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -624,7 +628,11 @@ pub fn boot_game(canvas_id: String) -> Result<(), JsValue> {
         )
         .add_systems(
             Update,
-            emit_projectile_fire_command.after(handle_drop_pickup_controls),
+            handle_crafting_controls.after(handle_drop_pickup_controls),
+        )
+        .add_systems(
+            Update,
+            emit_projectile_fire_command.after(handle_crafting_controls),
         )
         .add_systems(
             Update,
@@ -1255,6 +1263,41 @@ fn handle_drop_pickup_controls(
             "dropId": drop.id,
         }),
     );
+}
+
+fn queue_crafting_recipe(recipe: &str) {
+    queue_feature_command(
+        "crafting",
+        "queue",
+        json!({
+            "recipe": recipe,
+            "count": CRAFT_QUEUE_COUNT_PER_PRESS,
+        }),
+    );
+}
+
+fn handle_crafting_controls(input: Res<ButtonInput<KeyCode>>) {
+    if input.just_pressed(KeyCode::Digit1) || input.just_pressed(KeyCode::Numpad1) {
+        queue_crafting_recipe(RECIPE_SMELT_IRON_PLATE);
+    }
+
+    if input.just_pressed(KeyCode::Digit2) || input.just_pressed(KeyCode::Numpad2) {
+        queue_crafting_recipe(RECIPE_SMELT_COPPER_PLATE);
+    }
+
+    if input.just_pressed(KeyCode::Digit3) || input.just_pressed(KeyCode::Numpad3) {
+        queue_crafting_recipe(RECIPE_CRAFT_GEAR);
+    }
+
+    if input.just_pressed(KeyCode::KeyX) {
+        queue_feature_command(
+            "crafting",
+            "cancel",
+            json!({
+                "clear": true,
+            }),
+        );
+    }
 }
 
 fn simulate_local_player(
